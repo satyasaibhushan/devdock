@@ -60,4 +60,31 @@ describe('daemon routes', () => {
     expect(res.json()).toMatchObject({ ok: true })
     expect(start).toHaveBeenCalled()
   })
+
+  it('POST /repos/:id/exec 400 without a command', async () => {
+    const { svc } = makeService()
+    await svc.reconcileAll()
+    const app = buildApp(svc)
+    const res = await app.inject({ method: 'POST', url: '/repos/svc-a/exec', payload: {} })
+    expect(res.statusCode).toBe(400)
+  })
+
+  it('POST /repos/:id/exec sends the command', async () => {
+    const { svc } = makeService()
+    await svc.reconcileAll()
+    const app = buildApp(svc)
+    const res = await app.inject({
+      method: 'POST',
+      url: '/repos/svc-a/exec',
+      payload: { command: 'pnpm test' },
+    })
+    expect(res.json()).toMatchObject({ ok: true })
+  })
+
+  it('GET /repos/:id/logs 404 for unknown', async () => {
+    const { svc } = makeService()
+    const app = buildApp(svc)
+    const res = await app.inject({ method: 'GET', url: '/repos/nope/logs' })
+    expect(res.statusCode).toBe(404)
+  })
 })

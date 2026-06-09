@@ -21,6 +21,32 @@ export function buildApp(service: Service): FastifyInstance {
     return state.pods
   })
 
+  app.get<{ Params: { id: string }; Querystring: { tail?: string } }>(
+    '/repos/:id/logs',
+    async (req, reply) => {
+      if (!service.get(req.params.id)) return reply.code(404).send({ error: 'unknown repo' })
+      const tail = Number(req.query.tail ?? 200)
+      return service.logs(req.params.id, Number.isFinite(tail) ? tail : 200)
+    },
+  )
+
+  app.post<{ Params: { id: string }; Body: { command?: string } }>(
+    '/repos/:id/exec',
+    async (req, reply) => {
+      const command = req.body?.command
+      if (typeof command !== 'string' || !command.trim()) {
+        return reply.code(400).send({ error: 'command required' })
+      }
+      try {
+        const result = await service.exec(req.params.id, command)
+        return { ok: result.code === 0, code: result.code, stderr: result.stderr }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        return reply.code(message.includes('unknown repo') ? 404 : 500).send({ error: message })
+      }
+    },
+  )
+
   const verbs = ['start', 'build', 'stop', 'restart'] as const
   for (const verb of verbs) {
     app.post<{ Params: { id: string } }>(`/repos/:id/${verb}`, async (req, reply) => {

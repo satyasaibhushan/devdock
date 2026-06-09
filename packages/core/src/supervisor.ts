@@ -28,6 +28,11 @@ export class Supervisor {
     return purge
   }
 
+  /** Run a one-off command inside the repo's dev session via `tmux send-keys`. */
+  exec(repo: Repo, command: string): Promise<RunResult> {
+    return this.runner('tmux', ['send-keys', '-t', repo.session, command, 'Enter'])
+  }
+
   /** Whether a tmux session exists for this repo. */
   async hasSession(repo: Repo): Promise<boolean> {
     const r = await this.runner('tmux', ['has-session', '-t', repo.session])

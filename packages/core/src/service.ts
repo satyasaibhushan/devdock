@@ -108,6 +108,11 @@ export class Service {
     return this.runner('kubectl', args)
   }
 
+  /** Send a one-off command into the repo's dev session (spec §8). */
+  async exec(id: string, command: string): Promise<RunResult> {
+    return this.supervisor.exec(this.repoOrThrow(id), command)
+  }
+
   // ---- reconciliation (spec §6) ----
   async reconcileOne(id: string): Promise<RepoState> {
     const repo = this.repoOrThrow(id)

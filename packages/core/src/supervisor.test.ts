@@ -41,6 +41,18 @@ describe('Supervisor', () => {
     expect(calls[1]).toEqual(['kill-session', '-t', 'devdock-svc-a'])
   })
 
+  it('exec sends a command into the dev session', async () => {
+    const runner = vi.fn(async () => ok())
+    await new Supervisor(runner).exec(repo, 'pnpm test')
+    expect(runner).toHaveBeenCalledWith('tmux', [
+      'send-keys',
+      '-t',
+      'devdock-svc-a',
+      'pnpm test',
+      'Enter',
+    ])
+  })
+
   it('lists only devdock- sessions', async () => {
     const runner = vi.fn(async () => ok('devdock-svc-a\nother\ndevdock-svc-b\n'))
     expect(await new Supervisor(runner).listSessions()).toEqual(['devdock-svc-a', 'devdock-svc-b'])
