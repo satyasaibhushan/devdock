@@ -18,15 +18,16 @@
 </script>
 
 <div class="logs" bind:this={box}>
-  {#each lines as line, i (i)}<div class="line">{line}</div>{/each}
+  {#each lines as line, i (i)}<div class="line">{line}</div>{:else}<div class="empty">Waiting for log output…</div>{/each}
 </div>
 
 <style>
   .logs {
-    height: 240px; overflow-y: auto;
-    background: #0b0f14; border: 1px solid var(--line); border-radius: 8px;
+    height: 100%; min-height: 0; overflow-y: auto;
+    background: #0b0f14; border: 1px solid var(--line); border-radius: 10px;
     padding: 10px; font-family: var(--mono); font-size: 12px; line-height: 1.5;
     color: #c9d6e2; white-space: pre-wrap; word-break: break-all;
   }
   .line { min-height: 1em; }
+  .empty { color: var(--muted); }
 </style>

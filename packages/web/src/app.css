@@ -15,12 +15,21 @@
 * {
   box-sizing: border-box;
 }
+html,
+body {
+  height: 100%;
+}
 body {
   margin: 0;
   background: var(--bg);
   color: var(--ink);
   font-family: var(--sans);
   font-size: 14px;
+}
+#app {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
 }
 .dot {
   width: 10px;
