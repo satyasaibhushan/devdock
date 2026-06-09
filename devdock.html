@@ -94,6 +94,9 @@
   <a href="#phasing">17 · Phasing</a>
   <a href="#vision">18 · The bigger machine</a>
   <a href="#rules">19 · Design rules</a>
+
+  <div class="sec">Build log</div>
+  <a href="#todo">20 · Build TODO</a>
 </nav>
 
 <main>
@@ -428,6 +431,55 @@ devdock/
     <li><b>Light by default.</b> Always-on means low idle footprint; Tauri over Electron; purge over leaving things up.</li>
   </ol>
 
+  <!-- ============================================================= -->
+  <h2 id="todo">20 · Build TODO</h2>
+  <p class="lead">Living checklist — the source of truth for what we're building. Updated as each piece lands, alongside short commits.</p>
+  <p><span class="pill">☐ todo</span><span class="pill" style="color:var(--warn)">◐ in&nbsp;progress</span><span class="pill" style="color:var(--accent2)">✓ done</span></p>
+
+  <h3>Phase 0 · Scaffolding</h3>
+  <ul>
+    <li>☐ pnpm workspace + <code>packages/{core,daemon,web}</code></li>
+    <li>☐ TypeScript config (strict), <code>tsx</code> dev loop, <code>vitest</code>, <code>biome</code></li>
+    <li>☐ Root <code>package.json</code> scripts (dev / build / test / lint)</li>
+  </ul>
+
+  <h3>Phase 1 · Core service layer <span style="color:var(--muted);font-size:13px">(<code>packages/core</code>, transport-free)</span></h3>
+  <ul>
+    <li>☐ <code>stateStore</code> — SQLite (or JSON to start): repos, sessions, status, grants</li>
+    <li>☐ <code>registry</code> — scan <code>~/Code/**/.devspace/*/devspace.yaml</code>; parse workload, namespace, ports</li>
+    <li>☐ <code>supervisor</code> — start/build/kill via tmux + <code>devspace</code> subprocesses; track lifecycle</li>
+    <li>☐ <code>reconciler</code> — merge registry (desired) ⇄ cluster reality (actual) → status per repo</li>
+    <li>☐ <code>logTailer</code> — <code>kubectl logs -f</code> → ring buffer → fan-out to subscribers</li>
+    <li>☐ <code>ptyBroker</code> — node-pty ↔ <code>tmux attach</code>; single write-lock, resize, teardown</li>
+    <li>☐ <code>crashWatch</code> — pod restartCount + traceback detection; emit crash events</li>
+  </ul>
+
+  <h3>Phase 1 · Daemon <span style="color:var(--muted);font-size:13px">(<code>packages/daemon</code>, Fastify + ws)</span></h3>
+  <ul>
+    <li>☐ HTTP: <code>/health</code>, <code>/repos</code>, <code>/repos/:id</code>, <code>/repos/:id/pods</code></li>
+    <li>☐ HTTP control: <code>start</code> / <code>build</code> / <code>stop</code> / <code>restart</code></li>
+    <li>☐ WS: <code>/repos/:id/logs</code>, <code>/repos/:id/terminal?mode=ro|rw</code>, <code>/events</code></li>
+    <li>☐ launchd plist for always-on boot</li>
+  </ul>
+
+  <h3>Phase 1 · Web UI <span style="color:var(--muted);font-size:13px">(<code>packages/web</code>, Svelte + xterm.js)</span></h3>
+  <ul>
+    <li>☐ Repo list with reconciled status dots; start/build/kill controls</li>
+    <li>☐ Live log viewer (WS subscribe)</li>
+    <li>☐ xterm.js terminal pane (read-only / read-write)</li>
+  </ul>
+
+  <h3>Phase 2 · Tauri menu-bar</h3>
+  <ul>
+    <li>☐ Tray with glanceable status dots; click to pop the web UI</li>
+  </ul>
+
+  <h3>Phase 3 · MCP server</h3>
+  <ul>
+    <li>☐ <code>devdock_{list,status,start,build,stop,logs,exec}</code> over <code>core</code>; ro/rw via token scope</li>
+  </ul>
+
+  <!-- ============================================================= -->
   <div class="foot">
     devdock · design &amp; architecture spec · ~/Code/Personal/devdock/devdock.html<br>
     Stack: TypeScript · Fastify · node-pty · tmux · kubectl/devspace · Svelte + xterm.js · Tauri · TS MCP SDK · SQLite
