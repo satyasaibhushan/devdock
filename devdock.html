@@ -443,7 +443,7 @@ devdock/
     <li>✓ Root <code>package.json</code> scripts (dev / build / test / typecheck / lint / format)</li>
   </ul>
 
-  <h3>Phase 1 · Core service layer <span style="color:var(--muted);font-size:13px">(<code>packages/core</code>, transport-free)</span></h3>
+  <h3>Phase 1 · Core service layer <span style="color:var(--accent2);font-size:13px">✓ done</span> <span style="color:var(--muted);font-size:13px">(<code>packages/core</code>, transport-free)</span></h3>
   <ul>
     <li>✓ <code>stateStore</code> — JSON-backed: last-known status + terminal grants</li>
     <li>✓ <code>registry</code> — scan roots for <code>devspace.yaml</code>; parse workload, namespace, ports</li>
@@ -451,7 +451,7 @@ devdock/
     <li>✓ <code>reconciler</code> — merge registry (desired) ⇄ cluster reality (actual) → status per repo</li>
     <li>✓ <code>logTailer</code> — <code>kubectl logs -f</code> → ring buffer → fan-out to subscribers</li>
     <li>✓ <code>ptyBroker</code> — node-pty ↔ <code>tmux attach</code>; single write-lock, resize, teardown</li>
-    <li>☐ <code>crashWatch</code> — pod restartCount + traceback detection; emit crash events</li>
+    <li>✓ <code>crashWatch</code> — pod restartCount + traceback detection; emit crash events</li>
   </ul>
 
   <h3>Phase 1 · Daemon <span style="color:var(--muted);font-size:13px">(<code>packages/daemon</code>, Fastify + ws)</span></h3>

@@ -26,5 +26,12 @@ export {
   type PtySpawn,
   type TermSession,
 } from './ptyBroker.js'
+export {
+  CrashWatch,
+  looksLikeTraceback,
+  detectPodCrashes,
+  type CrashEvent,
+  type CrashListener,
+} from './crashWatch.js'
 
 export const version = '0.0.0'
