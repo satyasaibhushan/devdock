@@ -33,5 +33,10 @@ export {
   type CrashEvent,
   type CrashListener,
 } from './crashWatch.js'
+export {
+  Service,
+  type ServiceOptions,
+  type ServiceDeps,
+} from './service.js'
 
 export const version = '0.0.0'
