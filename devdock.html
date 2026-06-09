@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>devdock — design &amp; architecture</title>
+<style>
+  :root{
+    --bg:#0f1419; --panel:#161c24; --panel2:#1b232d; --ink:#e6edf3; --muted:#9aa7b4;
+    --line:#2a3441; --accent:#3fa7ff; --accent2:#46d39a; --warn:#f0b34a; --danger:#f06b6b;
+    --code:#0b0f14; --mono:"SF Mono",ui-monospace,"JetBrains Mono",Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.6;font-size:15px}
+  .wrap{display:grid;grid-template-columns:260px 1fr;max-width:1400px;margin:0 auto}
+  /* sidebar */
+  nav{position:sticky;top:0;align-self:start;height:100vh;overflow-y:auto;padding:28px 20px;border-right:1px solid var(--line);background:var(--panel)}
+  nav .brand{font-family:var(--mono);font-weight:700;font-size:20px;letter-spacing:.5px;color:var(--ink);margin-bottom:2px}
+  nav .brand b{color:var(--accent)}
+  nav .tag{color:var(--muted);font-size:12px;margin-bottom:22px}
+  nav a{display:block;color:var(--muted);text-decoration:none;padding:5px 10px;border-radius:6px;font-size:13.5px;margin:1px 0}
+  nav a:hover{background:var(--panel2);color:var(--ink)}
+  nav .sec{color:#5d6b78;text-transform:uppercase;font-size:10.5px;letter-spacing:1px;margin:18px 0 6px 10px;font-weight:700}
+  /* content */
+  main{padding:48px 56px;max-width:980px}
+  h1{font-size:34px;margin:0 0 6px;letter-spacing:-.5px}
+  h1 .sub{display:block;font-size:15px;color:var(--muted);font-weight:400;margin-top:8px;letter-spacing:0}
+  h2{font-size:23px;margin:52px 0 14px;padding-bottom:8px;border-bottom:1px solid var(--line)}
+  h3{font-size:17px;margin:30px 0 8px;color:var(--accent)}
+  h4{font-size:14px;margin:20px 0 6px;color:var(--accent2);font-family:var(--mono)}
+  p{margin:10px 0}
+  code{font-family:var(--mono);background:var(--panel2);padding:1.5px 6px;border-radius:4px;font-size:12.5px;color:#cde3ff}
+  pre{background:var(--code);border:1px solid var(--line);border-radius:10px;padding:18px;overflow-x:auto;font-family:var(--mono);font-size:12.5px;line-height:1.5;color:#c9d6e2}
+  pre .c{color:#5d6b78}/*comment*/
+  pre .k{color:#7fd1ff}/*key*/
+  pre .g{color:#46d39a}/*green*/
+  pre .y{color:#f0b34a}/*yellow*/
+  table{width:100%;border-collapse:collapse;margin:16px 0;font-size:13.5px}
+  th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--muted);font-size:11.5px;text-transform:uppercase;letter-spacing:.5px;background:var(--panel)}
+  tr:hover td{background:var(--panel)}
+  .box{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:8px;padding:14px 18px;margin:18px 0}
+  .box.warn{border-left-color:var(--warn)}
+  .box.ok{border-left-color:var(--accent2)}
+  .box.danger{border-left-color:var(--danger)}
+  .box .t{font-weight:700;font-size:13px;margin-bottom:4px;font-family:var(--mono)}
+  .pill{display:inline-block;background:var(--panel2);border:1px solid var(--line);border-radius:20px;padding:2px 11px;font-size:11.5px;font-family:var(--mono);margin:2px 4px 2px 0;color:var(--accent2)}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px}
+  .card h4{margin-top:0}
+  .lead{font-size:17px;color:var(--ink);border-left:3px solid var(--accent2);padding-left:16px;margin:18px 0}
+  ul,ol{margin:10px 0;padding-left:22px}
+  li{margin:5px 0}
+  .kbd{font-family:var(--mono);background:#0b0f14;border:1px solid var(--line);border-bottom-width:2px;border-radius:5px;padding:1px 7px;font-size:12px}
+  .foot{margin:60px 0 20px;padding-top:18px;border-top:1px solid var(--line);color:#5d6b78;font-size:12.5px}
+  hr{border:0;border-top:1px solid var(--line);margin:36px 0}
+  .ascii{font-size:11.5px;line-height:1.35}
+  a.ref{color:var(--accent)}
+  @media(max-width:900px){.wrap{grid-template-columns:1fr}nav{display:none}main{padding:28px 20px}.grid2{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<nav>
+  <div class="brand">dev<b>dock</b></div>
+  <div class="tag">devspace control plane · design spec</div>
+
+  <div class="sec">Foundations</div>
+  <a href="#what">1 · What it is</a>
+  <a href="#mandate">2 · The dual mandate</a>
+  <a href="#problem">3 · The problems it solves</a>
+
+  <div class="sec">Architecture</div>
+  <a href="#layers">4 · The three layers</a>
+  <a href="#tmux">5 · The tmux decision</a>
+  <a href="#reconcile">6 · Reconciliation</a>
+  <a href="#verbs">7 · The verbs</a>
+  <a href="#terminal">8 · Terminal access</a>
+  <a href="#existing">9 · Existing pods</a>
+  <a href="#crash">10 · Crash handling</a>
+
+  <div class="sec">Build</div>
+  <a href="#stack">11 · Tech stack</a>
+  <a href="#core">12 · Core service layer</a>
+  <a href="#api">13 · API surface</a>
+  <a href="#mcp">14 · MCP face</a>
+  <a href="#layout">15 · Repo layout</a>
+  <a href="#perf">16 · Performance</a>
+
+  <div class="sec">Beyond</div>
+  <a href="#phasing">17 · Phasing</a>
+  <a href="#vision">18 · The bigger machine</a>
+  <a href="#rules">19 · Design rules</a>
+</nav>
+
+<main>
+  <h1>devdock
+    <span class="sub">A global control plane for DevSpace sessions — start, kill, build, and attach to dev pods across every repo, from one daemon. Built for a human at a menu bar <em>and</em> an AI agent over MCP, sharing the same brain.</span>
+  </h1>
+
+  <div class="box">
+    <div class="t">TL;DR</div>
+    A headless <b>daemon</b> (always-on, launchd) wraps the <code>devspace</code> and <code>kubectl</code> CLIs. It launches each <code>devspace dev</code> inside its own <b>tmux session</b>, streams logs and PTYs over websockets, and reconciles live state from the cluster. On top sit thin clients that all call the same core service layer: a <b>menu-bar GUI</b> + web view for you, and an <b>MCP server</b> for the agent. Stack is <b>TypeScript</b> end-to-end, with <b>node-pty ↔ xterm.js</b> for terminals and <b>Tauri</b> for the tray.
+  </div>
+
+  <!-- ============================================================= -->
+  <h2 id="what">1 · What it is</h2>
+  <p class="lead">Today, working with DevSpace means walking each repo by hand: <code>cd</code> in, run <code>devspace dev</code>, leave a terminal hostage to its foreground sync, repeat for every service, and remember to <code>devspace purge</code> when you're done (you don't). devdock makes that a single pane of control.</p>
+
+  <p>devdock is a local service that knows about every repo on your machine with a DevSpace config, and lets you — or an agent — <b>start</b>, <b>kill</b>, <b>build</b>, <b>watch</b>, and <b>shell into</b> any of them without touching a terminal or remembering a namespace. It is not a Kubernetes IDE and not a DevSpace replacement; it is a thin, opinionated orchestrator <em>over</em> the tools you already trust, exposing them through one consistent surface.</p>
+
+  <h3>The three verbs, mapped to reality</h3>
+  <table>
+    <tr><th>devdock action</th><th>Underlying command</th><th>Meaning</th></tr>
+    <tr><td><span class="pill">Start</span></td><td><code>devspace dev</code></td><td>Build + deploy + file-sync + port-forward + open dev terminal in the pod</td></tr>
+    <tr><td><span class="pill">Build</span></td><td><code>devspace deploy</code></td><td>Build &amp; deploy the workload without entering dev mode</td></tr>
+    <tr><td><span class="pill">Kill</span></td><td><code>devspace purge</code></td><td>Tear the deployment down completely; free cluster <em>and</em> local sync resources</td></tr>
+    <tr><td><span class="pill">Listen</span></td><td><code>tmux attach -r</code> / <code>kubectl logs -f</code></td><td>Read-only view of the running process &amp; its crashes</td></tr>
+    <tr><td><span class="pill">Attach</span></td><td><code>tmux attach</code> / <code>kubectl exec -it</code></td><td>Read-write terminal: run <code>python main.py</code>, poke around, restart</td></tr>
+  </table>
+
+  <!-- ============================================================= -->
+  <h2 id="mandate">2 · The dual mandate</h2>
+  <p>devdock exists to serve two users with the <b>same nouns but different verbs</b>, and that duality is the central design force.</p>
+
+  <div class="grid2">
+    <div class="card">
+      <h4>The human (you)</h4>
+      <p>Wants <b>glance + click</b>. "Which devspaces are up right now? Kill career-service. Show me why the pod crashed." A menu-bar dot cluster and two-click controls.</p>
+    </div>
+    <div class="card">
+      <h4>The agent (Claude)</h4>
+      <p>Wants <b>call + read</b>. <code>devdock_status()</code>, <code>devdock_logs()</code>, <code>devdock_exec("python main.py")</code>. It restarts a crashed pod and re-reads logs without a human in the loop.</p>
+    </div>
+  </div>
+
+  <div class="box ok">
+    <div class="t">The unifying insight</div>
+    Both clients hit the <b>identical core service layer</b>. The read-only vs read-write terminal distinction you want for yourself <em>is</em> the permission scope for the agent: a read-only MCP token can observe and diagnose but not touch the pod; a read-write token can restart and run. One lock, two clients. Build the brain once.
+  </div>
+
+  <!-- ============================================================= -->
+  <h2 id="problem">3 · The problems it solves</h2>
+  <table>
+    <tr><th>Pain today</th><th>devdock's answer</th></tr>
+    <tr><td>Walking N repos to run <code>devspace dev</code></td><td>One pane; start any repo by name/click</td></tr>
+    <tr><td>Each <code>devspace dev</code> holds a terminal hostage</td><td>Runs detached inside tmux; daemon owns it</td></tr>
+    <tr><td>Forgetting to <code>purge</code> → idle syncs eat the laptop</td><td>One-click kill = purge; see what's running at a glance</td></tr>
+    <tr><td>Reload is slow; you babysit it</td><td>Status reflects pod readiness; poll it instead of watching</td></tr>
+    <tr><td><code>python main.py</code> crashes silently</td><td>Crash watch + log scan; one-click (or agent) re-run</td></tr>
+    <tr><td>The agent can't recover a dead pod unattended</td><td>MCP verbs let it detect &amp; restart — closes the autonomy gap</td></tr>
+  </table>
+
+  <!-- ============================================================= -->
+  <h2 id="layers">4 · The three layers</h2>
+  <p>devdock is three thin layers over <code>devspace</code> + <code>kubectl</code> + <code>tmux</code>. Nothing below is novel infrastructure; the value is the combination in one always-on service.</p>
+
+<pre class="ascii">
+  <span class="k">┌─ CLIENTS ────────────────────────────────────────────────────────┐</span>
+  │   menu-bar GUI + web view          MCP server          CLI         │
+  │   (you: glance + click)         (agent: call+read)   (scripts)      │
+  <span class="k">└───────────────┬───────────────────────┬───────────────┬──────────┘</span>
+                  │  same HTTP/WS API     │  same functions │
+  <span class="k">┌─ CONTROL DAEMON  (the only brain, headless, launchd) ─────────────┐</span>
+  │                                                                    │
+  │   <span class="g">registry</span>     scan ~/Code/**/.devspace/*/devspace.yaml         │
+  │   <span class="g">reconciler</span>   desired state  ⇄  actual cluster state           │
+  │   <span class="g">supervisor</span>   spawn/track devspace dev|deploy|purge            │
+  │   <span class="g">ptyBroker</span>    node-pty ⇄ websocket, ro/rw lock                 │
+  │   <span class="g">logTailer</span>    kubectl logs -f → ring buffer → ws subscribers   │
+  │   <span class="g">crashWatch</span>   pod restartCount + traceback scan                │
+  │   <span class="g">stateStore</span>   SQLite: repos, sessions, last-known status       │
+  │                                                                    │
+  <span class="k">└───────────────┬────────────────────────────────────────────────────┘</span>
+                  │  subprocess + websocket
+  <span class="k">┌─ EXECUTION  (tools you already run) ──────────────────────────────┐</span>
+  │   devspace dev   → inside  tmux new-session -d -s devdock-&lt;repo&gt;    │
+  │   kubectl logs/exec/attach → against any pod in the cluster         │
+  │   tmux attach (-r)         → read-write / read-only terminal        │
+  <span class="k">└────────────────────────────────────────────────────────────────────┘</span>
+</pre>
+
+  <div class="box">
+    <div class="t">The architectural rule</div>
+    The <code>core</code> service layer has <b>zero transport knowledge</b>. Fastify routes, the websocket handlers, and the MCP server are all thin callers of <code>core</code>. This is what keeps the human GUI and the agent's MCP verbs from ever drifting — they are two doors into one room.
+  </div>
+
+  <!-- ============================================================= -->
+  <h2 id="tmux">5 · The tmux decision (the one that makes it easy)</h2>
+  <p><code>devspace dev</code> is a long-running <b>foreground</b> process: it holds the file sync, the port-forward, and the in-pod terminal. If the daemon spawns it as a plain child and the daemon restarts, dev mode dies with it. The fix that unlocks everything: <b>launch each <code>devspace dev</code> inside its own named tmux session.</b></p>
+
+<pre>
+<span class="c"># start</span>
+tmux new-session -d -s <span class="y">devdock-career-service-agents</span> \
+    'cd ~/Code/backend/career-service-agents &amp;&amp; devspace dev'
+
+<span class="c"># the daemon never blocks on it; tmux owns the process</span>
+</pre>
+
+  <p>That single decision hands you, for free:</p>
+  <table>
+    <tr><th>Benefit</th><th>How</th></tr>
+    <tr><td>Survives daemon restarts</td><td>tmux outlives the daemon; on boot the daemon re-discovers sessions by name</td></tr>
+    <tr><td><b>Read-only terminal</b></td><td><code>tmux attach -r -t devdock-&lt;repo&gt;</code> — exactly your "listen" mode</td></tr>
+    <tr><td><b>Read-write terminal</b></td><td><code>tmux attach -t devdock-&lt;repo&gt;</code> — type <code>python main.py</code></td></tr>
+    <tr><td>Web terminal</td><td>node-pty spawns the <code>tmux attach</code> command; pipes to xterm.js over ws. <b>No ttyd needed.</b></td></tr>
+    <tr><td>Multiplexing</td><td>tmux is single-pane; many viewers, one writer — gate the rw attach behind a lock</td></tr>
+  </table>
+
+  <div class="box ok">
+    <div class="t">Consequence</div>
+    The "two permission levels" — listen vs control — are <b>not something you build</b>. They are <code>tmux attach -r</code> vs <code>tmux attach</code>. The daemon just chooses which command node-pty spawns based on the requester's grant.
+  </div>
+
+  <!-- ============================================================= -->
+  <h2 id="reconcile">6 · Reconciliation: state comes from the cluster</h2>
+  <p>devdock never trusts its own memory of "what's running." It <b>reconciles</b>: on boot and on a timer, it queries the cluster for reality and merges it with its registry. This makes it crash-proof and lets it adopt pods it never started.</p>
+
+<pre>
+<span class="c">// reconcile loop (every few seconds + on demand)</span>
+<span class="k">for</span> repo <span class="k">in</span> registry:
+    pods   = kubectl get pods -n &lt;ns&gt; -l svc=&lt;workload&gt; -o json   <span class="c">// your selector</span>
+    session = tmux has-session -t devdock-&lt;repo&gt;
+    status  = derive(pods, session):
+        - tmux session + ready pod        → <span class="g">RUNNING (managed)</span>
+        - ready pod, no tmux session      → <span class="y">RUNNING (external)</span>
+        - pod with restartCount&gt;0 / crash → <span class="y">CRASHED</span>
+        - no pod, no session              → <span class="c">STOPPED</span>
+</pre>
+
+  <table>
+    <tr><th>State</th><th>Meaning</th><th>What you can do</th></tr>
+    <tr><td><span class="pill" style="color:var(--accent2)">RUNNING (managed)</span></td><td>devdock launched it via tmux + devspace dev</td><td>full lifecycle: kill, attach, logs, restart</td></tr>
+    <tr><td><span class="pill" style="color:var(--warn)">RUNNING (external)</span></td><td>someone else / a prior session / a plain deploy</td><td>logs, exec, attach, kubectl restart — but doesn't own the sync</td></tr>
+    <tr><td><span class="pill" style="color:var(--danger)">CRASHED</span></td><td>pod up but entrypoint died / restart-looping</td><td>read logs, re-run main.py, restart</td></tr>
+    <tr><td><span class="pill" style="color:var(--muted)">STOPPED</span></td><td>nothing in cluster, no session</td><td>start, build</td></tr>
+  </table>
+
+  <!-- ============================================================= -->
+  <h2 id="verbs">7 · The verbs in full detail</h2>
+
+  <h4>Start</h4>
+  <pre>tmux new-session -d -s devdock-&lt;repo&gt; 'cd &lt;path&gt; &amp;&amp; devspace dev'
+<span class="c"># daemon then: tail the tmux pane for build progress, watch pod readiness,
+# flip status STOPPED → BUILDING → RUNNING(managed) as the pod goes Ready</span></pre>
+
+  <h4>Build</h4>
+  <pre>cd &lt;path&gt; &amp;&amp; devspace deploy
+<span class="c"># builds run IN-CLUSTER (BuildKit, per the repo's devspace.yaml) →
+# the heavy compile does NOT tax the laptop CPU</span></pre>
+
+  <h4>Kill</h4>
+  <pre>cd &lt;path&gt; &amp;&amp; devspace purge   &amp;&amp;   tmux kill-session -t devdock-&lt;repo&gt;
+<span class="c"># frees cluster resources AND stops the local file-sync watcher</span></pre>
+
+  <!-- ============================================================= -->
+  <h2 id="terminal">8 · Terminal access (read-only &amp; read-write)</h2>
+  <p>The terminal panes are the technically richest feature, and the reason the whole stack leans TypeScript. The canonical pairing is <b>node-pty</b> (spawns a PTY) ↔ <b>xterm.js</b> (renders it in the browser), bridged over a websocket.</p>
+
+<pre>
+<span class="c">// daemon: open a terminal for a client</span>
+<span class="k">function</span> openTerminal(repo, mode):           <span class="c">// mode = 'ro' | 'rw'</span>
+    <span class="k">if</span> mode == 'rw': acquireWriteLock(repo)    <span class="c">// one writer at a time</span>
+    cmd = mode == 'ro'
+        ? ['tmux','attach','-r','-t',`devdock-${repo}`]
+        : ['tmux','attach',     '-t',`devdock-${repo}`]
+    pty = nodePty.spawn(cmd[0], cmd.slice(1), {cols,rows})
+    pty.onData(d =&gt; ws.send(d))                 <span class="c">// pod → browser</span>
+    ws.onMessage(d =&gt; mode=='rw' &amp;&amp; pty.write(d)) <span class="c">// browser → pod</span>
+</pre>
+
+  <table>
+    <tr><th>Mode</th><th>Command node-pty spawns</th><th>Grant required</th></tr>
+    <tr><td>Listen (read-only)</td><td><code>tmux attach -r</code> or <code>kubectl logs -f</code></td><td>any client / read-only MCP token</td></tr>
+    <tr><td>Control (read-write)</td><td><code>tmux attach</code> or <code>kubectl exec -it … bash</code></td><td>write-lock holder / read-write MCP token</td></tr>
+    <tr><td>Attach to entrypoint</td><td><code>kubectl attach -it &lt;pod&gt;</code></td><td>connects to PID 1 — watch the live crash</td></tr>
+  </table>
+
+  <!-- ============================================================= -->
+  <h2 id="existing">9 · Interacting with existing pods</h2>
+  <p>Pod interaction is <b>pure kubectl against the cluster</b> — independent of whether devdock launched the pod. Reconciliation (§6) surfaces external pods; then all three interaction modes work on any running pod:</p>
+  <table>
+    <tr><th>Mode</th><th>Command</th><th>Use</th></tr>
+    <tr><td>Listen</td><td><code>kubectl logs -f &lt;pod&gt; -c &lt;container&gt;</code></td><td>live stdout incl. tracebacks, zero risk</td></tr>
+    <tr><td>Shell</td><td><code>kubectl exec -it &lt;pod&gt; -- /bin/bash</code></td><td>a <em>new</em> shell — run main.py, inspect</td></tr>
+    <tr><td>Attach</td><td><code>kubectl attach -it &lt;pod&gt;</code></td><td>the <em>actual</em> entrypoint process's stdio</td></tr>
+  </table>
+  <p>DevSpace also ships config-aware wrappers — <code>devspace enter --pod &lt;pod&gt;</code> and <code>devspace attach</code> — that pick the pod from the repo config, so you don't hand-write selectors. Raw kubectl is more universal; <code>devspace enter</code> is more ergonomic. devdock can offer both.</p>
+
+  <!-- ============================================================= -->
+  <h2 id="crash">10 · Crash handling</h2>
+  <p>The "<code>python main.py</code> dies and stays dead" problem. devdock detects it two ways and offers recovery:</p>
+  <ul>
+    <li><b>Pod-level:</b> watch <code>kubectl get pod -w</code> / <code>restartCount</code> — a climbing count means a restart loop.</li>
+    <li><b>Process-level:</b> scan the tailed log stream for tracebacks / non-zero exit markers; the entrypoint can be supervised so a dead <code>main.py</code> doesn't take the pod with it.</li>
+  </ul>
+  <p>Recovery: a <b>health probe</b> + one-click (or <code>devdock_exec</code>) re-run in the pod, and an optional supervised restart loop in the entrypoint so a crash self-heals. This is the exact capability the autonomous-dev nightly run needs to recover unattended.</p>
+
+  <!-- ============================================================= -->
+  <h2 id="stack">11 · Tech stack</h2>
+  <p>Chosen by working backward from the hardest constraint — the browser terminal forces <b>xterm.js</b>, whose paved feeder is <b>node-pty</b>, which pulls the daemon to <b>TypeScript</b>. One core language across daemon + UI + MCP.</p>
+  <table>
+    <tr><th>Layer</th><th>Choice</th><th>Why</th></tr>
+    <tr><td>Daemon core</td><td><b>Node + TypeScript</b>, Fastify (HTTP) + <code>ws</code></td><td>node-pty lives here; idle ~30–50 MB, fine for always-on</td></tr>
+    <tr><td>PTY / terminal</td><td><b>node-pty</b> → <code>tmux attach</code></td><td>VS Code/Hyper's path; replaces ttyd; tmux gives ro/rw + survival</td></tr>
+    <tr><td>Cluster / devspace</td><td><b>shell out</b> to <code>kubectl</code> / <code>devspace</code></td><td>wrapping trusted CLIs = hours; a k8s client lib = weeks of edge cases</td></tr>
+    <tr><td>Web UI</td><td><b>Svelte</b> + <b>xterm.js</b> + a charts lib</td><td>least ceremony for a solo dashboard; xterm.js mandatory</td></tr>
+    <tr><td>Menu-bar shell</td><td><b>Tauri</b> (phase 2)</td><td>~5 MB native tray, low RAM; Electron would be 150 MB always-resident</td></tr>
+    <tr><td>MCP face</td><td><b>TS MCP SDK</b>, in-process</td><td>shares the service layer directly; most mature SDK</td></tr>
+    <tr><td>State</td><td><b>SQLite</b> (or JSON to start)</td><td>single-user, local — don't overbuild</td></tr>
+    <tr><td>Tooling</td><td>pnpm · tsx · vitest · biome</td><td>fast workspace + dev loop</td></tr>
+  </table>
+  <div class="box warn">
+    <div class="t">Rust footprint</div>
+    Rust appears <b>only</b> as the thin Tauri shell you barely touch. The brain is 100% TypeScript.
+  </div>
+
+  <!-- ============================================================= -->
+  <h2 id="core">12 · Core service layer</h2>
+  <p>Transport-free modules under <code>packages/core</code>. Everything else calls these.</p>
+  <table>
+    <tr><th>Module</th><th>Responsibility</th></tr>
+    <tr><td><code>registry</code></td><td>discover repos: scan <code>~/Code/**/.devspace/*/devspace.yaml</code>; parse workload name, namespace, ports</td></tr>
+    <tr><td><code>reconciler</code></td><td>merge registry (desired) with cluster reality (actual) → status per repo</td></tr>
+    <tr><td><code>supervisor</code></td><td>start/build/kill via tmux + devspace subprocesses; track lifecycle</td></tr>
+    <tr><td><code>ptyBroker</code></td><td>open ro/rw PTYs (node-pty), enforce the single write-lock, resize, teardown</td></tr>
+    <tr><td><code>logTailer</code></td><td><code>kubectl logs -f</code> → ring buffer → fan-out to subscribers</td></tr>
+    <tr><td><code>crashWatch</code></td><td>pod restartCount + traceback detection; emit crash events</td></tr>
+    <tr><td><code>stateStore</code></td><td>SQLite: repos, sessions, last-known status, grants</td></tr>
+  </table>
+
+  <!-- ============================================================= -->
+  <h2 id="api">13 · API surface (HTTP + WebSocket)</h2>
+<pre>
+<span class="c">// HTTP — control + queries</span>
+GET   /health
+GET   /repos                      <span class="c">// list + reconciled status</span>
+GET   /repos/:id                  <span class="c">// detail: pods, ports, session</span>
+POST  /repos/:id/start            <span class="c">// devspace dev (in tmux)</span>
+POST  /repos/:id/build            <span class="c">// devspace deploy</span>
+POST  /repos/:id/stop             <span class="c">// devspace purge + kill tmux</span>
+POST  /repos/:id/restart          <span class="c">// kubectl rollout restart / re-run main.py</span>
+GET   /repos/:id/pods             <span class="c">// reconciled pod list (incl. external)</span>
+
+<span class="c">// WebSocket — streams</span>
+WS    /repos/:id/logs             <span class="c">// kubectl logs -f, fan-out</span>
+WS    /repos/:id/terminal?mode=ro|rw   <span class="c">// node-pty ⇄ tmux attach</span>
+WS    /events                     <span class="c">// status changes, crash events (drives the tray dots)</span>
+</pre>
+
+  <!-- ============================================================= -->
+  <h2 id="mcp">14 · MCP face (the agent's hands)</h2>
+  <p>A second entry point over the same <code>core</code> functions. Read-only vs read-write is a property of the agent's token.</p>
+<pre>
+devdock_list()                    → repos + status
+devdock_status(repo)              → RUNNING|CRASHED|STOPPED|EXTERNAL
+devdock_start(repo)               → devspace dev
+devdock_build(repo)               → devspace deploy
+devdock_stop(repo)                → devspace purge
+devdock_logs(repo, tail=200)      → recent log lines  (read-only OK)
+devdock_exec(repo, "python main.py")  → run in pod    (read-write only)
+</pre>
+  <div class="box ok">
+    <div class="t">Why this matters</div>
+    With these verbs the autonomous-dev loop can: detect a crashed pod (<code>devdock_status</code>), read the traceback (<code>devdock_logs</code>), fix the code, and restart (<code>devdock_exec</code>) — <b>with no human in the loop</b>. devdock is the actuator that vision was missing.
+  </div>
+
+  <!-- ============================================================= -->
+  <h2 id="layout">15 · Repo layout</h2>
+<pre>
+devdock/
+  packages/
+    core/        <span class="c"># service layer: registry, reconciler, supervisor,</span>
+                 <span class="c">#                ptyBroker, logTailer, crashWatch, stateStore</span>
+    daemon/      <span class="c"># Fastify + ws + MCP entry; thin transport over core</span>
+    web/         <span class="c"># Svelte + xterm.js dashboard</span>
+    tray/        <span class="c"># Tauri menu-bar shell (phase 2)</span>
+  pnpm-workspace.yaml
+  package.json
+</pre>
+
+  <!-- ============================================================= -->
+  <h2 id="perf">16 · Performance — will it slow the laptop?</h2>
+  <p><b>The daemon itself: no.</b> Idle subprocess manager + log tailers + websockets — a few tens of MB RAM, ~0% CPU at rest.</p>
+  <p><b>The cost is what it runs, and devdock is the cure, not the cause:</b></p>
+  <ul>
+    <li><b>Builds run in-cluster</b> (BuildKit per the repo's devspace.yaml) → the heavy compile is off your machine.</li>
+    <li>The real local cost is the <b>file-sync watcher</b> inside each running <code>devspace dev</code> — scales with (running repos) × (files watched). The killer is watching <code>node_modules</code>/<code>.venv</code>/<code>.git</code>.</li>
+    <li>Because <b>kill = purge is one click</b>, you run only the repos you're touching — <b>net less</b> load than the status quo of leaving everything up.</li>
+  </ul>
+  <h4>Mitigations baked in</h4>
+  <ul>
+    <li>Sync excludes for <code>node_modules</code>, <code>.venv</code>, <code>.git</code>, build dirs.</li>
+    <li>"Pause sync" on idle repos without a full purge.</li>
+    <li>Per-repo resource readout in the UI so you can spot the hog.</li>
+  </ul>
+
+  <!-- ============================================================= -->
+  <h2 id="phasing">17 · Phasing</h2>
+  <ol>
+    <li><b>Phase 1 — daemon + web UI.</b> TS daemon (registry, reconcile, supervisor, ptyBroker, logTailer) + a browser dashboard with xterm.js. Start/kill/build/logs/terminal on <code>localhost</code>. This is the whole product minus polish.</li>
+    <li><b>Phase 2 — Tauri menu-bar.</b> Tray with glanceable status dots; click to pop the web UI for the one repo you care about. Now it's an always-there background app with a face.</li>
+    <li><b>Phase 3 — MCP server.</b> Trivial once <code>core</code> exists — a second entry point over the same functions. This is what plugs devdock into the autonomous-dev machine.</li>
+  </ol>
+
+  <!-- ============================================================= -->
+  <h2 id="vision">18 · The bigger machine devdock plugs into</h2>
+  <p>devdock isn't a side project — it's the <b>control plane</b> for a larger goal: handing development of a backend module to an AI agent and getting out of the loop. That machine has a substrate (fast DB access, stable pod, token/latency signals), a verification spine (eval + score timeline), and a Jira intake/outflow ring. devdock is the piece that lets the agent <b>operate the pod itself</b>:</p>
+  <ul>
+    <li>Restart a crashed <code>main.py</code> during a nightly run.</li>
+    <li>Read logs to diagnose a failing flow.</li>
+    <li>Wait on real pod readiness instead of a human watching a terminal.</li>
+  </ul>
+  <p>Its read-only/read-write toggle becomes the dial for how much autonomy the agent gets. Same control surface, two operators.</p>
+
+  <!-- ============================================================= -->
+  <h2 id="rules">19 · Design rules (non-negotiables)</h2>
+  <ol>
+    <li><b>One brain.</b> All logic in <code>core</code>; clients are thin. GUI and MCP never diverge.</li>
+    <li><b>Don't reimplement the CLIs.</b> Shell out to <code>devspace</code>/<code>kubectl</code>; never a k8s client lib for v1.</li>
+    <li><b>State from the cluster, not memory.</b> Always reconcile; adopt external pods; survive restarts.</li>
+    <li><b>tmux owns the long-running process</b>, never the daemon's own child handle.</li>
+    <li><b>One writer per terminal.</b> Read-only is the default; write is a held lock / scoped token.</li>
+    <li><b>API-first.</b> Daemon HTTP/WS is the contract; menu-bar, web, MCP, CLI are all clients of it.</li>
+    <li><b>Light by default.</b> Always-on means low idle footprint; Tauri over Electron; purge over leaving things up.</li>
+  </ol>
+
+  <div class="foot">
+    devdock · design &amp; architecture spec · ~/Code/Personal/devdock/devdock.html<br>
+    Stack: TypeScript · Fastify · node-pty · tmux · kubectl/devspace · Svelte + xterm.js · Tauri · TS MCP SDK · SQLite
+  </div>
+
+</main>
+</div>
+</body>
+</html>
