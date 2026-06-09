@@ -10,5 +10,6 @@ export {
   sessionName,
   type ScanOptions,
 } from './registry.js'
+export { Supervisor, shellQuote, type Runner } from './supervisor.js'
 
 export const version = '0.0.0'
