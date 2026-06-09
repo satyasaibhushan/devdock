@@ -18,5 +18,13 @@ export {
   RingBuffer,
   type LogSubscriber,
 } from './logTailer.js'
+export {
+  PtyBroker,
+  WriteLock,
+  attachArgs,
+  type PtyLike,
+  type PtySpawn,
+  type TermSession,
+} from './ptyBroker.js'
 
 export const version = '0.0.0'

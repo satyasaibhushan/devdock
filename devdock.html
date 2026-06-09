@@ -450,7 +450,7 @@ devdock/
     <li>✓ <code>supervisor</code> — start/build/kill via tmux + <code>devspace</code> subprocesses; session listing</li>
     <li>✓ <code>reconciler</code> — merge registry (desired) ⇄ cluster reality (actual) → status per repo</li>
     <li>✓ <code>logTailer</code> — <code>kubectl logs -f</code> → ring buffer → fan-out to subscribers</li>
-    <li>☐ <code>ptyBroker</code> — node-pty ↔ <code>tmux attach</code>; single write-lock, resize, teardown</li>
+    <li>✓ <code>ptyBroker</code> — node-pty ↔ <code>tmux attach</code>; single write-lock, resize, teardown</li>
     <li>☐ <code>crashWatch</code> — pod restartCount + traceback detection; emit crash events</li>
   </ul>
 
