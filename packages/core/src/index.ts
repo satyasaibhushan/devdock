@@ -12,5 +12,11 @@ export {
 } from './registry.js'
 export { Supervisor, shellQuote, type Runner } from './supervisor.js'
 export { Reconciler, deriveStatus, parsePods } from './reconciler.js'
+export {
+  LogTailer,
+  LogHub,
+  RingBuffer,
+  type LogSubscriber,
+} from './logTailer.js'
 
 export const version = '0.0.0'
