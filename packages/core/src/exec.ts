@@ -15,10 +15,11 @@ export interface RunOptions {
   env?: NodeJS.ProcessEnv
 }
 
-/** Run a command to completion and capture its output. Never rejects on a
- *  non-zero exit — inspect `code`. Rejects only if the binary can't spawn. */
+/** Run a command to completion and capture its output. Never rejects — a
+ *  non-zero exit (inspect `code`) and a missing binary (code 127, like a shell)
+ *  are both reported in the result so one absent CLI can't crash the daemon. */
 export function run(cmd: string, args: string[], opts: RunOptions = {}): Promise<RunResult> {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     const child = spawn(cmd, args, { cwd: opts.cwd, env: opts.env })
     let stdout = ''
     let stderr = ''
@@ -28,15 +29,17 @@ export function run(cmd: string, args: string[], opts: RunOptions = {}): Promise
       timer = setTimeout(() => child.kill('SIGKILL'), opts.timeoutMs)
     }
 
-    child.stdout.on('data', (d) => {
+    child.stdout?.on('data', (d) => {
       stdout += d
     })
-    child.stderr.on('data', (d) => {
+    child.stderr?.on('data', (d) => {
       stderr += d
     })
     child.on('error', (err) => {
       if (timer) clearTimeout(timer)
-      reject(err)
+      const code = (err as NodeJS.ErrnoException).code === 'ENOENT' ? 127 : -1
+      const hint = code === 127 ? `${cmd}: command not found` : err.message
+      resolve({ code, stdout, stderr: stderr || hint })
     })
     child.on('close', (code) => {
       if (timer) clearTimeout(timer)

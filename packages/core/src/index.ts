@@ -38,5 +38,12 @@ export {
   type ServiceOptions,
   type ServiceDeps,
 } from './service.js'
+export {
+  checkTools,
+  missingToolWarnings,
+  DEFAULT_TOOLS,
+  type ToolCheck,
+  type ToolStatus,
+} from './preflight.js'
 
 export const version = '0.0.0'

@@ -1,7 +1,7 @@
 // @devdock/daemon — the only brain. Composes the core Service with HTTP + WS.
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { Service } from '@devdock/core'
+import { Service, checkTools, missingToolWarnings } from '@devdock/core'
 import { buildApp } from './routes.js'
 import { attachWs } from './wsServer.js'
 
@@ -9,6 +9,10 @@ const PORT = Number(process.env.DEVDOCK_PORT ?? 7717)
 const HOST = process.env.DEVDOCK_HOST ?? '127.0.0.1'
 
 async function main() {
+  for (const w of missingToolWarnings(await checkTools())) {
+    console.warn(`devdock: ${w}`)
+  }
+
   const roots = (process.env.DEVDOCK_ROOTS ?? join(homedir(), 'Code')).split(':').filter(Boolean)
   const service = new Service({
     roots,
