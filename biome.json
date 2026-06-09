@@ -6,7 +6,7 @@
     "useIgnoreFile": true
   },
   "files": {
-    "ignore": ["dist", "node_modules", "*.html"]
+    "ignore": ["dist", "node_modules", "*.html", "**/*.svelte"]
   },
   "formatter": {
     "enabled": true,

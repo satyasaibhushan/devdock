@@ -1,0 +1,65 @@
+:root {
+  --bg: #0f1419;
+  --panel: #161c24;
+  --panel2: #1b232d;
+  --ink: #e6edf3;
+  --muted: #9aa7b4;
+  --line: #2a3441;
+  --accent: #3fa7ff;
+  --ok: #46d39a;
+  --warn: #f0b34a;
+  --danger: #f06b6b;
+  --mono: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 14px;
+}
+.dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+}
+.dot.RUNNING_MANAGED {
+  background: var(--ok);
+}
+.dot.RUNNING_EXTERNAL {
+  background: var(--warn);
+}
+.dot.CRASHED {
+  background: var(--danger);
+}
+.dot.BUILDING {
+  background: var(--accent);
+}
+.dot.STOPPED {
+  background: #5d6b78;
+}
+button {
+  font-family: var(--sans);
+  background: var(--panel2);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+button:hover {
+  border-color: var(--accent);
+}
+button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+code {
+  font-family: var(--mono);
+  color: #cde3ff;
+}

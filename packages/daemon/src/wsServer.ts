@@ -34,9 +34,9 @@ function matchRoute(pathname: string): Route | undefined {
 }
 
 function handle(ws: WebSocket, route: Route, url: URL, service: Service): void {
-  if (route.kind === 'events') return handleEvents(ws, service)
-  if (route.kind === 'logs') return handleLogs(ws, service, route.id)
-  return handleTerminal(ws, service, route.id, url)
+  if (route.kind === 'events') handleEvents(ws, service)
+  else if (route.kind === 'logs') handleLogs(ws, service, route.id)
+  else handleTerminal(ws, service, route.id, url)
 }
 
 function send(ws: WebSocket, obj: unknown): void {
