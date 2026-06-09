@@ -454,12 +454,12 @@ devdock/
     <li>✓ <code>crashWatch</code> — pod restartCount + traceback detection; emit crash events</li>
   </ul>
 
-  <h3>Phase 1 · Daemon <span style="color:var(--muted);font-size:13px">(<code>packages/daemon</code>, Fastify + ws)</span></h3>
+  <h3>Phase 1 · Daemon <span style="color:var(--accent2);font-size:13px">✓ done</span> <span style="color:var(--muted);font-size:13px">(<code>packages/daemon</code>, Fastify + ws)</span></h3>
   <ul>
-    <li>☐ HTTP: <code>/health</code>, <code>/repos</code>, <code>/repos/:id</code>, <code>/repos/:id/pods</code></li>
-    <li>☐ HTTP control: <code>start</code> / <code>build</code> / <code>stop</code> / <code>restart</code></li>
-    <li>☐ WS: <code>/repos/:id/logs</code>, <code>/repos/:id/terminal?mode=ro|rw</code>, <code>/events</code></li>
-    <li>☐ launchd plist for always-on boot</li>
+    <li>✓ HTTP: <code>/health</code>, <code>/repos</code>, <code>/repos/:id</code>, <code>/repos/:id/pods</code></li>
+    <li>✓ HTTP control: <code>start</code> / <code>build</code> / <code>stop</code> / <code>restart</code></li>
+    <li>✓ WS: <code>/repos/:id/logs</code>, <code>/repos/:id/terminal?mode=ro|rw</code>, <code>/events</code></li>
+    <li>✓ launchd plist + install script for always-on boot</li>
   </ul>
 
   <h3>Phase 1 · Web UI <span style="color:var(--muted);font-size:13px">(<code>packages/web</code>, Svelte + xterm.js)</span></h3>

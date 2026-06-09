@@ -11,6 +11,11 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@devdock/core": "workspace:*"
+    "@devdock/core": "workspace:*",
+    "fastify": "^5.8.5",
+    "ws": "^8.21.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.18.1"
   }
 }
