@@ -445,7 +445,7 @@ devdock/
 
   <h3>Phase 1 · Core service layer <span style="color:var(--muted);font-size:13px">(<code>packages/core</code>, transport-free)</span></h3>
   <ul>
-    <li>☐ <code>stateStore</code> — SQLite (or JSON to start): repos, sessions, status, grants</li>
+    <li>✓ <code>stateStore</code> — JSON-backed: last-known status + terminal grants</li>
     <li>☐ <code>registry</code> — scan <code>~/Code/**/.devspace/*/devspace.yaml</code>; parse workload, namespace, ports</li>
     <li>☐ <code>supervisor</code> — start/build/kill via tmux + <code>devspace</code> subprocesses; track lifecycle</li>
     <li>☐ <code>reconciler</code> — merge registry (desired) ⇄ cluster reality (actual) → status per repo</li>
