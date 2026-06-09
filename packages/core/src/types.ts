@@ -17,6 +17,8 @@ export interface Repo {
   namespace?: string
   /** Primary workload / deployment name, if declared. */
   workload?: string
+  /** Optional label selector used to find this repo's pods (e.g. `svc=app`). */
+  selector?: string
   /** Forwarded ports declared in the config. */
   ports: number[]
   /** The tmux session name devdock uses for this repo. */

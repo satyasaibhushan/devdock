@@ -11,5 +11,6 @@ export {
   type ScanOptions,
 } from './registry.js'
 export { Supervisor, shellQuote, type Runner } from './supervisor.js'
+export { Reconciler, deriveStatus, parsePods } from './reconciler.js'
 
 export const version = '0.0.0'
