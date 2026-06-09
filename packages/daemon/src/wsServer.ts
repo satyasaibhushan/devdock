@@ -63,9 +63,21 @@ function handleLogs(ws: WebSocket, service: Service, id: string): void {
 
 function handleTerminal(ws: WebSocket, service: Service, id: string, url: URL): void {
   const mode: TermMode = url.searchParams.get('mode') === 'rw' ? 'rw' : 'ro'
+  // The socket can close (or error) before openTerminal() resolves. Track that so
+  // the PTY spawned by the pending promise is torn down immediately rather than
+  // orphaned — orphaned attaches leak /dev/ptmx slots until the pool is exhausted.
+  let socketClosed = false
+  ws.on('close', () => {
+    socketClosed = true
+  })
+  ws.on('error', () => ws.close())
   service
     .openTerminal(id, mode)
     .then((term) => {
+      if (socketClosed) {
+        term.close()
+        return
+      }
       term.onData((data) => {
         if (ws.readyState === WebSocket.OPEN) ws.send(data)
       })
