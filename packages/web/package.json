@@ -1,0 +1,10 @@
+{
+  "name": "@devdock/web",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "echo \"@devdock/web: Svelte + xterm.js dashboard — scaffolded in Phase 1\"",
+    "typecheck": "echo \"@devdock/web: no TS yet\""
+  }
+}
