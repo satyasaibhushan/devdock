@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { Reconciler, deriveStatus, parsePods } from './reconciler.js'
+import { Reconciler, deriveStatus, matchPods, parsePods } from './reconciler.js'
 import type { PodInfo, Repo } from './types.js'
 
 const ready: PodInfo = { name: 'p', phase: 'Running', ready: true, restartCount: 0 }
@@ -49,6 +49,26 @@ describe('parsePods', () => {
   })
 })
 
+describe('matchPods', () => {
+  const pods: PodInfo[] = [
+    { name: 'career-service-ui-devspace-abc', phase: 'Running', ready: true, restartCount: 0 },
+    { name: 'registry-74cf9445-fzkg5', phase: 'Running', ready: true, restartCount: 23 },
+  ]
+  it('keeps only pods named after the project, dropping unrelated ones', () => {
+    expect(matchPods(pods, 'career-service-ui').map((p) => p.name)).toEqual([
+      'career-service-ui-devspace-abc',
+    ])
+  })
+  it('matches an exact name and a hyphen-prefixed name', () => {
+    expect(
+      matchPods([{ name: 'svc', phase: 'Running', ready: true, restartCount: 0 }], 'svc'),
+    ).toHaveLength(1)
+  })
+  it('an empty name attributes nothing', () => {
+    expect(matchPods(pods, '  ')).toEqual([])
+  })
+})
+
 describe('Reconciler', () => {
   const repo: Repo = {
     id: 'svc',
@@ -66,7 +86,7 @@ describe('Reconciler', () => {
       stdout: JSON.stringify({
         items: [
           {
-            metadata: { name: 'p' },
+            metadata: { name: 'svc-devspace-xyz' },
             status: { phase: 'Running', containerStatuses: [{ ready: true, restartCount: 0 }] },
           },
         ],

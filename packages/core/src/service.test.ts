@@ -33,7 +33,7 @@ describe('Service', () => {
     const podsJson = JSON.stringify({
       items: [
         {
-          metadata: { name: 'app-1' },
+          metadata: { name: 'svc-a-app-1' },
           status: { phase: 'Running', containerStatuses: [{ ready: true, restartCount: 0 }] },
         },
       ],

@@ -11,7 +11,7 @@ export {
   type ScanOptions,
 } from './registry.js'
 export { Supervisor, shellQuote, type Runner } from './supervisor.js'
-export { Reconciler, deriveStatus, parsePods } from './reconciler.js'
+export { Reconciler, deriveStatus, parsePods, matchPods } from './reconciler.js'
 export {
   LogTailer,
   LogHub,

@@ -21,6 +21,16 @@ export function deriveStatus(pods: PodInfo[], hasSession: boolean): RepoStatus {
   return 'STOPPED'
 }
 
+/** Keep only pods that belong to this repo by devspace's naming convention:
+ *  pods are named `<project>-...` / `<project>-devspace-...`. Without this, an
+ *  unscoped namespace query attributes every pod (e.g. a crashed `registry`) to
+ *  every repo. An empty/whitespace name matches nothing (can't attribute). */
+export function matchPods(pods: PodInfo[], name: string): PodInfo[] {
+  const n = name.trim()
+  if (!n) return []
+  return pods.filter((p) => p.name === n || p.name.startsWith(`${n}-`))
+}
+
 /** Parse `kubectl get pods -o json` into PodInfo[]. Defensive against junk. */
 export function parsePods(json: string): PodInfo[] {
   let doc: unknown
@@ -71,7 +81,10 @@ export class Reconciler {
     if (repo.selector) args.push('-l', repo.selector)
     const r = await this.runner('kubectl', args).catch(() => undefined)
     if (!r || r.code !== 0) return []
-    return parsePods(r.stdout)
+    // Attribute pods to this repo by name (devspace names pods after the
+    // project) unless an explicit label selector already scoped the query.
+    const pods = parsePods(r.stdout)
+    return repo.selector ? pods : matchPods(pods, repo.name)
   }
 }
 
