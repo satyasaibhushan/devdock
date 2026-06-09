@@ -2,6 +2,14 @@
 // Read-only is the default; read-write is a held lock (spec design rule §5).
 import type { Repo, TermMode } from './types.js'
 
+/**
+ * Grace period before a closed pty is reaped. node-pty leaks the master
+ * /dev/ptmx fd if killed in the same event-loop turn it was spawned, so teardown
+ * is deferred at least this long. Empirically ~10ms suffices; 50ms is a safe
+ * margin and imperceptible for a closing terminal.
+ */
+const PTY_TEARDOWN_GRACE_MS = 50
+
 /** Minimal subset of node-pty's IPty the broker depends on (keeps tests pty-free). */
 export interface PtyLike {
   onData(cb: (data: string) => void): void
@@ -9,6 +17,14 @@ export interface PtyLike {
   write(data: string): void
   resize(cols: number, rows: number): void
   kill(): void
+  /**
+   * Full teardown: destroys the master read stream and releases the /dev/ptmx
+   * slot. node-pty's kill() only signals the child — it leaves the master fd
+   * open until the (possibly never-flowing) read stream emits 'close', so a
+   * terminal closed before any onData consumer attached would leak a PTY.
+   * Optional: injected test fakes fall back to kill().
+   */
+  destroy?(): void
 }
 
 export type PtySpawn = (
@@ -20,8 +36,22 @@ export type PtySpawn = (
 /** Lazy real node-pty spawner (imported only when no spawner is injected). */
 async function defaultSpawn(): Promise<PtySpawn> {
   const pty = await import('node-pty')
-  return (file, args, opts) =>
-    pty.spawn(file, args, { cols: opts.cols, rows: opts.rows, name: 'xterm-color' })
+  return (file, args, opts) => {
+    const p = pty.spawn(file, args, { cols: opts.cols, rows: opts.rows, name: 'xterm-color' })
+    return {
+      onData: (cb) => p.onData(cb),
+      onExit: (cb) => p.onExit(() => cb()),
+      write: (data) => p.write(data),
+      resize: (cols, rows) => p.resize(cols, rows),
+      kill: () => p.kill(),
+      // node-pty's UnixTerminal exposes destroy(); WindowsTerminal does not.
+      destroy: () => {
+        const d = (p as unknown as { destroy?: () => void }).destroy
+        if (typeof d === 'function') d.call(p)
+        else p.kill()
+      },
+    }
+  }
 }
 
 /** The tmux command a terminal of `mode` attaches with (spec §8). */
@@ -81,11 +111,36 @@ export class PtyBroker {
     const pty = spawn('tmux', attachArgs(repo.session, mode), { cols, rows })
 
     let closed = false
+    const teardown = () => {
+      // Two-step teardown. kill() SIGHUPs the child (the `tmux attach` client) so
+      // it detaches and exits — node-pty's destroy() alone defers that SIGHUP to a
+      // socket 'close' event that never fires when the read stream was never
+      // consumed, stranding the attach client. destroy() then releases the master
+      // /dev/ptmx fd regardless of stream flow state.
+      try {
+        pty.kill()
+      } catch {
+        /* pid already gone */
+      }
+      try {
+        pty.destroy?.()
+      } catch {
+        /* socket already torn down */
+      }
+    }
     const close = () => {
       if (closed) return
       closed = true
-      pty.kill()
+      // Release the write-lock immediately so a new rw terminal isn't blocked.
       if (token) this.locks.release(repo.id, token)
+      // Defer the fd teardown past the spawn tick. node-pty cannot release the
+      // master /dev/ptmx fd if the pty is killed in the same event-loop turn it
+      // was spawned (libuv's PTY wiring hasn't settled) — it leaks the slot. The
+      // socket-closed-before-open()-resolved race tears down in exactly that
+      // window, so give every pty a brief grace period before reaping it. unref()
+      // keeps this timer from holding the process (or test runner) open.
+      const timer: ReturnType<typeof setTimeout> = setTimeout(teardown, PTY_TEARDOWN_GRACE_MS)
+      timer.unref?.()
     }
     pty.onExit(close)
 
