@@ -1,0 +1,140 @@
+// registry — discover DevSpace-enabled repos (spec §12).
+// Scans configured roots for devspace.yaml and parses workload, namespace, ports.
+import { type Dirent, readFileSync, readdirSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { basename, dirname, join } from 'node:path'
+import { parse as parseYaml } from 'yaml'
+import type { Repo } from './types.js'
+
+const IGNORE_DIRS = new Set(['node_modules', '.git', '.venv', 'dist', 'build', 'vendor'])
+const CONFIG_NAME = 'devspace.yaml'
+
+/** tmux session name devdock uses for a repo (spec §5). */
+export function sessionName(id: string): string {
+  return `devdock-${id}`
+}
+
+/** Parse the relevant fields out of a devspace.yaml string. Pure + testable. */
+export function parseDevspaceConfig(yamlText: string): {
+  name?: string
+  namespace?: string
+  workload?: string
+  ports: number[]
+} {
+  let doc: unknown
+  try {
+    doc = parseYaml(yamlText)
+  } catch {
+    return { ports: [] }
+  }
+  if (doc === null || typeof doc !== 'object') return { ports: [] }
+  const d = doc as Record<string, unknown>
+
+  const name = typeof d.name === 'string' ? d.name : undefined
+  const deployments = asRecord(d.deployments)
+  const dev = asRecord(d.dev)
+
+  // workload: first deployment, else first dev target.
+  const workload = firstKey(deployments) ?? firstKey(dev)
+
+  // namespace: top-level, or a deployment's kubectl/helm namespace.
+  let namespace = typeof d.namespace === 'string' ? d.namespace : undefined
+
+  const ports = new Set<number>()
+  for (const target of Object.values(dev ?? {})) {
+    const t = asRecord(target)
+    if (!t) continue
+    if (!namespace && typeof t.namespace === 'string') namespace = t.namespace
+    collectPorts(t.ports, ports)
+    collectPorts(t.forward, ports)
+  }
+
+  return { name, namespace, workload, ports: [...ports].sort((a, b) => a - b) }
+}
+
+function asRecord(v: unknown): Record<string, unknown> | undefined {
+  return v !== null && typeof v === 'object' && !Array.isArray(v)
+    ? (v as Record<string, unknown>)
+    : undefined
+}
+
+function firstKey(r: Record<string, unknown> | undefined): string | undefined {
+  if (!r) return undefined
+  for (const k of Object.keys(r)) return k
+  return undefined
+}
+
+function collectPorts(v: unknown, out: Set<number>): void {
+  if (!Array.isArray(v)) return
+  for (const entry of v) {
+    const e = asRecord(entry)
+    const raw = e?.port
+    // devspace port mappings look like "8080:80" or 8080.
+    const local = typeof raw === 'string' ? raw.split(':')[0] : raw
+    const n = Number(local)
+    if (Number.isFinite(n) && n > 0) out.add(n)
+  }
+}
+
+/** Recursively find devspace.yaml paths under a root, skipping noisy dirs. */
+function findConfigs(root: string, depth: number, out: string[]): void {
+  if (depth < 0) return
+  let entries: Dirent[]
+  try {
+    entries = readdirSync(root, { withFileTypes: true })
+  } catch {
+    return
+  }
+  for (const e of entries) {
+    if (e.isFile() && e.name === CONFIG_NAME) out.push(join(root, e.name))
+    else if (e.isDirectory() && !IGNORE_DIRS.has(e.name) && !e.name.startsWith('.'))
+      findConfigs(join(root, e.name), depth - 1, out)
+  }
+}
+
+export interface ScanOptions {
+  /** Roots to scan. Defaults to ~/Code. */
+  roots?: string[]
+  /** Max directory depth to recurse. */
+  maxDepth?: number
+}
+
+/** Scan the filesystem and build the repo registry. */
+export function scanRepos(opts: ScanOptions = {}): Repo[] {
+  const roots = opts.roots ?? [join(homedir(), 'Code')]
+  const maxDepth = opts.maxDepth ?? 4
+  const configs: string[] = []
+  for (const root of roots) findConfigs(root, maxDepth, configs)
+
+  const repos: Repo[] = []
+  const seen = new Set<string>()
+  for (const configPath of configs) {
+    // repo root is the dir holding devspace.yaml (or its parent if under .devspace/).
+    let repoPath = dirname(configPath)
+    if (basename(repoPath) === '.devspace') repoPath = dirname(repoPath)
+    if (seen.has(repoPath)) continue
+    seen.add(repoPath)
+
+    const id = basename(repoPath)
+    const cfg = parseDevspaceConfig(safeRead(configPath))
+    repos.push({
+      id,
+      name: cfg.name ?? id,
+      path: repoPath,
+      configPath,
+      namespace: cfg.namespace,
+      workload: cfg.workload,
+      ports: cfg.ports,
+      session: sessionName(id),
+    })
+  }
+  return repos.sort((a, b) => a.id.localeCompare(b.id))
+}
+
+function safeRead(path: string): string {
+  try {
+    return readFileSync(path, 'utf8')
+  } catch {
+    return ''
+  }
+}

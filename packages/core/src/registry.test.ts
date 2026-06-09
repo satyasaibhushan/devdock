@@ -1,0 +1,57 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { parseDevspaceConfig, scanRepos, sessionName } from './registry.js'
+
+describe('parseDevspaceConfig', () => {
+  it('extracts name, namespace, workload, and ports', () => {
+    const cfg = parseDevspaceConfig(`
+name: career-service
+deployments:
+  app:
+    helm: {}
+dev:
+  app:
+    namespace: career
+    ports:
+      - port: "8080:80"
+      - port: 5005
+`)
+    expect(cfg.name).toBe('career-service')
+    expect(cfg.workload).toBe('app')
+    expect(cfg.namespace).toBe('career')
+    expect(cfg.ports).toEqual([5005, 8080])
+  })
+
+  it('is defensive against junk', () => {
+    expect(parseDevspaceConfig(': not : valid :')).toEqual({ ports: [] })
+    expect(parseDevspaceConfig('')).toEqual({ ports: [] })
+  })
+})
+
+describe('sessionName', () => {
+  it('prefixes with devdock-', () => {
+    expect(sessionName('career-service')).toBe('devdock-career-service')
+  })
+})
+
+describe('scanRepos', () => {
+  let root: string
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'devdock-scan-'))
+  })
+  afterEach(() => rmSync(root, { recursive: true, force: true }))
+
+  it('discovers repos and skips ignored dirs', () => {
+    mkdirSync(join(root, 'svc-a'), { recursive: true })
+    writeFileSync(join(root, 'svc-a', 'devspace.yaml'), 'name: svc-a\n')
+    mkdirSync(join(root, 'svc-a', 'node_modules', 'pkg'), { recursive: true })
+    writeFileSync(join(root, 'svc-a', 'node_modules', 'pkg', 'devspace.yaml'), 'name: nope\n')
+
+    const repos = scanRepos({ roots: [root] })
+    expect(repos).toHaveLength(1)
+    expect(repos[0]?.id).toBe('svc-a')
+    expect(repos[0]?.session).toBe('devdock-svc-a')
+  })
+})

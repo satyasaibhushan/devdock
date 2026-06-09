@@ -4,5 +4,11 @@
 export * from './types.js'
 export * from './exec.js'
 export { StateStore, type Grant } from './stateStore.js'
+export {
+  scanRepos,
+  parseDevspaceConfig,
+  sessionName,
+  type ScanOptions,
+} from './registry.js'
 
 export const version = '0.0.0'
