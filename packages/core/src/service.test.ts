@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { RunResult } from './exec.js'
+import { PtyBroker } from './ptyBroker.js'
 import { Service } from './service.js'
 
 let root: string
@@ -63,6 +64,51 @@ describe('Service', () => {
     const svc = new Service({ roots: [root], stateFile })
     svc.rescan()
     await expect(svc.start('nope')).rejects.toThrow(/unknown repo/)
+  })
+
+  it('terminal falls back to a devspace-enter pod shell for external deployments', async () => {
+    const podsJson = JSON.stringify({
+      items: [
+        {
+          metadata: { name: 'svc-a-devspace-1' },
+          status: { phase: 'Running', containerStatuses: [{ ready: true, restartCount: 0 }] },
+        },
+      ],
+    })
+    const spawns: Array<{ file: string; args: string[]; cwd?: string }> = []
+    const broker = new PtyBroker((file, args, opts) => {
+      spawns.push({ file, args, cwd: opts.cwd })
+      return {
+        onData: () => {},
+        onExit: () => {},
+        write: () => {},
+        resize: () => {},
+        kill: () => {},
+      }
+    })
+    // no tmux session, but live pods → RUNNING_EXTERNAL
+    const svc = new Service(
+      { roots: [root], stateFile },
+      { runner: cannedRunner(podsJson, false), broker },
+    )
+    svc.rescan()
+    await svc.reconcileAll()
+    expect(svc.get('svc-a')?.status).toBe('RUNNING_EXTERNAL')
+
+    await svc.openTerminal('svc-a', 'ro')
+    expect(spawns[0]?.file).toBe('devspace')
+    expect(spawns[0]?.args).toEqual(['enter', '--pod', 'svc-a-devspace-1'])
+    expect(spawns[0]?.cwd).toBe(join(root, 'svc-a'))
+  })
+
+  it('terminal refuses when nothing is running', async () => {
+    const svc = new Service(
+      { roots: [root], stateFile },
+      { runner: cannedRunner('{"items":[]}', false) },
+    )
+    svc.rescan()
+    await svc.reconcileAll()
+    await expect(svc.openTerminal('svc-a', 'ro')).rejects.toThrow(/not running/)
   })
 
   it('restart rolls the workload deployment', async () => {

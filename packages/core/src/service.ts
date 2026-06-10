@@ -182,8 +182,20 @@ export class Service {
   }
 
   // ---- terminal (spec §8) ----
-  openTerminal(id: string, mode: TermMode, cols?: number, rows?: number) {
-    return this.broker.open(this.repoOrThrow(id), mode, cols, rows)
+  /**
+   * Managed repos attach the devdock tmux session; externally-started
+   * deployments (pods but no session) fall back to a `devspace enter` pod shell.
+   */
+  async openTerminal(id: string, mode: TermMode, cols?: number, rows?: number) {
+    const repo = this.repoOrThrow(id)
+    if (await this.supervisor.hasSession(repo)) {
+      return this.broker.open(repo, mode, cols, rows)
+    }
+    const pods = this.states.get(id)?.pods ?? []
+    if (pods.length > 0) {
+      return this.broker.openShell(repo, mode, cols, rows, pods[0]?.name)
+    }
+    throw new Error(`${id} is not running — start it first`)
   }
 
   // ---- reconcile loop ----

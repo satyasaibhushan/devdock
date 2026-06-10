@@ -30,14 +30,19 @@ export interface PtyLike {
 export type PtySpawn = (
   file: string,
   args: string[],
-  opts: { cols: number; rows: number },
+  opts: { cols: number; rows: number; cwd?: string },
 ) => PtyLike
 
 /** Lazy real node-pty spawner (imported only when no spawner is injected). */
 async function defaultSpawn(): Promise<PtySpawn> {
   const pty = await import('node-pty')
   return (file, args, opts) => {
-    const p = pty.spawn(file, args, { cols: opts.cols, rows: opts.rows, name: 'xterm-color' })
+    const p = pty.spawn(file, args, {
+      cols: opts.cols,
+      rows: opts.rows,
+      name: 'xterm-color',
+      cwd: opts.cwd,
+    })
     return {
       onData: (cb) => p.onData(cb),
       onExit: (cb) => p.onExit(() => cb()),
@@ -99,8 +104,32 @@ export class PtyBroker {
     this.spawn = spawn
   }
 
-  /** Open a terminal. Read-write requires (and holds) the repo's write-lock. */
-  async open(repo: Repo, mode: TermMode, cols = 80, rows = 24): Promise<TermSession> {
+  /** Attach the repo's tmux dev session. Read-write requires (and holds) the repo's write-lock. */
+  open(repo: Repo, mode: TermMode, cols = 80, rows = 24): Promise<TermSession> {
+    return this.attach(repo, mode, 'tmux', attachArgs(repo.session, mode), undefined, cols, rows)
+  }
+
+  /**
+   * Shell into the repo's running container via `devspace enter` — the fallback
+   * for externally-started deployments that have pods but no devdock tmux
+   * session. Runs in the repo directory so devspace resolves namespace/selector
+   * from the project's own devspace.yaml (which imports/vars make unparseable
+   * statically). Passing the pod skips devspace's interactive picker.
+   */
+  openShell(repo: Repo, mode: TermMode, cols = 80, rows = 24, pod?: string): Promise<TermSession> {
+    const args = pod ? ['enter', '--pod', pod] : ['enter']
+    return this.attach(repo, mode, 'devspace', args, repo.path, cols, rows)
+  }
+
+  private async attach(
+    repo: Repo,
+    mode: TermMode,
+    file: string,
+    args: string[],
+    cwd: string | undefined,
+    cols: number,
+    rows: number,
+  ): Promise<TermSession> {
     let token: symbol | null = null
     if (mode === 'rw') {
       token = this.locks.acquire(repo.id)
@@ -108,7 +137,7 @@ export class PtyBroker {
     }
 
     const spawn = await this.resolveSpawn()
-    const pty = spawn('tmux', attachArgs(repo.session, mode), { cols, rows })
+    const pty = spawn(file, args, { cols, rows, cwd })
 
     let closed = false
     const teardown = () => {

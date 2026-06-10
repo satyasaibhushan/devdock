@@ -70,6 +70,29 @@ describe('PtyBroker', () => {
     expect(broker.locks.isHeld('svc')).toBe(false)
   })
 
+  it('openShell runs `devspace enter` in the repo directory', async () => {
+    const calls: Array<{ file: string; args: string[]; cwd?: string }> = []
+    const pty = fakePty()
+    const spawn: PtySpawn = (file, args, opts) => {
+      calls.push({ file, args, cwd: opts.cwd })
+      return pty
+    }
+    const broker = new PtyBroker(spawn)
+    const term = await broker.openShell(repo, 'ro')
+    expect(calls).toEqual([{ file: 'devspace', args: ['enter'], cwd: '/p' }])
+    term.write('whoami')
+    expect(pty.written).toEqual([])
+  })
+
+  it('openShell read-write holds the same per-repo lock as open', async () => {
+    const broker = new PtyBroker(spawnOf(fakePty()))
+    const term = await broker.openShell(repo, 'rw')
+    expect(broker.locks.isHeld('svc')).toBe(true)
+    await expect(broker.open(repo, 'rw')).rejects.toThrow(/write-lock/)
+    term.close()
+    expect(broker.locks.isHeld('svc')).toBe(false)
+  })
+
   it('releases the lock when the pty exits', async () => {
     const pty = fakePty()
     const broker = new PtyBroker(spawnOf(pty))

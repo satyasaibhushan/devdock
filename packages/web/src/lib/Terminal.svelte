@@ -60,7 +60,10 @@
     <div class="overlay">
       <p class="title">Terminal unavailable</p>
       <p class="msg">{error}</p>
-      <p class="hint">A terminal attaches to the repo's live dev session — start it first.</p>
+      <p class="hint">
+        Attaches the dev session — or a pod shell if the deployment was started outside devdock.
+        Nothing running? Start it first.
+      </p>
     </div>
   {/if}
 </div>
