@@ -34,7 +34,15 @@ async function main() {
   process.on('SIGTERM', shutdown)
 }
 
-main().catch((err) => {
+main().catch((err: NodeJS.ErrnoException) => {
+  if (err.code === 'EADDRINUSE') {
+    // Single-instance guard: the port is the lock. A second daemon (launchd
+    // respawn racing a manual run, or vice versa) must not fight the first.
+    console.error(
+      `devdock daemon already listening on ${HOST}:${PORT} — refusing to start a second instance`,
+    )
+    process.exit(0)
+  }
   console.error('devdock daemon failed to start:', err)
   process.exit(1)
 })
