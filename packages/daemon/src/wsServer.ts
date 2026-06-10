@@ -61,8 +61,20 @@ function handleLogs(ws: WebSocket, service: Service, id: string): void {
   ws.on('close', unsubscribe)
 }
 
+/** Control-frame prefix on the terminal socket — everything else is raw keystrokes. */
+const TERM_CTL = '\x01'
+
+function dim(url: URL, key: string): number | undefined {
+  const n = Number(url.searchParams.get(key))
+  return Number.isInteger(n) && n > 0 && n <= 1000 ? n : undefined
+}
+
 function handleTerminal(ws: WebSocket, service: Service, id: string, url: URL): void {
   const mode: TermMode = url.searchParams.get('mode') === 'rw' ? 'rw' : 'ro'
+  // Open at the client's fitted size so tmux renders the full pane immediately
+  // instead of starting at the 80x24 default and redrawing.
+  const cols = dim(url, 'cols')
+  const rows = dim(url, 'rows')
   // The socket can close (or error) before openTerminal() resolves. Track that so
   // the PTY spawned by the pending promise is torn down immediately rather than
   // orphaned — orphaned attaches leak /dev/ptmx slots until the pool is exhausted.
@@ -72,7 +84,7 @@ function handleTerminal(ws: WebSocket, service: Service, id: string, url: URL): 
   })
   ws.on('error', () => ws.close())
   service
-    .openTerminal(id, mode)
+    .openTerminal(id, mode, cols, rows)
     .then((term) => {
       if (socketClosed) {
         term.close()
@@ -81,7 +93,25 @@ function handleTerminal(ws: WebSocket, service: Service, id: string, url: URL): 
       term.onData((data) => {
         if (ws.readyState === WebSocket.OPEN) ws.send(data)
       })
-      ws.on('message', (raw) => term.write(raw.toString()))
+      ws.on('message', (raw) => {
+        const text = raw.toString()
+        if (text.startsWith(TERM_CTL)) {
+          // Resize applies in any mode — a read-only viewer still needs the
+          // PTY sized to its grid for tmux to redraw correctly.
+          try {
+            const msg = JSON.parse(text.slice(1))
+            if (msg.type === 'resize') {
+              const c = Number(msg.cols)
+              const r = Number(msg.rows)
+              if (Number.isInteger(c) && Number.isInteger(r) && c > 0 && r > 0) term.resize(c, r)
+            }
+          } catch {
+            /* malformed control frame — drop it */
+          }
+          return
+        }
+        term.write(text)
+      })
       ws.on('close', () => term.close())
     })
     .catch((err: unknown) => {

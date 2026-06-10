@@ -67,6 +67,20 @@ export function openLogs(id: string): WebSocket {
   return new WebSocket(wsUrl(`/repos/${encodeURIComponent(id)}/logs`))
 }
 
-export function openTerminal(id: string, mode: 'ro' | 'rw'): WebSocket {
-  return new WebSocket(wsUrl(`/repos/${encodeURIComponent(id)}/terminal?mode=${mode}`))
+export function openTerminal(
+  id: string,
+  mode: 'ro' | 'rw',
+  cols?: number,
+  rows?: number,
+): WebSocket {
+  const size = cols && rows ? `&cols=${cols}&rows=${rows}` : ''
+  return new WebSocket(wsUrl(`/repos/${encodeURIComponent(id)}/terminal?mode=${mode}${size}`))
+}
+
+/** Control-frame prefix on the terminal socket: anything else is raw keystrokes. */
+export const TERM_CTL = '\x01'
+
+/** Tell the daemon-side PTY the terminal's new size so tmux redraws to fit. */
+export function sendResize(ws: WebSocket, cols: number, rows: number): void {
+  ws.send(`${TERM_CTL}${JSON.stringify({ type: 'resize', cols, rows })}`)
 }

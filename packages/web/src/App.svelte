@@ -2,13 +2,13 @@
   import LogViewer from './lib/LogViewer.svelte'
   import RepoList from './lib/RepoList.svelte'
   import Terminal from './lib/Terminal.svelte'
-  import { type RepoState, type Verb, fetchRepos, openEvents, runVerb } from './lib/api'
+  import { type RepoState, type RepoStatus, type Verb, fetchRepos, openEvents, runVerb } from './lib/api'
 
   let repos = $state<RepoState[]>([])
   let selectedId = $state<string | null>(null)
   let mode = $state<'ro' | 'rw'>('ro')
   let connected = $state(false)
-  let busy = $state<Verb | null>(null)
+  let busy = $state<{ id: string; verb: Verb } | null>(null)
   let toast = $state<string | null>(null)
 
   async function refresh() {
@@ -40,13 +40,35 @@
   // when its value actually changes.
   const sid = $derived(selected?.repo.id ?? '')
   const sstatus = $derived(selected?.status ?? '')
-  const verbs: Verb[] = ['start', 'build', 'restart', 'stop']
+  // What the terminal would attach to (mirrors service.openTerminal): the tmux
+  // session, a pod shell, or nothing. Keying the terminal on this — instead of
+  // the raw status — keeps it connected across status flips that don't change
+  // the attach target (BUILDING → RUNNING_MANAGED, RUNNING → CRASHED), so it
+  // stops redialing mid-session.
+  const sterm = $derived(
+    !selected ? 'none' : selected.hasSession ? 'tmux' : selected.pods.length ? 'pod' : 'none',
+  )
 
-  async function act(verb: Verb) {
-    if (!selected) return
-    busy = verb
+  // Only the verbs that make sense for the repo's current state (spec §7).
+  const ACTIONS: Record<RepoStatus, Verb[]> = {
+    STOPPED: ['start', 'build'],
+    DEPLOYED: ['start', 'build', 'stop'],
+    BUILDING: ['stop'],
+    RUNNING_MANAGED: ['restart', 'stop'],
+    RUNNING_EXTERNAL: ['start', 'restart', 'stop'],
+    CRASHED: ['restart', 'stop'],
+  }
+  const verbs = $derived(
+    selected
+      ? ACTIONS[selected.status].filter((v) => v !== 'restart' || selected.repo.workload)
+      : [],
+  )
+
+  async function act(verb: Verb, id = selected?.repo.id) {
+    if (!id || busy) return
+    busy = { id, verb }
     try {
-      await runVerb(selected.repo.id, verb)
+      await runVerb(id, verb)
       await refresh()
     } catch (e) {
       toast = `${verb} failed: ${e instanceof Error ? e.message : String(e)}`
@@ -67,7 +89,13 @@
 
 <main>
   <aside>
-    <RepoList {repos} {selectedId} onselect={(id) => (selectedId = id)} />
+    <RepoList
+      {repos}
+      {selectedId}
+      busyId={busy?.id ?? null}
+      onselect={(id) => (selectedId = id)}
+      onstart={(id) => act('start', id)}
+    />
   </aside>
 
   <section class="detail">
@@ -79,7 +107,7 @@
           <span class="pill {selected.status}">{selected.status.replace('_', ' ').toLowerCase()}</span>
         </div>
         <div class="actions">
-          {#each verbs as v}
+          {#each verbs as v (v)}
             <button
               class:danger={v === 'stop'}
               disabled={busy !== null}
@@ -112,7 +140,7 @@
               <button class:active={mode === 'rw'} onclick={() => (mode = 'rw')}>read-write</button>
             </div>
           </div>
-          {#key sid + mode + sstatus}
+          {#key sid + mode + sterm}
             <Terminal id={sid} {mode} />
           {/key}
         </div>
