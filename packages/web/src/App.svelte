@@ -33,6 +33,13 @@
   })
 
   const selected = $derived(repos.find((r) => r.repo.id === selectedId) ?? null)
+  // Memoized primitives for the stream children. `selected` is a fresh object
+  // every 4s poll, so passing `selected.repo.id` straight through would retrigger
+  // the children's $effects — tearing down and redialing their WebSockets (and
+  // the daemon-side PTY) on every refresh. A $derived string only propagates
+  // when its value actually changes.
+  const sid = $derived(selected?.repo.id ?? '')
+  const sstatus = $derived(selected?.status ?? '')
   const verbs: Verb[] = ['start', 'build', 'restart', 'stop']
 
   async function act(verb: Verb) {
@@ -91,8 +98,8 @@
       <div class="streams">
         <div class="block">
           <div class="bhead"><h3>Logs</h3></div>
-          {#key selected.repo.id}
-            <LogViewer id={selected.repo.id} />
+          {#key sid + sstatus}
+            <LogViewer id={sid} />
           {/key}
         </div>
 
@@ -104,8 +111,8 @@
               <button class:active={mode === 'rw'} onclick={() => (mode = 'rw')}>read-write</button>
             </div>
           </div>
-          {#key selected.repo.id + mode}
-            <Terminal id={selected.repo.id} {mode} />
+          {#key sid + mode + sstatus}
+            <Terminal id={sid} {mode} />
           {/key}
         </div>
       </div>
