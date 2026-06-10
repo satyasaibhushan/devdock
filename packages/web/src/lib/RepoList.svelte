@@ -132,6 +132,9 @@
   .st.BUILDING {
     color: var(--accent);
   }
+  .st.DEPLOYED {
+    color: #9fb6cc;
+  }
   .empty {
     color: var(--muted);
     font-size: 13px;

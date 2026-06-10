@@ -1,13 +1,25 @@
 // Thin client of the daemon's HTTP/WS API (spec §13). The web UI is a thin
 // client of the same contract the MCP server and tray speak.
 
-export type RepoStatus = 'RUNNING_MANAGED' | 'RUNNING_EXTERNAL' | 'CRASHED' | 'STOPPED' | 'BUILDING'
+export type RepoStatus =
+  | 'RUNNING_MANAGED'
+  | 'RUNNING_EXTERNAL'
+  | 'CRASHED'
+  | 'STOPPED'
+  | 'BUILDING'
+  | 'DEPLOYED'
 
 export interface PodInfo {
   name: string
   phase: string
   ready: boolean
   restartCount: number
+}
+
+export interface DeploymentInfo {
+  name: string
+  replicas: number
+  readyReplicas: number
 }
 
 export interface Repo {
@@ -24,6 +36,7 @@ export interface RepoState {
   repo: Repo
   status: RepoStatus
   pods: PodInfo[]
+  deployments?: DeploymentInfo[]
   hasSession: boolean
   updatedAt: number
 }

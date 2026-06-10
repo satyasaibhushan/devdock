@@ -17,6 +17,7 @@ function fakeClient(over: Partial<DaemonClient> = {}): DaemonClient {
     },
     status: 'RUNNING_MANAGED',
     pods: [{ name: 'p', phase: 'Running', ready: true, restartCount: 0 }],
+    deployments: [],
     hasSession: true,
     updatedAt: 0,
   }

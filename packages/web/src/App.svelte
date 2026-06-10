@@ -92,6 +92,7 @@
       <div class="meta">
         <code>{selected.repo.path}</code>
         <span>· {selected.pods.length} pod{selected.pods.length === 1 ? '' : 's'}</span>
+        {#if selected.status === 'DEPLOYED'}<span>· deployment present, scaled to 0</span>{/if}
         {#if selected.repo.ports.length}<span>· :{selected.repo.ports.join(' :')}</span>{/if}
       </div>
 
@@ -223,6 +224,10 @@
   .pill.BUILDING {
     color: var(--accent);
     border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  }
+  .pill.DEPLOYED {
+    color: #9fb6cc;
+    border-color: #46566a;
   }
 
   .actions {

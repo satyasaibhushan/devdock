@@ -1,12 +1,17 @@
 // reconciler — state comes from the cluster, never from memory (spec §6).
-// Queries kubectl for pod reality, checks the tmux session, derives status.
+// Queries kubectl for pod + deployment reality, checks the tmux session,
+// derives status.
 import { type RunResult, run } from './exec.js'
-import type { PodInfo, Repo, RepoState, RepoStatus } from './types.js'
+import type { DeploymentInfo, PodInfo, Repo, RepoState, RepoStatus } from './types.js'
 
 type Runner = (cmd: string, args: string[], opts?: { cwd?: string }) => Promise<RunResult>
 
 /** Derive a repo's lifecycle status from observed pods + session (spec §6 table). */
-export function deriveStatus(pods: PodInfo[], hasSession: boolean): RepoStatus {
+export function deriveStatus(
+  pods: PodInfo[],
+  hasSession: boolean,
+  hasDeployment = false,
+): RepoStatus {
   const crashed = pods.some((p) => p.restartCount > 0 || p.phase === 'Failed')
   if (crashed) return 'CRASHED'
 
@@ -18,17 +23,31 @@ export function deriveStatus(pods: PodInfo[], hasSession: boolean): RepoStatus {
 
   // No pods. A live session means devspace dev is mid-build/deploy.
   if (hasSession) return 'BUILDING'
-  return 'STOPPED'
+
+  // No pods, no session — but deployment objects in the cluster mean the repo
+  // was deployed and is merely scaled down, not absent.
+  return hasDeployment ? 'DEPLOYED' : 'STOPPED'
 }
 
-/** Keep only pods that belong to this repo by devspace's naming convention:
- *  pods are named `<project>-...` / `<project>-devspace-...`. Without this, an
- *  unscoped namespace query attributes every pod (e.g. a crashed `registry`) to
- *  every repo. An empty/whitespace name matches nothing (can't attribute). */
-export function matchPods(pods: PodInfo[], name: string): PodInfo[] {
+/** Name-prefix attribution shared by pods and deployments: devspace names both
+ *  `<project>-...` / `<project>-devspace-...`. An empty/whitespace name matches
+ *  nothing (can't attribute). */
+function matchByName<T extends { name: string }>(items: T[], name: string): T[] {
   const n = name.trim()
   if (!n) return []
-  return pods.filter((p) => p.name === n || p.name.startsWith(`${n}-`))
+  return items.filter((i) => i.name === n || i.name.startsWith(`${n}-`))
+}
+
+/** Keep only pods that belong to this repo by devspace's naming convention.
+ *  Without this, an unscoped namespace query attributes every pod (e.g. a
+ *  crashed `registry`) to every repo. */
+export function matchPods(pods: PodInfo[], name: string): PodInfo[] {
+  return matchByName(pods, name)
+}
+
+/** Keep only deployment objects that belong to this repo, same convention. */
+export function matchDeployments(deployments: DeploymentInfo[], name: string): DeploymentInfo[] {
+  return matchByName(deployments, name)
 }
 
 /** Parse `kubectl get pods -o json` into PodInfo[]. Defensive against junk. */
@@ -60,31 +79,96 @@ export function parsePods(json: string): PodInfo[] {
   return pods
 }
 
+/** Parse `kubectl get deployments -o json` into DeploymentInfo[]. Defensive against junk. */
+export function parseDeployments(json: string): DeploymentInfo[] {
+  let doc: unknown
+  try {
+    doc = JSON.parse(json)
+  } catch {
+    return []
+  }
+  const items = (doc as { items?: unknown })?.items
+  if (!Array.isArray(items)) return []
+
+  const out: DeploymentInfo[] = []
+  for (const item of items) {
+    const meta = (item as { metadata?: { name?: string } }).metadata
+    const spec = (item as { spec?: { replicas?: unknown } }).spec
+    const status = (item as { status?: { readyReplicas?: unknown } }).status
+    out.push({
+      name: meta?.name ?? '<unknown>',
+      replicas: typeof spec?.replicas === 'number' ? spec.replicas : 0,
+      readyReplicas: typeof status?.readyReplicas === 'number' ? status.readyReplicas : 0,
+    })
+  }
+  return out
+}
+
+/** One reconcile pass's worth of kubectl list results, keyed by query shape.
+ *  Repos sharing a namespace share the answer — a 47-repo pass costs one
+ *  `get pods` + one `get deployments` per namespace, not one pair per repo.
+ *  Make a fresh cache per pass; a single-repo reconcile after a verb uses its
+ *  own so it never sees pre-verb data. */
+export interface ClusterCache {
+  pods: Map<string, PodInfo[]>
+  deployments: Map<string, DeploymentInfo[]>
+}
+
+export function newClusterCache(): ClusterCache {
+  return { pods: new Map(), deployments: new Map() }
+}
+
 export class Reconciler {
   constructor(private readonly runner: Runner = run) {}
 
   /** Reconcile one repo against the cluster + its tmux session. */
-  async reconcile(repo: Repo, hasSession: boolean): Promise<RepoState> {
-    const pods = await this.fetchPods(repo)
+  async reconcile(
+    repo: Repo,
+    hasSession: boolean,
+    cache: ClusterCache = newClusterCache(),
+  ): Promise<RepoState> {
+    const pods = await this.fetchPods(repo, cache)
+    const deployments = matchDeployments(await this.fetchDeployments(repo, cache), repo.name)
     return {
       repo,
-      status: deriveStatus(pods, hasSession),
+      status: deriveStatus(pods, hasSession, deployments.length > 0),
       pods,
+      deployments,
       hasSession,
       updatedAt: nowMs(),
     }
   }
 
-  private async fetchPods(repo: Repo): Promise<PodInfo[]> {
-    const args = ['get', 'pods', '-o', 'json']
-    if (repo.namespace) args.push('-n', repo.namespace)
-    if (repo.selector) args.push('-l', repo.selector)
-    const r = await this.runner('kubectl', args).catch(() => undefined)
-    if (!r || r.code !== 0) return []
+  private async fetchPods(repo: Repo, cache: ClusterCache): Promise<PodInfo[]> {
+    const key = `${repo.namespace ?? ''}|${repo.selector ?? ''}`
+    let pods = cache.pods.get(key)
+    if (!pods) {
+      const args = ['get', 'pods', '-o', 'json']
+      if (repo.namespace) args.push('-n', repo.namespace)
+      if (repo.selector) args.push('-l', repo.selector)
+      const r = await this.runner('kubectl', args).catch(() => undefined)
+      // A failure caches as empty too — don't re-ask a broken kubectl 47 times.
+      pods = !r || r.code !== 0 ? [] : parsePods(r.stdout)
+      cache.pods.set(key, pods)
+    }
     // Attribute pods to this repo by name (devspace names pods after the
     // project) unless an explicit label selector already scoped the query.
-    const pods = parsePods(r.stdout)
     return repo.selector ? pods : matchPods(pods, repo.name)
+  }
+
+  /** Namespace-wide deployment objects; the caller attributes by name. No label
+   *  selector here — deployments follow the same naming convention as pods. */
+  private async fetchDeployments(repo: Repo, cache: ClusterCache): Promise<DeploymentInfo[]> {
+    const key = repo.namespace ?? ''
+    let deployments = cache.deployments.get(key)
+    if (!deployments) {
+      const args = ['get', 'deployments', '-o', 'json']
+      if (repo.namespace) args.push('-n', repo.namespace)
+      const r = await this.runner('kubectl', args).catch(() => undefined)
+      deployments = !r || r.code !== 0 ? [] : parseDeployments(r.stdout)
+      cache.deployments.set(key, deployments)
+    }
+    return deployments
   }
 }
 

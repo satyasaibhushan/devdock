@@ -1,7 +1,15 @@
 // Shared domain types for @devdock/core.
 
-/** Reconciled lifecycle state of a repo's workload (see spec §6). */
-export type RepoStatus = 'RUNNING_MANAGED' | 'RUNNING_EXTERNAL' | 'CRASHED' | 'STOPPED' | 'BUILDING'
+/** Reconciled lifecycle state of a repo's workload (see spec §6).
+ *  STOPPED = nothing in the cluster; DEPLOYED = deployment objects exist but
+ *  no pods run (built then scaled to zero); the rest are pod/session-derived. */
+export type RepoStatus =
+  | 'RUNNING_MANAGED'
+  | 'RUNNING_EXTERNAL'
+  | 'CRASHED'
+  | 'STOPPED'
+  | 'BUILDING'
+  | 'DEPLOYED'
 
 /** A DevSpace-enabled repo discovered by the registry (spec §12). */
 export interface Repo {
@@ -33,11 +41,21 @@ export interface PodInfo {
   restartCount: number
 }
 
+/** A deployment object observed in the cluster — exists even when scaled to zero. */
+export interface DeploymentInfo {
+  name: string
+  /** Desired replicas (spec.replicas). */
+  replicas: number
+  /** Ready replicas (status.readyReplicas). */
+  readyReplicas: number
+}
+
 /** The reconciled view of a single repo (spec §6). */
 export interface RepoState {
   repo: Repo
   status: RepoStatus
   pods: PodInfo[]
+  deployments: DeploymentInfo[]
   hasSession: boolean
   /** epoch ms of last reconcile. */
   updatedAt: number

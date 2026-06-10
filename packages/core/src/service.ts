@@ -7,7 +7,7 @@ import { CrashWatch } from './crashWatch.js'
 import { type RunResult, run, spawnStream } from './exec.js'
 import { FileTail, LogHub, LogTailer, type SpawnFn } from './logTailer.js'
 import { PtyBroker } from './ptyBroker.js'
-import { Reconciler } from './reconciler.js'
+import { type ClusterCache, Reconciler, newClusterCache } from './reconciler.js'
 import { scanRepos } from './registry.js'
 import { StateStore } from './stateStore.js'
 import { Supervisor } from './supervisor.js'
@@ -162,10 +162,10 @@ export class Service {
   }
 
   // ---- reconciliation (spec §6) ----
-  async reconcileOne(id: string): Promise<RepoState> {
+  async reconcileOne(id: string, cache?: ClusterCache): Promise<RepoState> {
     const repo = this.repoOrThrow(id)
     const hasSession = await this.supervisor.hasSession(repo)
-    const state = await this.reconciler.reconcile(repo, hasSession)
+    const state = await this.reconciler.reconcile(repo, hasSession, cache)
     if (hasSession && !this.devTails.has(id)) {
       // live dev session without a pane mirror (daemon restarted under it, or
       // the session was started outside devdock) — attach one so its output
@@ -183,8 +183,11 @@ export class Service {
   }
 
   async reconcileAll(): Promise<RepoState[]> {
+    // Share one cluster snapshot across the pass — repos in the same namespace
+    // reuse a single kubectl query instead of issuing one each.
+    const cache = newClusterCache()
     const out: RepoState[] = []
-    for (const id of this.repos.keys()) out.push(await this.reconcileOne(id))
+    for (const id of this.repos.keys()) out.push(await this.reconcileOne(id, cache))
     return out
   }
 

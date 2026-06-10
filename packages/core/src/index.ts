@@ -17,7 +17,16 @@ export {
   type StreamRunner,
   type LineSink,
 } from './supervisor.js'
-export { Reconciler, deriveStatus, parsePods, matchPods } from './reconciler.js'
+export {
+  Reconciler,
+  deriveStatus,
+  parsePods,
+  matchPods,
+  parseDeployments,
+  matchDeployments,
+  newClusterCache,
+  type ClusterCache,
+} from './reconciler.js'
 export {
   LogTailer,
   FileTail,

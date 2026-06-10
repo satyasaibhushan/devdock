@@ -21,11 +21,12 @@ beforeEach(() => {
 afterEach(() => rmSync(root, { recursive: true, force: true }))
 
 /** A runner that returns canned results based on the command. */
-function cannedRunner(podsJson: string, sessionExists: boolean) {
+function cannedRunner(podsJson: string, sessionExists: boolean, deploymentsJson = '{"items":[]}') {
   return vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
     if (cmd === 'tmux' && args[0] === 'has-session')
       return { code: sessionExists ? 0 : 1, stdout: '', stderr: '' }
-    if (cmd === 'kubectl' && args[0] === 'get') return { code: 0, stdout: podsJson, stderr: '' }
+    if (cmd === 'kubectl' && args[0] === 'get')
+      return { code: 0, stdout: args[1] === 'deployments' ? deploymentsJson : podsJson, stderr: '' }
     return { code: 0, stdout: '', stderr: '' }
   })
 }
@@ -60,6 +61,19 @@ describe('Service', () => {
     const states = await svc.reconcileAll()
     expect(states[0]?.status).toBe('RUNNING_MANAGED')
     expect(svc.get('svc-a')?.status).toBe('RUNNING_MANAGED')
+  })
+
+  it('reports DEPLOYED when deployment objects exist but nothing runs', async () => {
+    const deploymentsJson = JSON.stringify({
+      items: [{ metadata: { name: 'svc-a' }, spec: { replicas: 0 }, status: {} }],
+    })
+    const svc = new Service(
+      { roots: [root], stateFile },
+      { runner: cannedRunner('{"items":[]}', false, deploymentsJson) },
+    )
+    svc.rescan()
+    await svc.reconcileAll()
+    expect(svc.get('svc-a')?.status).toBe('DEPLOYED')
   })
 
   it('emits a status event on change', async () => {
