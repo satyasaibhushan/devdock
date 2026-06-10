@@ -37,6 +37,23 @@
 
   const label = (s: string) => s.replace('RUNNING_', '').replace('_', ' ').toLowerCase()
   const startable = (s: RepoStatus) => s === 'STOPPED' || s === 'DEPLOYED'
+
+  const COLLAPSE_KEY = 'devdock.collapsedSections'
+  function readCollapsed(): Record<string, boolean> {
+    try {
+      return JSON.parse(localStorage.getItem(COLLAPSE_KEY) ?? '{}')
+    } catch {
+      return {}
+    }
+  }
+  let collapsed = $state<Record<string, boolean>>(readCollapsed())
+  function toggle(title: string) {
+    collapsed[title] = !collapsed[title]
+    localStorage.setItem(COLLAPSE_KEY, JSON.stringify(collapsed))
+  }
+  // A live filter overrides collapsing — matches must never hide inside a
+  // collapsed section.
+  const isOpen = (title: string) => query.trim() !== '' || !collapsed[title]
 </script>
 
 <div class="panel">
@@ -45,11 +62,16 @@
   </div>
   <div class="list" role="listbox" aria-label="repositories">
     {#each sections as section (section.title)}
-      <div class="shead">
+      <button
+        class="shead"
+        aria-expanded={isOpen(section.title)}
+        onclick={() => toggle(section.title)}
+      >
+        <span class="chev" class:open={isOpen(section.title)}>▸</span>
         <span class="stitle">{section.title}</span>
         <span class="scount">{section.repos.length}</span>
-      </div>
-      {#each section.repos as r (r.repo.id)}
+      </button>
+      {#each isOpen(section.title) ? section.repos : [] as r (r.repo.id)}
         <div class="rowwrap" class:sel={r.repo.id === selectedId}>
           <button
             class="row"
@@ -131,9 +153,24 @@
     top: 0;
     background: var(--panel);
     z-index: 1;
+    width: 100%;
+    border: none;
+    text-align: left;
+    cursor: pointer;
   }
   .shead:first-child {
     padding-top: 4px;
+  }
+  .shead:hover .stitle {
+    color: var(--ink);
+  }
+  .chev {
+    font-size: 9px;
+    color: var(--muted);
+    transition: transform 0.12s ease;
+  }
+  .chev.open {
+    transform: rotate(90deg);
   }
   .stitle {
     font-family: var(--mono);
