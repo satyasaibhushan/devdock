@@ -12,9 +12,9 @@ const repo: Repo = {
 }
 
 describe('attachArgs', () => {
-  it('uses -r for read-only', () => {
-    expect(attachArgs('s', 'ro')).toEqual(['attach', '-r', '-t', 's'])
-    expect(attachArgs('s', 'rw')).toEqual(['attach', '-t', 's'])
+  it('uses -r for read-only and matches the session name exactly', () => {
+    expect(attachArgs('s', 'ro')).toEqual(['attach', '-r', '-t', '=s'])
+    expect(attachArgs('s', 'rw')).toEqual(['attach', '-t', '=s'])
   })
 })
 

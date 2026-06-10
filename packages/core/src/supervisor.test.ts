@@ -41,7 +41,7 @@ describe('Supervisor', () => {
       'pipe-pane',
       '-o',
       '-t',
-      'devdock-svc-a',
+      '=devdock-svc-a',
       "cat >> '/tmp/svc-a.dev.log'",
     ])
   })
@@ -78,7 +78,7 @@ describe('Supervisor', () => {
     })
     await new Supervisor(runner).kill(repo)
     expect(calls[0]).toEqual(['purge'])
-    expect(calls[1]).toEqual(['kill-session', '-t', 'devdock-svc-a'])
+    expect(calls[1]).toEqual(['kill-session', '-t', '=devdock-svc-a'])
   })
 
   it('exec sends a command into the dev session', async () => {
@@ -87,10 +87,18 @@ describe('Supervisor', () => {
     expect(runner).toHaveBeenCalledWith('tmux', [
       'send-keys',
       '-t',
-      'devdock-svc-a',
+      '=devdock-svc-a',
       'pnpm test',
       'Enter',
     ])
+  })
+
+  it('hasSession matches the session name exactly, not by prefix', async () => {
+    // tmux -t prefix-matching made `devdock-dashboard` claim
+    // `devdock-dashboard-api-accounts`; `=` forces the exact name.
+    const runner = vi.fn(async () => ok())
+    await new Supervisor(runner).hasSession(repo)
+    expect(runner).toHaveBeenCalledWith('tmux', ['has-session', '-t', '=devdock-svc-a'])
   })
 
   it('lists only devdock- sessions', async () => {

@@ -169,7 +169,7 @@ describe('Service', () => {
       'pipe-pane',
       '-o',
       '-t',
-      'devdock-svc-a',
+      '=devdock-svc-a',
       expect.stringContaining('svc-a.dev.log'),
     ])
     expect(spawns[0]?.cmd).toBe('tail')

@@ -30,6 +30,12 @@ export function devspaceArgs(repo: Repo): string[] {
   return args
 }
 
+/** tmux `-t` matches session names by prefix, so `devdock-dashboard` would hit
+ *  `devdock-dashboard-api-accounts`. The `=` sigil forces an exact match. */
+export function exactTarget(session: string): string {
+  return `=${session}`
+}
+
 export class Supervisor {
   private readonly runner: Runner
   private readonly streamRunner: StreamRunner
@@ -60,7 +66,7 @@ export class Supervisor {
       'pipe-pane',
       '-o',
       '-t',
-      repo.session,
+      exactTarget(repo.session),
       `cat >> ${shellQuote(pipeFile)}`,
     ])
   }
@@ -78,18 +84,20 @@ export class Supervisor {
     const purge = onLine
       ? await this.streamRunner('devspace', args, { cwd: repo.path }, onLine)
       : await this.runner('devspace', args, { cwd: repo.path })
-    await this.runner('tmux', ['kill-session', '-t', repo.session]).catch(() => undefined)
+    await this.runner('tmux', ['kill-session', '-t', exactTarget(repo.session)]).catch(
+      () => undefined,
+    )
     return purge
   }
 
   /** Run a one-off command inside the repo's dev session via `tmux send-keys`. */
   exec(repo: Repo, command: string): Promise<RunResult> {
-    return this.runner('tmux', ['send-keys', '-t', repo.session, command, 'Enter'])
+    return this.runner('tmux', ['send-keys', '-t', exactTarget(repo.session), command, 'Enter'])
   }
 
   /** Whether a tmux session exists for this repo. */
   async hasSession(repo: Repo): Promise<boolean> {
-    const r = await this.runner('tmux', ['has-session', '-t', repo.session])
+    const r = await this.runner('tmux', ['has-session', '-t', exactTarget(repo.session)])
     return r.code === 0
   }
 

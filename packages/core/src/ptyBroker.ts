@@ -59,9 +59,11 @@ async function defaultSpawn(): Promise<PtySpawn> {
   }
 }
 
-/** The tmux command a terminal of `mode` attaches with (spec §8). */
+/** The tmux command a terminal of `mode` attaches with (spec §8).
+ *  `=` forces an exact session-name match — tmux `-t` matching is otherwise
+ *  prefix-based and could attach a sibling repo's session. */
 export function attachArgs(session: string, mode: TermMode): string[] {
-  return mode === 'ro' ? ['attach', '-r', '-t', session] : ['attach', '-t', session]
+  return mode === 'ro' ? ['attach', '-r', '-t', `=${session}`] : ['attach', '-t', `=${session}`]
 }
 
 /** Single-writer lock: one read-write terminal per repo at a time (spec §5). */
