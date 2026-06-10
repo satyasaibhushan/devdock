@@ -25,8 +25,34 @@ dev:
   })
 
   it('is defensive against junk', () => {
-    expect(parseDevspaceConfig(': not : valid :')).toEqual({ ports: [] })
-    expect(parseDevspaceConfig('')).toEqual({ ports: [] })
+    expect(parseDevspaceConfig(': not : valid :')).toEqual({ ports: [], varDefaults: {} })
+    expect(parseDevspaceConfig('')).toEqual({ ports: [], varDefaults: {} })
+  })
+
+  it('captures defaults of question vars (the ones that prompt), skipping the rest', () => {
+    const cfg = parseDevspaceConfig(`
+name: svc
+vars:
+  WORKLOAD_TYPE:
+    question: Which workload type do you want to work on?
+    default: "api"
+    options: ["api", "cron", "worker"]
+  TARGET_REGION:
+    question: Which region?
+    default: "us"
+  OPTIONS_ONLY:
+    question: Which workload type do you want to work on?
+    options: ["worker", "cron"]
+  NO_DEFAULT:
+    question: Pick something?
+  PLAIN_VALUE: api
+  COMPUTED: \${DEVSPACE_NAME}
+`)
+    expect(cfg.varDefaults).toEqual({
+      WORKLOAD_TYPE: 'api',
+      TARGET_REGION: 'us',
+      OPTIONS_ONLY: 'worker',
+    })
   })
 })
 

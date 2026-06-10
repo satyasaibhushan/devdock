@@ -148,14 +148,14 @@ describe('Service', () => {
     const seen: string[] = []
     const unsub = svc.subscribeLogs('svc-a', (l) => seen.push(l))
     await svc.build('svc-a')
-    expect(seen[0]).toBe('$ devspace deploy')
-    expect(seen.at(-1)).toBe('✓ devspace deploy')
+    expect(seen[0]).toBe('$ devspace deploy -n ns')
+    expect(seen.at(-1)).toBe('✓ devspace deploy -n ns')
     unsub()
 
     await svc.stop('svc-a')
     const lines = svc.logs('svc-a')
-    expect(lines).toContain('$ devspace purge')
-    expect(lines).toContain('✓ devspace purge')
+    expect(lines).toContain('$ devspace purge -n ns')
+    expect(lines).toContain('✓ devspace purge -n ns')
   })
 
   it('start mirrors the dev pane into the logs (pipe-pane + tail -F)', async () => {
@@ -173,7 +173,7 @@ describe('Service', () => {
       expect.stringContaining('svc-a.dev.log'),
     ])
     expect(spawns[0]?.cmd).toBe('tail')
-    expect(svc.logs('svc-a')[0]).toBe('$ devspace dev')
+    expect(svc.logs('svc-a')[0]).toBe('$ devspace dev -n ns')
   })
 
   it('reattaches the dev-pane mirror when a live session has none (daemon restart)', async () => {

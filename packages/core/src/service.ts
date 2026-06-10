@@ -10,7 +10,7 @@ import { PtyBroker } from './ptyBroker.js'
 import { type ClusterCache, Reconciler, newClusterCache } from './reconciler.js'
 import { scanRepos } from './registry.js'
 import { StateStore } from './stateStore.js'
-import { Supervisor } from './supervisor.js'
+import { Supervisor, devspaceArgs } from './supervisor.js'
 import type { Repo, RepoState, TermMode } from './types.js'
 
 export interface ServiceOptions {
@@ -96,7 +96,7 @@ export class Service {
     const pipeFile = this.devLogPath(id)
     mkdirSync(dirname(pipeFile), { recursive: true })
     writeFileSync(pipeFile, '') // fresh run, fresh file — old output doesn't replay
-    hub.push('$ devspace dev')
+    hub.push(`$ ${['devspace dev', ...devspaceArgs(repo)].join(' ')}`)
     const r = await this.supervisor.start(repo, pipeFile)
     if (r.code === 0) {
       this.tailDevLog(id, pipeFile)
@@ -110,8 +110,10 @@ export class Service {
 
   async build(id: string): Promise<RunResult> {
     const repo = this.repoOrThrow(id)
-    const r = await this.narrate(id, 'devspace deploy', (onLine) =>
-      this.supervisor.build(repo, onLine),
+    const r = await this.narrate(
+      id,
+      ['devspace deploy', ...devspaceArgs(repo)].join(' '),
+      (onLine) => this.supervisor.build(repo, onLine),
     )
     await this.reconcileOne(id)
     return r
@@ -121,8 +123,10 @@ export class Service {
     const repo = this.repoOrThrow(id)
     this.tailers.get(id)?.stop()
     this.tailers.delete(id)
-    const r = await this.narrate(id, 'devspace purge', (onLine) =>
-      this.supervisor.kill(repo, onLine),
+    const r = await this.narrate(
+      id,
+      ['devspace purge', ...devspaceArgs(repo)].join(' '),
+      (onLine) => this.supervisor.kill(repo, onLine),
     )
     this.devTails.get(id)?.stop()
     this.devTails.delete(id)

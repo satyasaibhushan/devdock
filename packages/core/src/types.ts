@@ -29,6 +29,9 @@ export interface Repo {
   selector?: string
   /** Forwarded ports declared in the config. */
   ports: number[]
+  /** Answers for the config's `question:` vars, taken from their declared
+   *  defaults — passed as `--var` so devspace never prompts for input. */
+  varDefaults?: Record<string, string>
   /** The tmux session name devdock uses for this repo. */
   session: string
 }

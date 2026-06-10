@@ -13,6 +13,7 @@ export {
 export {
   Supervisor,
   shellQuote,
+  devspaceArgs,
   type Runner,
   type StreamRunner,
   type LineSink,

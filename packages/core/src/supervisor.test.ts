@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { RunResult } from './exec.js'
 import { sessionName } from './registry.js'
-import { Supervisor, shellQuote } from './supervisor.js'
+import { Supervisor, devspaceArgs, shellQuote } from './supervisor.js'
 import type { Repo } from './types.js'
 
 const repo: Repo = {
@@ -96,6 +96,55 @@ describe('Supervisor', () => {
   it('lists only devdock- sessions', async () => {
     const runner = vi.fn(async () => ok('devdock-svc-a\nother\ndevdock-svc-b\n'))
     expect(await new Supervisor(runner).listSessions()).toEqual(['devdock-svc-a', 'devdock-svc-b'])
+  })
+
+  describe('non-interactive args (question vars + namespace)', () => {
+    const prompty: Repo = {
+      ...repo,
+      namespace: 'panels',
+      varDefaults: { WORKLOAD_TYPE: 'api', TARGET_REGION: 'us' },
+    }
+
+    it('answers question vars with their defaults and pins the namespace', () => {
+      expect(devspaceArgs(prompty)).toEqual([
+        '--var',
+        'WORKLOAD_TYPE=api',
+        '--var',
+        'TARGET_REGION=us',
+        '-n',
+        'panels',
+      ])
+      expect(devspaceArgs(repo)).toEqual([])
+    })
+
+    it('build and kill pass them to devspace', async () => {
+      const runner = vi.fn(async () => ok())
+      const sup = new Supervisor(runner)
+      await sup.build(prompty)
+      expect(runner).toHaveBeenCalledWith(
+        'devspace',
+        ['deploy', '--var', 'WORKLOAD_TYPE=api', '--var', 'TARGET_REGION=us', '-n', 'panels'],
+        { cwd: prompty.path },
+      )
+      await sup.kill(prompty)
+      expect(runner).toHaveBeenCalledWith(
+        'devspace',
+        ['purge', '--var', 'WORKLOAD_TYPE=api', '--var', 'TARGET_REGION=us', '-n', 'panels'],
+        { cwd: prompty.path },
+      )
+    })
+
+    it('start embeds them in the tmux command, with values quoted', async () => {
+      const runner = vi.fn(async () => ok())
+      await new Supervisor(runner).start(prompty)
+      expect(runner).toHaveBeenCalledWith('tmux', [
+        'new-session',
+        '-d',
+        '-s',
+        'devdock-svc-a',
+        "cd '/home/me/Code/svc a' && devspace dev --var 'WORKLOAD_TYPE=api' --var 'TARGET_REGION=us' -n 'panels'",
+      ])
+    })
   })
 })
 

@@ -20,19 +20,34 @@ export function parseDevspaceConfig(yamlText: string): {
   namespace?: string
   workload?: string
   ports: number[]
+  varDefaults: Record<string, string>
 } {
   let doc: unknown
   try {
     doc = parseYaml(yamlText)
   } catch {
-    return { ports: [] }
+    return { ports: [], varDefaults: {} }
   }
-  if (doc === null || typeof doc !== 'object') return { ports: [] }
+  if (doc === null || typeof doc !== 'object') return { ports: [], varDefaults: {} }
   const d = doc as Record<string, unknown>
 
   const name = typeof d.name === 'string' ? d.name : undefined
   const deployments = asRecord(d.deployments)
   const dev = asRecord(d.dev)
+
+  // `question:` vars stop devspace for interactive input. Capture each one's
+  // declared default (or first option when there is no default) so verbs can
+  // answer it via --var. Plain-value vars never prompt and need nothing.
+  const varDefaults: Record<string, string> = {}
+  for (const [key, value] of Object.entries(asRecord(d.vars) ?? {})) {
+    const entry = asRecord(value)
+    if (!entry || !('question' in entry)) continue
+    const options = Array.isArray(entry.options) ? entry.options : []
+    const answer = entry.default ?? options[0]
+    if (typeof answer === 'string' || typeof answer === 'number' || typeof answer === 'boolean') {
+      varDefaults[key] = String(answer)
+    }
+  }
 
   // workload: first deployment, else first dev target.
   const workload = firstKey(deployments) ?? firstKey(dev)
@@ -49,7 +64,7 @@ export function parseDevspaceConfig(yamlText: string): {
     collectPorts(t.forward, ports)
   }
 
-  return { name, namespace, workload, ports: [...ports].sort((a, b) => a - b) }
+  return { name, namespace, workload, ports: [...ports].sort((a, b) => a - b), varDefaults }
 }
 
 function asRecord(v: unknown): Record<string, unknown> | undefined {
@@ -152,6 +167,7 @@ export function scanRepos(opts: ScanOptions = {}): Repo[] {
       namespace: cfg.namespace,
       workload: cfg.workload,
       ports: cfg.ports,
+      varDefaults: Object.keys(cfg.varDefaults).length ? cfg.varDefaults : undefined,
       session: sessionName(id),
     })
   }

@@ -17,6 +17,19 @@ export type StreamRunner = (
 
 export type LineSink = (line: string) => void
 
+/** Args that make devspace run without user input: every `question:` var is
+ *  answered with its declared default (what the user's ddev/dpurge/ddep
+ *  aliases do by hand), and the namespace is pinned when the config names one
+ *  so the verb doesn't depend on the current kubectl context. */
+export function devspaceArgs(repo: Repo): string[] {
+  const args: string[] = []
+  for (const [key, value] of Object.entries(repo.varDefaults ?? {})) {
+    args.push('--var', `${key}=${value}`)
+  }
+  if (repo.namespace) args.push('-n', repo.namespace)
+  return args
+}
+
 export class Supervisor {
   private readonly runner: Runner
   private readonly streamRunner: StreamRunner
@@ -32,7 +45,10 @@ export class Supervisor {
    *  With `pipeFile`, the pane is mirrored there via `tmux pipe-pane` so the
    *  daemon can tail the same output you'd see running `devspace dev` yourself. */
   async start(repo: Repo, pipeFile?: string): Promise<RunResult> {
-    const inner = `cd ${shellQuote(repo.path)} && devspace dev`
+    const extra = devspaceArgs(repo)
+      .map((a) => (a.startsWith('-') ? a : shellQuote(a)))
+      .join(' ')
+    const inner = `cd ${shellQuote(repo.path)} && devspace dev${extra ? ` ${extra}` : ''}`
     const r = await this.runner('tmux', ['new-session', '-d', '-s', repo.session, inner])
     if (r.code === 0 && pipeFile) await this.pipe(repo, pipeFile)
     return r
@@ -51,15 +67,17 @@ export class Supervisor {
 
   /** Build & deploy without entering dev mode: `devspace deploy`. */
   build(repo: Repo, onLine?: LineSink): Promise<RunResult> {
-    if (!onLine) return this.runner('devspace', ['deploy'], { cwd: repo.path })
-    return this.streamRunner('devspace', ['deploy'], { cwd: repo.path }, onLine)
+    const args = ['deploy', ...devspaceArgs(repo)]
+    if (!onLine) return this.runner('devspace', args, { cwd: repo.path })
+    return this.streamRunner('devspace', args, { cwd: repo.path }, onLine)
   }
 
   /** Tear down: `devspace purge`, then kill the tmux session if present. */
   async kill(repo: Repo, onLine?: LineSink): Promise<RunResult> {
+    const args = ['purge', ...devspaceArgs(repo)]
     const purge = onLine
-      ? await this.streamRunner('devspace', ['purge'], { cwd: repo.path }, onLine)
-      : await this.runner('devspace', ['purge'], { cwd: repo.path })
+      ? await this.streamRunner('devspace', args, { cwd: repo.path }, onLine)
+      : await this.runner('devspace', args, { cwd: repo.path })
     await this.runner('tmux', ['kill-session', '-t', repo.session]).catch(() => undefined)
     return purge
   }
