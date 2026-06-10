@@ -1,6 +1,6 @@
 // registry — discover DevSpace-enabled repos (spec §12).
 // Scans configured roots for devspace.yaml and parses workload, namespace, ports.
-import { type Dirent, readFileSync, readdirSync } from 'node:fs'
+import { type Dirent, readFileSync, readdirSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { parse as parseYaml } from 'yaml'
@@ -87,8 +87,35 @@ function findConfigs(root: string, depth: number, out: string[]): void {
   }
   for (const e of entries) {
     if (e.isFile() && e.name === CONFIG_NAME) out.push(join(root, e.name))
+    else if (e.isDirectory() && e.name === '.devspace') findServiceConfigs(join(root, e.name), out)
     else if (e.isDirectory() && !IGNORE_DIRS.has(e.name) && !e.name.startsWith('.'))
       findConfigs(join(root, e.name), depth - 1, out)
+  }
+}
+
+/**
+ * Multi-service repos keep one config per service at .devspace/<service>/devspace.yaml
+ * (the `./devspace` wrapper pattern); each service is its own repo entry whose
+ * path is the service dir, so devspace commands run where the wrapper would run
+ * them. Only exact <service>/devspace.yaml children count — everything else in
+ * .devspace/ is devspace's own cache and is ignored.
+ */
+function findServiceConfigs(devspaceDir: string, out: string[]): void {
+  let entries: Dirent[]
+  try {
+    entries = readdirSync(devspaceDir, { withFileTypes: true })
+  } catch {
+    return
+  }
+  for (const e of entries) {
+    if (!e.isDirectory()) continue
+    const cfg = join(devspaceDir, e.name, CONFIG_NAME)
+    try {
+      statSync(cfg)
+      out.push(cfg)
+    } catch {
+      /* not a service dir */
+    }
   }
 }
 

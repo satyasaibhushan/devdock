@@ -54,4 +54,24 @@ describe('scanRepos', () => {
     expect(repos[0]?.id).toBe('svc-a')
     expect(repos[0]?.session).toBe('devdock-svc-a')
   })
+
+  it('discovers per-service configs in multi-service repos (.devspace/<service>/)', () => {
+    // the ./devspace wrapper pattern: no root devspace.yaml, one per service.
+    const repo = join(root, 'agents')
+    mkdirSync(join(repo, '.devspace', 'agents-api'), { recursive: true })
+    mkdirSync(join(repo, '.devspace', 'agents-worker'), { recursive: true })
+    mkdirSync(join(repo, '.devspace', 'logs'), { recursive: true }) // cache dir, no yaml
+    writeFileSync(join(repo, '.devspace', 'agents-api', 'devspace.yaml'), 'name: agents-api\n')
+    writeFileSync(
+      join(repo, '.devspace', 'agents-worker', 'devspace.yaml'),
+      'name: agents-worker\n',
+    )
+
+    const repos = scanRepos({ roots: [root] })
+    expect(repos.map((r) => r.id)).toEqual(['agents-api', 'agents-worker'])
+    // path is the service dir — devspace commands run where the wrapper runs them.
+    expect(repos[0]?.path).toBe(join(repo, '.devspace', 'agents-api'))
+    expect(repos[0]?.name).toBe('agents-api')
+    expect(repos[0]?.session).toBe('devdock-agents-api')
+  })
 })
