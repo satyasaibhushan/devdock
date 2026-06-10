@@ -10,13 +10,21 @@ export {
   sessionName,
   type ScanOptions,
 } from './registry.js'
-export { Supervisor, shellQuote, type Runner } from './supervisor.js'
+export {
+  Supervisor,
+  shellQuote,
+  type Runner,
+  type StreamRunner,
+  type LineSink,
+} from './supervisor.js'
 export { Reconciler, deriveStatus, parsePods, matchPods } from './reconciler.js'
 export {
   LogTailer,
+  FileTail,
   LogHub,
   RingBuffer,
   type LogSubscriber,
+  type SpawnFn,
 } from './logTailer.js'
 export {
   PtyBroker,

@@ -1,6 +1,6 @@
 // logTailer — kubectl logs -f → ring buffer → fan-out to subscribers (spec §12).
 import type { ChildProcess } from 'node:child_process'
-import { spawnStream } from './exec.js'
+import { LineSplitter, spawnStream } from './exec.js'
 import type { PodInfo, Repo } from './types.js'
 
 /** Fixed-capacity ring buffer of recent items. */
@@ -24,6 +24,16 @@ export class RingBuffer<T> {
 
 export type LogSubscriber = (line: string) => void
 
+// biome-ignore lint/suspicious/noControlCharactersInRegex: matching ANSI CSI escapes is the point
+const ANSI_CSI = /\x1b\[[0-9;?]*[ -/]*[@-~]/g
+
+/** Normalize a raw process line for display: drop ANSI styling and keep only
+ *  the final \r-overwritten frame (spinner/progress redraws). */
+export function cleanLine(line: string): string {
+  const plain = line.replace(ANSI_CSI, '').replace(/\r+$/, '')
+  return plain.includes('\r') ? (plain.split('\r').pop() ?? '') : plain
+}
+
 /** Buffers recent log lines and fans them out; new subscribers get the backlog. */
 export class LogHub {
   private readonly ring: RingBuffer<string>
@@ -33,13 +43,15 @@ export class LogHub {
   }
 
   push(line: string): void {
-    this.ring.push(line)
-    for (const sub of this.subs) sub(line)
+    const clean = cleanLine(line)
+    this.ring.push(clean)
+    for (const sub of this.subs) sub(clean)
   }
 
-  /** Subscribe; immediately replays the backlog, then streams live. Returns unsubscribe. */
-  subscribe(sub: LogSubscriber): () => void {
-    for (const line of this.ring.toArray()) sub(line)
+  /** Subscribe; immediately replays the backlog, then streams live. Returns unsubscribe.
+   *  Pass `replay: false` for consumers that must only see new lines (crash detection). */
+  subscribe(sub: LogSubscriber, opts: { replay?: boolean } = {}): () => void {
+    if (opts.replay !== false) for (const line of this.ring.toArray()) sub(line)
     this.subs.add(sub)
     return () => this.subs.delete(sub)
   }
@@ -54,14 +66,21 @@ export class LogHub {
   }
 }
 
-type SpawnFn = (cmd: string, args: string[]) => ChildProcess
+export type SpawnFn = (cmd: string, args: string[]) => ChildProcess
 
-/** Tails `kubectl logs -f` for a repo's pod into a LogHub. */
+/** Tails `kubectl logs -f` for a repo's pod into a LogHub. The hub can be
+ *  shared (the repo's single stream of pod logs + verb activity) or owned. */
 export class LogTailer {
-  readonly hub = new LogHub()
+  readonly hub: LogHub
   private child?: ChildProcess
-  private carry = ''
-  constructor(private readonly spawnFn: SpawnFn = spawnStream) {}
+  private readonly lines: LineSplitter
+  constructor(
+    private readonly spawnFn: SpawnFn = spawnStream,
+    hub?: LogHub,
+  ) {
+    this.hub = hub ?? new LogHub()
+    this.lines = new LineSplitter((line) => this.hub.push(line))
+  }
 
   start(repo: Repo, pod: PodInfo, container?: string): void {
     if (this.child) return
@@ -69,24 +88,41 @@ export class LogTailer {
     if (repo.namespace) args.push('-n', repo.namespace)
     if (container) args.push('-c', container)
     const child = this.spawnFn('kubectl', args)
-    child.stdout?.on('data', (d: Buffer) => this.ingest(d.toString()))
-    child.stderr?.on('data', (d: Buffer) => this.ingest(d.toString()))
+    child.stdout?.on('data', (d: Buffer) => this.lines.ingest(d.toString()))
+    child.stderr?.on('data', (d: Buffer) => this.lines.ingest(d.toString()))
     this.child = child
   }
 
-  /** Split incoming chunks on newlines, carrying partial lines across chunks. */
-  private ingest(chunk: string): void {
-    const text = this.carry + chunk
-    const parts = text.split('\n')
-    this.carry = parts.pop() ?? ''
-    for (const line of parts) this.hub.push(line)
+  stop(): void {
+    this.lines.flush()
+    this.child?.kill('SIGTERM')
+    this.child = undefined
+  }
+}
+
+/** Follows a file (`tail -n +1 -F`) into a LogHub — used for the tmux pane
+ *  output of `devspace dev`, mirrored to a file via `tmux pipe-pane`. */
+export class FileTail {
+  private child?: ChildProcess
+  private readonly lines: LineSplitter
+  constructor(
+    readonly hub: LogHub,
+    private readonly spawnFn: SpawnFn = spawnStream,
+  ) {
+    this.lines = new LineSplitter((line) => this.hub.push(line))
+  }
+
+  start(path: string): void {
+    if (this.child) return
+    // -n +1: replay the (freshly truncated) file from the top; -F: survive
+    // rotation/truncation and a file that doesn't exist yet.
+    const child = this.spawnFn('tail', ['-n', '+1', '-F', path])
+    child.stdout?.on('data', (d: Buffer) => this.lines.ingest(d.toString()))
+    this.child = child
   }
 
   stop(): void {
-    if (this.carry) {
-      this.hub.push(this.carry)
-      this.carry = ''
-    }
+    this.lines.flush()
     this.child?.kill('SIGTERM')
     this.child = undefined
   }

@@ -1,7 +1,19 @@
 import { EventEmitter } from 'node:events'
 import { describe, expect, it, vi } from 'vitest'
-import { LogHub, LogTailer, RingBuffer } from './logTailer.js'
+import { FileTail, LogHub, LogTailer, RingBuffer, cleanLine } from './logTailer.js'
 import type { PodInfo, Repo } from './types.js'
+
+function fakeChild() {
+  const fake = new EventEmitter() as EventEmitter & {
+    stdout: EventEmitter
+    stderr: EventEmitter
+    kill: () => void
+  }
+  fake.stdout = new EventEmitter()
+  fake.stderr = new EventEmitter()
+  fake.kill = vi.fn()
+  return fake
+}
 
 describe('RingBuffer', () => {
   it('drops oldest beyond capacity', () => {
@@ -30,6 +42,24 @@ describe('LogHub', () => {
     const hub = new LogHub()
     for (let i = 0; i < 5; i++) hub.push(String(i))
     expect(hub.recent(2)).toEqual(['3', '4'])
+  })
+
+  it('strips ANSI styling and keeps the final \\r frame', () => {
+    expect(cleanLine('\x1b[1;31mfatal \x1b[0mparse variables')).toBe('fatal parse variables')
+    expect(cleanLine('building 1/3\rbuilding 2/3\rbuilding 3/3')).toBe('building 3/3')
+    expect(cleanLine('plain line\r')).toBe('plain line')
+    const hub = new LogHub()
+    hub.push('\x1b[1;36minfo \x1b[0mhello')
+    expect(hub.recent()).toEqual(['info hello'])
+  })
+
+  it('replay: false delivers only new lines', () => {
+    const hub = new LogHub()
+    hub.push('old')
+    const seen: string[] = []
+    hub.subscribe((l) => seen.push(l), { replay: false })
+    hub.push('new')
+    expect(seen).toEqual(['new'])
   })
 })
 
@@ -76,6 +106,36 @@ describe('LogTailer', () => {
     expect(seen).toEqual(['line1', 'line2'])
 
     tailer.stop()
+    expect(fake.kill).toHaveBeenCalled()
+  })
+
+  it('writes into a shared hub when given one', () => {
+    const fake = fakeChild()
+    const hub = new LogHub()
+    hub.push('verb output')
+    const tailer = new LogTailer(
+      vi.fn(() => fake as never),
+      hub,
+    )
+    tailer.start(repo, pod)
+    fake.stdout.emit('data', Buffer.from('pod log\n'))
+    expect(hub.recent()).toEqual(['verb output', 'pod log'])
+  })
+})
+
+describe('FileTail', () => {
+  it('follows a file from the top into the hub', () => {
+    const fake = fakeChild()
+    const spawnFn = vi.fn(() => fake as never)
+    const hub = new LogHub()
+    const tail = new FileTail(hub, spawnFn)
+    tail.start('/tmp/x.dev.log')
+
+    expect(spawnFn).toHaveBeenCalledWith('tail', ['-n', '+1', '-F', '/tmp/x.dev.log'])
+    fake.stdout.emit('data', Buffer.from('deploying…\ndone\n'))
+    expect(hub.recent()).toEqual(['deploying…', 'done'])
+
+    tail.stop()
     expect(fake.kill).toHaveBeenCalled()
   })
 })

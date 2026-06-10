@@ -30,6 +30,46 @@ describe('Supervisor', () => {
     ])
   })
 
+  it('start mirrors the pane to a file when given one', async () => {
+    const calls: string[][] = []
+    const runner = vi.fn(async (_c: string, args: string[]) => {
+      calls.push(args)
+      return ok()
+    })
+    await new Supervisor(runner).start(repo, '/tmp/svc-a.dev.log')
+    expect(calls[1]).toEqual([
+      'pipe-pane',
+      '-o',
+      '-t',
+      'devdock-svc-a',
+      "cat >> '/tmp/svc-a.dev.log'",
+    ])
+  })
+
+  it('does not pipe when the session failed to start', async () => {
+    const runner = vi.fn(async () => ({ code: 1, stdout: '', stderr: 'duplicate session' }))
+    await new Supervisor(runner).start(repo, '/tmp/svc-a.dev.log')
+    expect(runner).toHaveBeenCalledTimes(1)
+  })
+
+  it('build streams deploy output through the stream runner', async () => {
+    const streamRunner = vi.fn(
+      async (_c: string, _a: string[], _o: { cwd?: string }, onLine: (l: string) => void) => {
+        onLine('deploying chart…')
+        return ok()
+      },
+    )
+    const lines: string[] = []
+    await new Supervisor(undefined, streamRunner).build(repo, (l) => lines.push(l))
+    expect(streamRunner).toHaveBeenCalledWith(
+      'devspace',
+      ['deploy'],
+      { cwd: repo.path },
+      expect.any(Function),
+    )
+    expect(lines).toEqual(['deploying chart…'])
+  })
+
   it('kill purges then kills the session', async () => {
     const calls: string[][] = []
     const runner = vi.fn(async (_c: string, args: string[]) => {

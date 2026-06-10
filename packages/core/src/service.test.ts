@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { RunResult } from './exec.js'
+import type { SpawnFn } from './logTailer.js'
 import { PtyBroker } from './ptyBroker.js'
 import { Service } from './service.js'
 
@@ -29,6 +30,16 @@ function cannedRunner(podsJson: string, sessionExists: boolean) {
   })
 }
 
+/** Records streaming spawns (tail -F, kubectl logs -f) without real children. */
+function fakeStreamSpawner() {
+  const spawns: Array<{ cmd: string; args: string[] }> = []
+  const spawner = ((cmd: string, args: string[]) => {
+    spawns.push({ cmd, args })
+    return { stdout: { on() {} }, stderr: { on() {} }, kill() {} } as never
+  }) as SpawnFn
+  return { spawner, spawns }
+}
+
 describe('Service', () => {
   it('scans repos and reconciles to a status', async () => {
     const podsJson = JSON.stringify({
@@ -39,7 +50,10 @@ describe('Service', () => {
         },
       ],
     })
-    const svc = new Service({ roots: [root], stateFile }, { runner: cannedRunner(podsJson, true) })
+    const svc = new Service(
+      { roots: [root], stateFile },
+      { runner: cannedRunner(podsJson, true), streamSpawner: fakeStreamSpawner().spawner },
+    )
     svc.rescan()
     expect(svc.listRepos().map((r) => r.id)).toEqual(['svc-a'])
 
@@ -109,6 +123,54 @@ describe('Service', () => {
     svc.rescan()
     await svc.reconcileAll()
     await expect(svc.openTerminal('svc-a', 'ro')).rejects.toThrow(/not running/)
+  })
+
+  it('narrates verb activity into the repo logs, even with no pods', async () => {
+    const svc = new Service(
+      { roots: [root], stateFile },
+      { runner: cannedRunner('{"items":[]}', false) },
+    )
+    svc.rescan()
+    const seen: string[] = []
+    const unsub = svc.subscribeLogs('svc-a', (l) => seen.push(l))
+    await svc.build('svc-a')
+    expect(seen[0]).toBe('$ devspace deploy')
+    expect(seen.at(-1)).toBe('✓ devspace deploy')
+    unsub()
+
+    await svc.stop('svc-a')
+    const lines = svc.logs('svc-a')
+    expect(lines).toContain('$ devspace purge')
+    expect(lines).toContain('✓ devspace purge')
+  })
+
+  it('start mirrors the dev pane into the logs (pipe-pane + tail -F)', async () => {
+    const runner = cannedRunner('{"items":[]}', true)
+    const { spawner, spawns } = fakeStreamSpawner()
+    const svc = new Service({ roots: [root], stateFile }, { runner, streamSpawner: spawner })
+    svc.rescan()
+    await svc.start('svc-a')
+
+    expect(runner).toHaveBeenCalledWith('tmux', [
+      'pipe-pane',
+      '-o',
+      '-t',
+      'devdock-svc-a',
+      expect.stringContaining('svc-a.dev.log'),
+    ])
+    expect(spawns[0]?.cmd).toBe('tail')
+    expect(svc.logs('svc-a')[0]).toBe('$ devspace dev')
+  })
+
+  it('reattaches the dev-pane mirror when a live session has none (daemon restart)', async () => {
+    const runner = cannedRunner('{"items":[]}', true)
+    const { spawner, spawns } = fakeStreamSpawner()
+    const svc = new Service({ roots: [root], stateFile }, { runner, streamSpawner: spawner })
+    svc.rescan()
+    await svc.reconcileAll()
+
+    expect(runner).toHaveBeenCalledWith('tmux', expect.arrayContaining(['pipe-pane']))
+    expect(spawns.map((s) => s.cmd)).toEqual(['tail'])
   })
 
   it('restart rolls the workload deployment', async () => {

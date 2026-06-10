@@ -1,10 +1,11 @@
 // service — the one brain (spec §19.1). Composes the core modules and exposes
 // transport-free verbs that the daemon (HTTP/WS) and MCP both call.
 import { EventEmitter } from 'node:events'
-import { join } from 'node:path'
+import { mkdirSync, writeFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import { CrashWatch } from './crashWatch.js'
-import { type RunResult, run } from './exec.js'
-import { LogTailer } from './logTailer.js'
+import { type RunResult, run, spawnStream } from './exec.js'
+import { FileTail, LogHub, LogTailer, type SpawnFn } from './logTailer.js'
 import { PtyBroker } from './ptyBroker.js'
 import { Reconciler } from './reconciler.js'
 import { scanRepos } from './registry.js'
@@ -24,6 +25,8 @@ export interface ServiceDeps {
   reconciler?: Reconciler
   broker?: PtyBroker
   runner?: (cmd: string, args: string[], opts?: { cwd?: string }) => Promise<RunResult>
+  /** Spawner for streaming children (kubectl logs -f, tail -F). Tests inject a fake. */
+  streamSpawner?: SpawnFn
 }
 
 export class Service {
@@ -33,10 +36,14 @@ export class Service {
   private readonly reconciler: Reconciler
   private readonly broker: PtyBroker
   private readonly runner: NonNullable<ServiceDeps['runner']>
+  private readonly streamSpawner: SpawnFn
   private readonly store: StateStore
   private readonly repos = new Map<string, Repo>()
   private readonly states = new Map<string, RepoState>()
+  /** One log stream per repo: pod logs + dev-pane output + verb activity. */
+  private readonly hubs = new Map<string, LogHub>()
   private readonly tailers = new Map<string, LogTailer>()
+  private readonly devTails = new Map<string, FileTail>()
   private readonly watchers = new Map<string, CrashWatch>()
   private timer?: NodeJS.Timeout
 
@@ -50,6 +57,7 @@ export class Service {
     this.reconciler = deps.reconciler ?? new Reconciler(deps.runner)
     this.broker = deps.broker ?? new PtyBroker()
     this.runner = deps.runner ?? run
+    this.streamSpawner = deps.streamSpawner ?? spawnStream
     this.store = new StateStore(this.opts.stateFile)
   }
 
@@ -80,21 +88,44 @@ export class Service {
   }
 
   // ---- lifecycle verbs (spec §7) ----
+  // Every verb narrates into the repo's log hub — the same output you'd see
+  // running the devspace command in a terminal streams to the Logs panel live.
   async start(id: string): Promise<RunResult> {
-    const r = await this.supervisor.start(this.repoOrThrow(id))
+    const repo = this.repoOrThrow(id)
+    const hub = this.hubFor(id)
+    const pipeFile = this.devLogPath(id)
+    mkdirSync(dirname(pipeFile), { recursive: true })
+    writeFileSync(pipeFile, '') // fresh run, fresh file — old output doesn't replay
+    hub.push('$ devspace dev')
+    const r = await this.supervisor.start(repo, pipeFile)
+    if (r.code === 0) {
+      this.tailDevLog(id, pipeFile)
+    } else {
+      for (const line of nonEmptyLines(r.stderr)) hub.push(line)
+      hub.push(`✗ devspace dev failed to start (exit ${r.code})`)
+    }
     await this.reconcileOne(id)
     return r
   }
 
   async build(id: string): Promise<RunResult> {
-    return this.supervisor.build(this.repoOrThrow(id))
+    const repo = this.repoOrThrow(id)
+    const r = await this.narrate(id, 'devspace deploy', (onLine) =>
+      this.supervisor.build(repo, onLine),
+    )
+    await this.reconcileOne(id)
+    return r
   }
 
   async stop(id: string): Promise<RunResult> {
     const repo = this.repoOrThrow(id)
     this.tailers.get(id)?.stop()
     this.tailers.delete(id)
-    const r = await this.supervisor.kill(repo)
+    const r = await this.narrate(id, 'devspace purge', (onLine) =>
+      this.supervisor.kill(repo, onLine),
+    )
+    this.devTails.get(id)?.stop()
+    this.devTails.delete(id)
     await this.reconcileOne(id)
     return r
   }
@@ -105,7 +136,24 @@ export class Service {
     if (!repo.workload) throw new Error(`no workload known for ${id}`)
     const args = ['rollout', 'restart', `deployment/${repo.workload}`]
     if (repo.namespace) args.push('-n', repo.namespace)
-    return this.runner('kubectl', args)
+    return this.narrate(id, `kubectl ${args.join(' ')}`, async (onLine) => {
+      const r = await this.runner('kubectl', args)
+      for (const line of nonEmptyLines(r.stdout + r.stderr)) onLine(line)
+      return r
+    })
+  }
+
+  /** Run a verb with a `$ cmd` header and ✓/✗ footer, streaming lines into the repo's hub. */
+  private async narrate(
+    id: string,
+    label: string,
+    fn: (onLine: (line: string) => void) => Promise<RunResult>,
+  ): Promise<RunResult> {
+    const hub = this.hubFor(id)
+    hub.push(`$ ${label}`)
+    const r = await fn((line) => hub.push(line))
+    hub.push(r.code === 0 ? `✓ ${label}` : `✗ ${label} exited ${r.code}`)
+    return r
   }
 
   /** Send a one-off command into the repo's dev session (spec §8). */
@@ -118,6 +166,18 @@ export class Service {
     const repo = this.repoOrThrow(id)
     const hasSession = await this.supervisor.hasSession(repo)
     const state = await this.reconciler.reconcile(repo, hasSession)
+    if (hasSession && !this.devTails.has(id)) {
+      // live dev session without a pane mirror (daemon restarted under it, or
+      // the session was started outside devdock) — attach one so its output
+      // flows to the logs. pipe-pane -o is a no-op if a pipe already exists.
+      const file = this.devLogPath(id)
+      mkdirSync(dirname(file), { recursive: true })
+      await this.supervisor.pipe(repo, file)
+      this.tailDevLog(id, file)
+    } else if (!hasSession && this.devTails.has(id)) {
+      this.devTails.get(id)?.stop()
+      this.devTails.delete(id)
+    }
     this.applyState(state)
     return state
   }
@@ -152,33 +212,57 @@ export class Service {
   }
 
   // ---- logs (spec §12) ----
-  /** Ensure a tailer is running for the repo's first pod and return recent lines. */
+  /** Recent lines from the repo's hub (pod logs, dev-pane output, verb activity). */
   logs(id: string, tail = 200): string[] {
-    return this.ensureTailer(id)?.hub.recent(tail) ?? []
+    this.ensureTailer(id)
+    return this.hubFor(id).recent(tail)
   }
 
   subscribeLogs(id: string, cb: (line: string) => void): () => void {
-    const tailer = this.ensureTailer(id)
-    if (!tailer) return () => {}
-    return tailer.hub.subscribe(cb)
+    this.ensureTailer(id)
+    return this.hubFor(id).subscribe(cb)
   }
 
-  private ensureTailer(id: string): LogTailer | undefined {
-    const existing = this.tailers.get(id)
-    if (existing) return existing
+  private hubFor(id: string): LogHub {
+    let hub = this.hubs.get(id)
+    if (!hub) {
+      hub = new LogHub()
+      this.hubs.set(id, hub)
+    }
+    return hub
+  }
+
+  /** Where `tmux pipe-pane` mirrors a repo's `devspace dev` pane. */
+  private devLogPath(id: string): string {
+    return join(dirname(this.opts.stateFile), 'logs', `${id}.dev.log`)
+  }
+
+  /** (Re)follow the dev-pane mirror file into the repo's hub. */
+  private tailDevLog(id: string, file: string): void {
+    this.devTails.get(id)?.stop()
+    const tail = new FileTail(this.hubFor(id), this.streamSpawner)
+    tail.start(file)
+    this.devTails.set(id, tail)
+  }
+
+  private ensureTailer(id: string): void {
+    if (this.tailers.has(id)) return
     const repo = this.repos.get(id)
     const pod = this.states.get(id)?.pods[0]
-    if (!repo || !pod) return undefined
-    const tailer = new LogTailer()
+    if (!repo || !pod) return
+    const tailer = new LogTailer(this.streamSpawner, this.hubFor(id))
     tailer.start(repo, pod)
-    // feed crash detection from the log stream too.
+    // feed crash detection from new log lines only — the hub's backlog may
+    // hold old pod logs and verb output that must not re-trigger alerts.
     const watcher = this.watcherFor(id)
-    tailer.hub.subscribe((line) => {
-      const e = watcher.observeLog(pod.name, line)
-      if (e) this.events.emit('crash', e)
-    })
+    tailer.hub.subscribe(
+      (line) => {
+        const e = watcher.observeLog(pod.name, line)
+        if (e) this.events.emit('crash', e)
+      },
+      { replay: false },
+    )
     this.tailers.set(id, tailer)
-    return tailer
   }
 
   // ---- terminal (spec §8) ----
@@ -211,5 +295,10 @@ export class Service {
     if (this.timer) clearInterval(this.timer)
     this.timer = undefined
     for (const t of this.tailers.values()) t.stop()
+    for (const t of this.devTails.values()) t.stop()
   }
+}
+
+function nonEmptyLines(text: string): string[] {
+  return text.split('\n').filter((l) => l.trim() !== '')
 }
