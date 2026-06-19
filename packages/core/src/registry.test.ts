@@ -112,27 +112,59 @@ describe('scanRepos', () => {
     expect(repos[0]?.session).toBe('devdock-svc-a')
   })
 
-  it('discovers per-service configs in multi-service repos (.devspace/<service>/)', () => {
-    // the ./devspace wrapper pattern: no root devspace.yaml, one per service.
+  it('groups per-service configs in multi-service repos into one row (.devspace/<service>/)', () => {
+    // the ./devspace wrapper pattern: no root devspace.yaml, one per workload.
+    // The sibling configs collapse into a single `agents` row with members.
     const repo = join(root, 'agents')
     mkdirSync(join(repo, '.devspace', 'agents-api'), { recursive: true })
     mkdirSync(join(repo, '.devspace', 'agents-worker'), { recursive: true })
     mkdirSync(join(repo, '.devspace', 'logs'), { recursive: true }) // cache dir, no yaml
-    writeFileSync(join(repo, '.devspace', 'agents-api', 'devspace.yaml'), 'name: agents-api\n')
+    writeFileSync(
+      join(repo, '.devspace', 'agents-api', 'devspace.yaml'),
+      'name: agents-api\nvars:\n  WORKLOAD_TYPE: api\n',
+    )
     writeFileSync(
       join(repo, '.devspace', 'agents-worker', 'devspace.yaml'),
-      'name: agents-worker\n',
+      'name: agents-worker\nvars:\n  WORKLOAD_TYPE: worker\n',
     )
 
     const repos = scanRepos({ roots: [root] })
-    expect(repos.map((r) => r.id)).toEqual(['agents-api', 'agents-worker'])
-    // path is the service dir — devspace commands run where the wrapper runs them.
-    expect(repos[0]?.path).toBe(join(repo, '.devspace', 'agents-api'))
-    // root is the wrapper's dir (parent of .devspace) — devdock exports it as
-    // DEVSPACE_BINARY_DIR so relative Dockerfile/context paths resolve.
-    expect(repos[0]?.root).toBe(repo)
-    expect(repos[0]?.name).toBe('agents-api')
-    expect(repos[0]?.session).toBe('devdock-agents-api')
+    expect(repos.map((r) => r.id)).toEqual(['agents'])
+    const base = repos[0]
+    // one row, named for the repo dir; api sorts first; root is the wrapper dir.
+    expect(base?.name).toBe('agents')
+    expect(base?.path).toBe(repo)
+    expect(base?.root).toBe(repo)
+    expect(base?.session).toBe('devdock-agents')
+    expect(base?.workloads).toEqual(['api', 'worker'])
+    expect(base?.defaultWorkload).toBe('api')
+    // members are the per-workload configs, each rooted at its own service dir.
+    expect(base?.members?.map((m) => m.workloadType)).toEqual(['api', 'worker'])
+    expect(base?.members?.[0]?.path).toBe(join(repo, '.devspace', 'agents-api'))
+    expect(base?.members?.[0]?.name).toBe('agents-api')
+    expect(base?.members?.[0]?.root).toBe(repo)
+  })
+
+  it('derives a member workload type from its name suffix when no scalar var', () => {
+    const repo = join(root, 'agents')
+    mkdirSync(join(repo, '.devspace', 'agents-api'), { recursive: true })
+    mkdirSync(join(repo, '.devspace', 'agents-worker'), { recursive: true })
+    writeFileSync(join(repo, '.devspace', 'agents-api', 'devspace.yaml'), 'name: agents-api\n')
+    writeFileSync(join(repo, '.devspace', 'agents-worker', 'devspace.yaml'), 'name: agents-worker\n')
+
+    const base = scanRepos({ roots: [root] })[0]
+    expect(base?.workloads).toEqual(['api', 'worker'])
+  })
+
+  it('leaves a lone .devspace/<service>/ config ungrouped', () => {
+    const repo = join(root, 'agents')
+    mkdirSync(join(repo, '.devspace', 'agents-api'), { recursive: true })
+    writeFileSync(join(repo, '.devspace', 'agents-api', 'devspace.yaml'), 'name: agents-api\n')
+
+    const repos = scanRepos({ roots: [root] })
+    expect(repos.map((r) => r.id)).toEqual(['agents-api'])
+    expect(repos[0]?.workloads).toBeUndefined()
+    expect(repos[0]?.members).toBeUndefined()
   })
 
   it('leaves root unset for a single-config repo at its own root', () => {

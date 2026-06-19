@@ -1,9 +1,13 @@
 // workloads — one repo, several deployable workloads (spec §6.1).
-// Some configs deploy more than one thing off a single `WORKLOAD_TYPE` question
-// var: `devspace deploy --var WORKLOAD_TYPE=worker` names the deployment
-// `<base>-worker`, `=api` names `<base>-api`, and so on. devdock keeps these as
-// ONE repo row and reuses the existing reconciler/supervisor per workload by
-// cloning the Repo with a suffixed name/session and the var pre-answered.
+// A repo deploys more than one workload in one of two ways, both kept as ONE
+// row that scopes the reconciler/supervisor per workload:
+//   1. One config with a `WORKLOAD_TYPE` question var — `devspace deploy --var
+//      WORKLOAD_TYPE=worker` names the deployment `<base>-worker`, `=api` names
+//      `<base>-api`. scopeRepo clones the Repo with a suffixed name/session and
+//      the var pre-answered.
+//   2. Separate `.devspace/<base>-<type>/` configs (the `./devspace` wrapper
+//      pattern) — each is already a complete config; the base carries them as
+//      `members` and scopeRepo returns the matching member directly.
 import type { Repo, RepoState, RepoStatus, WorkloadState } from './types.js'
 
 /** Status priority for the aggregate a multi-workload row shows: the most
@@ -29,6 +33,7 @@ export function aggregateStatus(statuses: RepoStatus[]): RepoStatus {
 /** The workload types a repo can deploy, or `[undefined]` for a single-workload
  *  repo — the one element that means "act on the repo as-is, no scoping". */
 export function workloadTypes(repo: Repo): (string | undefined)[] {
+  if (repo.members?.length) return repo.members.map((m) => m.workloadType ?? m.id)
   return repo.workloads?.length ? repo.workloads : [undefined]
 }
 
@@ -49,6 +54,11 @@ export function resolveWorkload(repo: Repo, requested?: string): string | undefi
  *  (single-workload repos), so callers can treat both paths uniformly. */
 export function scopeRepo(repo: Repo, type?: string): Repo {
   if (!type) return repo
+  // Multi-config repos already have a complete, correctly-named config per
+  // workload — return that member as-is rather than synthesizing a clone.
+  if (repo.members?.length) {
+    return repo.members.find((m) => (m.workloadType ?? m.id) === type) ?? repo
+  }
   return {
     ...repo,
     name: `${repo.name}-${type}`,

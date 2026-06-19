@@ -30,6 +30,44 @@ const single: Repo = {
   session: 'devdock-svc-a',
 }
 
+// A multi-config repo: workloads live in separate .devspace/<name>-<type>/
+// configs, carried as members (each a complete Repo) rather than a question var.
+const multiConfig: Repo = {
+  id: 'career-service-agents',
+  name: 'career-service-agents',
+  path: '/home/me/Code/career-service-agents',
+  root: '/home/me/Code/career-service-agents',
+  configPath: '/home/me/Code/career-service-agents/.devspace/career-service-agents-api/devspace.yaml',
+  ports: [],
+  workloads: ['api', 'worker'],
+  defaultWorkload: 'api',
+  session: 'devdock-career-service-agents',
+  members: [
+    {
+      id: 'career-service-agents-api',
+      name: 'career-service-agents-api',
+      path: '/home/me/Code/career-service-agents/.devspace/career-service-agents-api',
+      root: '/home/me/Code/career-service-agents',
+      configPath:
+        '/home/me/Code/career-service-agents/.devspace/career-service-agents-api/devspace.yaml',
+      ports: [],
+      workloadType: 'api',
+      session: 'devdock-career-service-agents-api',
+    },
+    {
+      id: 'career-service-agents-worker',
+      name: 'career-service-agents-worker',
+      path: '/home/me/Code/career-service-agents/.devspace/career-service-agents-worker',
+      root: '/home/me/Code/career-service-agents',
+      configPath:
+        '/home/me/Code/career-service-agents/.devspace/career-service-agents-worker/devspace.yaml',
+      ports: [],
+      workloadType: 'worker',
+      session: 'devdock-career-service-agents-worker',
+    },
+  ],
+}
+
 describe('aggregateStatus', () => {
   it('picks the most attention-worthy status', () => {
     expect(aggregateStatus(['STOPPED', 'CRASHED', 'RUNNING_MANAGED'])).toBe('CRASHED')
@@ -53,6 +91,9 @@ describe('workloadTypes', () => {
   })
   it('yields a single undefined for a plain repo (act on it as-is)', () => {
     expect(workloadTypes(single)).toEqual([undefined])
+  })
+  it('lists a multi-config repo’s member types', () => {
+    expect(workloadTypes(multiConfig)).toEqual(['api', 'worker'])
   })
 })
 
@@ -83,6 +124,16 @@ describe('scopeRepo', () => {
   })
   it('returns the repo unchanged when no workload is given', () => {
     expect(scopeRepo(single, undefined)).toBe(single)
+  })
+  it('returns the matching member config for a multi-config repo', () => {
+    const w = scopeRepo(multiConfig, 'worker')
+    // the member is used as-is — its own service dir, name and session.
+    expect(w.path).toBe(
+      '/home/me/Code/career-service-agents/.devspace/career-service-agents-worker',
+    )
+    expect(w.name).toBe('career-service-agents-worker')
+    expect(w.session).toBe('devdock-career-service-agents-worker')
+    expect(w.root).toBe('/home/me/Code/career-service-agents')
   })
 })
 

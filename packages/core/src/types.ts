@@ -47,6 +47,16 @@ export interface Repo {
   /** The workload acted on when none is specified — the `WORKLOAD_TYPE`
    *  default (typically `api`). Only meaningful alongside `workloads`. */
   defaultWorkload?: string
+  /** This config's own workload type, from a scalar `WORKLOAD_TYPE` var (e.g.
+   *  `api`). Set on the per-workload configs of a multi-config repo so the base
+   *  can label and scope them; unset for ordinary repos. */
+  workloadType?: string
+  /** For a repo whose workloads live in separate `.devspace/<name>-<type>/`
+   *  configs (one `devspace.yaml` each, not one config with a `WORKLOAD_TYPE`
+   *  question var), the per-workload configs — each a complete Repo with its own
+   *  service dir, name and session. The base groups them into one row and scopes
+   *  verbs to the chosen member. Unset for single-config repos. */
+  members?: Repo[]
   /** The tmux session name devdock uses for this repo. */
   session: string
 }

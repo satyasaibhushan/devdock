@@ -29,6 +29,10 @@ export function parseDevspaceConfig(yamlText: string): {
   workloads?: string[]
   /** WORKLOAD_TYPE default (the workload acted on when none is chosen). */
   defaultWorkload?: string
+  /** WORKLOAD_TYPE as a plain scalar var (e.g. `api`) — the case where each
+   *  workload is its own `.devspace/<name>-<type>/` config rather than one
+   *  config with a question var. */
+  workloadType?: string
 } {
   let doc: unknown
   try {
@@ -49,7 +53,11 @@ export function parseDevspaceConfig(yamlText: string): {
   const varDefaults: Record<string, string> = {}
   let workloads: string[] | undefined
   let defaultWorkload: string | undefined
+  let workloadType: string | undefined
   for (const [key, value] of Object.entries(asRecord(d.vars) ?? {})) {
+    // A plain `WORKLOAD_TYPE: api` scalar marks a single-workload service config
+    // (one per `.devspace/<name>-<type>/`); the base groups siblings by it.
+    if (key === WORKLOAD_VAR && typeof value === 'string') workloadType = value
     const entry = asRecord(value)
     if (!entry || !('question' in entry)) continue
     const options = Array.isArray(entry.options) ? entry.options : []
@@ -91,6 +99,7 @@ export function parseDevspaceConfig(yamlText: string): {
     varDefaults,
     workloads,
     defaultWorkload,
+    workloadType,
   }
 }
 
@@ -205,10 +214,74 @@ export function scanRepos(opts: ScanOptions = {}): Repo[] {
       varDefaults: Object.keys(cfg.varDefaults).length ? cfg.varDefaults : undefined,
       workloads: cfg.workloads,
       defaultWorkload: cfg.defaultWorkload,
+      workloadType: cfg.workloadType,
       session: sessionName(id),
     })
   }
-  return repos.sort((a, b) => a.id.localeCompare(b.id))
+  return groupByRoot(repos).sort((a, b) => a.id.localeCompare(b.id))
+}
+
+/** Repos whose workloads live in separate `.devspace/<name>-<type>/` configs
+ *  share a wrapper `root`. Fold each such group (2+ configs) into one base repo
+ *  whose `members` are those configs — so the repo is one row with a workload
+ *  selector, like the `WORKLOAD_TYPE`-question-var repos. Lone configs and
+ *  ordinary repos pass through unchanged. */
+function groupByRoot(repos: Repo[]): Repo[] {
+  const groups = new Map<string, Repo[]>()
+  const out: Repo[] = []
+  for (const r of repos) {
+    if (!r.root) {
+      out.push(r)
+      continue
+    }
+    const g = groups.get(r.root)
+    if (g) g.push(r)
+    else groups.set(r.root, [r])
+  }
+  for (const [root, members] of groups) {
+    if (members.length < 2) {
+      out.push(members[0] as Repo)
+      continue
+    }
+    out.push(baseRepo(root, members))
+  }
+  return out
+}
+
+/** Build the one-row base for a multi-config repo from its per-workload members. */
+function baseRepo(root: string, members: Repo[]): Repo {
+  const id = basename(root)
+  const tagged = members
+    .map((m) => ({ ...m, workloadType: workloadTypeOf(id, m) }))
+    .sort((a, b) => apiFirst(a.workloadType) - apiFirst(b.workloadType) || a.workloadType.localeCompare(b.workloadType))
+  const types = tagged.map((m) => m.workloadType)
+  const first = tagged[0] as Repo
+  return {
+    id,
+    name: id,
+    path: root,
+    root,
+    configPath: first.configPath,
+    namespace: first.namespace,
+    workload: first.workload,
+    ports: [...new Set(tagged.flatMap((m) => m.ports))].sort((a, b) => a - b),
+    workloads: types,
+    defaultWorkload: types.includes('api') ? 'api' : types[0],
+    members: tagged,
+    session: sessionName(id),
+  }
+}
+
+/** A member's workload type: its scalar `WORKLOAD_TYPE`, else the suffix of its
+ *  config name after the repo id (`career-service-agents-worker` → `worker`). */
+function workloadTypeOf(id: string, m: Repo): string {
+  if (m.workloadType) return m.workloadType
+  const src = m.name || m.id
+  return src.startsWith(`${id}-`) ? src.slice(id.length + 1) : src
+}
+
+function apiFirst(type: string): number {
+  return type === 'api' ? 0 : 1
 }
 
 function safeRead(path: string): string {
