@@ -1,7 +1,7 @@
 // supervisor — start/build/kill a repo's workload via tmux + devspace (spec §7).
 // Each `devspace dev` runs inside its own named tmux session so it survives
 // daemon restarts and the daemon never blocks on it (spec §5).
-import { type RunResult, loginShell, run, runStream } from './exec.js'
+import { type RunResult, loginShell, loginShellArgs, run, runStream } from './exec.js'
 import type { Repo } from './types.js'
 
 /** Injectable command runner — defaults to the real `run`; swapped in tests. */
@@ -77,7 +77,7 @@ export class Supervisor {
     // Run the dev command through a login shell inside the session so it gets
     // the same PATH/env the user has in a terminal (docker/kubectl resolve), and
     // honors the wrapper's DEVSPACE_BINARY_DIR — matching build/kill exactly.
-    const inner = `${loginShell} -lc ${shellQuote(devspaceCommand(repo, 'dev'))}`
+    const inner = `${loginShell} ${loginShellArgs} ${shellQuote(devspaceCommand(repo, 'dev'))}`
     const r = await this.runner('tmux', ['new-session', '-d', '-s', repo.session, inner])
     if (r.code === 0 && pipeFile) await this.pipe(repo, pipeFile)
     return r
@@ -97,7 +97,7 @@ export class Supervisor {
   /** Build & deploy without entering dev mode: `devspace deploy`, through a
    *  login shell so docker/kubectl resolve (see devspaceCommand). */
   build(repo: Repo, onLine?: LineSink): Promise<RunResult> {
-    const args = ['-lc', devspaceCommand(repo, 'deploy')]
+    const args = [loginShellArgs, devspaceCommand(repo, 'deploy')]
     if (!onLine) return this.runner(loginShell, args)
     return this.streamRunner(loginShell, args, {}, onLine)
   }
@@ -105,7 +105,7 @@ export class Supervisor {
   /** Tear down: `devspace purge` (through a login shell), then kill the tmux
    *  session if present. */
   async kill(repo: Repo, onLine?: LineSink): Promise<RunResult> {
-    const args = ['-lc', devspaceCommand(repo, 'purge')]
+    const args = [loginShellArgs, devspaceCommand(repo, 'purge')]
     const purge = onLine
       ? await this.streamRunner(loginShell, args, {}, onLine)
       : await this.runner(loginShell, args)

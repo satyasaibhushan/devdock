@@ -3,12 +3,18 @@
 import { type ChildProcess, spawn } from 'node:child_process'
 import { env } from 'node:process'
 
-/** The user's interactive login shell. devdock shells out to `devspace`, which
- *  in turn invokes docker/kubectl; on a typical machine those live in dirs like
- *  ~/.rd/bin (Rancher Desktop) that the daemon's launchd PATH omits. Running a
- *  verb through `loginShell -lc '…'` sources the user's profile, so the same
- *  PATH/env the user has in a terminal applies and those tools resolve. */
+/** The user's login shell. devdock shells out to `devspace`, which in turn
+ *  invokes docker/kubectl; on a typical machine those live in dirs like
+ *  ~/.rd/bin (Rancher Desktop) that the daemon's launchd PATH omits. */
 export const loginShell = env.SHELL || '/bin/zsh'
+
+/** Flags for invoking the login shell to run a verb: interactive + login + a
+ *  command. The `-i` matters — Rancher Desktop (and many tools) add their bin
+ *  dir to PATH in `.zshrc`, which a non-interactive login shell (`-lc`) skips;
+ *  only an interactive shell sources it. So `-ilc` gives the verb the exact
+ *  PATH/env the user has in a terminal. `-c` still runs the command and exits
+ *  (no REPL), so there's no hang. */
+export const loginShellArgs = '-ilc'
 
 export interface RunResult {
   code: number

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { type RunResult, loginShell } from './exec.js'
+import { type RunResult, loginShell, loginShellArgs } from './exec.js'
 import { sessionName } from './registry.js'
 import { Supervisor, devspaceArgs, devspaceCommand, shellQuote, verbLabel } from './supervisor.js'
 import type { Repo } from './types.js'
@@ -37,7 +37,7 @@ describe('Supervisor', () => {
       '-d',
       '-s',
       'devdock-svc-a',
-      `${loginShell} -lc ${shellQuote("cd '/home/me/Code/svc a' && devspace dev")}`,
+      `${loginShell} ${loginShellArgs} ${shellQuote("cd '/home/me/Code/svc a' && devspace dev")}`,
     ])
   })
 
@@ -74,7 +74,7 @@ describe('Supervisor', () => {
     await new Supervisor(undefined, streamRunner).build(repo, (l) => lines.push(l))
     expect(streamRunner).toHaveBeenCalledWith(
       loginShell,
-      ['-lc', devspaceCommand(repo, 'deploy')],
+      [loginShellArgs, devspaceCommand(repo, 'deploy')],
       {},
       expect.any(Function),
     )
@@ -88,7 +88,10 @@ describe('Supervisor', () => {
       return ok()
     })
     await new Supervisor(runner).kill(repo)
-    expect(calls[0]).toEqual({ cmd: loginShell, args: ['-lc', devspaceCommand(repo, 'purge')] })
+    expect(calls[0]).toEqual({
+      cmd: loginShell,
+      args: [loginShellArgs, devspaceCommand(repo, 'purge')],
+    })
     expect(calls[1]).toEqual({ cmd: 'tmux', args: ['kill-session', '-t', '=devdock-svc-a'] })
   })
 
@@ -140,9 +143,15 @@ describe('Supervisor', () => {
       const runner = vi.fn(async () => ok())
       const sup = new Supervisor(runner)
       await sup.build(prompty)
-      expect(runner).toHaveBeenCalledWith(loginShell, ['-lc', devspaceCommand(prompty, 'deploy')])
+      expect(runner).toHaveBeenCalledWith(loginShell, [
+        loginShellArgs,
+        devspaceCommand(prompty, 'deploy'),
+      ])
       await sup.kill(prompty)
-      expect(runner).toHaveBeenCalledWith(loginShell, ['-lc', devspaceCommand(prompty, 'purge')])
+      expect(runner).toHaveBeenCalledWith(loginShell, [
+        loginShellArgs,
+        devspaceCommand(prompty, 'purge'),
+      ])
     })
 
     it('start embeds the answered command in the tmux login-shell call', async () => {
@@ -153,7 +162,7 @@ describe('Supervisor', () => {
         '-d',
         '-s',
         'devdock-svc-a',
-        `${loginShell} -lc ${shellQuote(devspaceCommand(prompty, 'dev'))}`,
+        `${loginShell} ${loginShellArgs} ${shellQuote(devspaceCommand(prompty, 'dev'))}`,
       ])
     })
   })
