@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { type RunResult, loginShell } from './exec.js'
 import { sessionName } from './registry.js'
-import { Supervisor, devspaceArgs, devspaceCommand, shellQuote } from './supervisor.js'
+import { Supervisor, devspaceArgs, devspaceCommand, shellQuote, verbLabel } from './supervisor.js'
 import type { Repo } from './types.js'
 
 const repo: Repo = {
@@ -180,6 +180,17 @@ describe('devspaceCommand', () => {
       "export DEVSPACE_BINARY_DIR='/home/me/Code/agents' && " +
         "cd '/home/me/Code/agents/.devspace/agents-api' && devspace deploy",
     )
+  })
+})
+
+describe('verbLabel', () => {
+  it('shows ./devspace for a wrapper repo (driven by the repo script)', () => {
+    expect(verbLabel(wrapped, 'deploy')).toBe('./devspace deploy')
+  })
+
+  it('shows devspace for a plain repo, with question vars + namespace', () => {
+    const prompty: Repo = { ...repo, namespace: 'panels', varDefaults: { WORKLOAD_TYPE: 'api' } }
+    expect(verbLabel(prompty, 'deploy')).toBe('devspace deploy --var WORKLOAD_TYPE=api -n panels')
   })
 })
 

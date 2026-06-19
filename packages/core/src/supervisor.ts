@@ -50,6 +50,15 @@ export function devspaceCommand(repo: Repo, verb: string): string {
   return repo.root ? `export DEVSPACE_BINARY_DIR=${shellQuote(repo.root)} && ${cmd}` : cmd
 }
 
+/** The verb as the user sees it in the logs. Wrapper repos are driven by the
+ *  repo's `./devspace` script (it exports DEVSPACE_BINARY_DIR and runs devspace
+ *  in the service dir — what devspaceCommand reproduces non-interactively), so
+ *  show `./devspace`; plain repos call `devspace` directly. */
+export function verbLabel(repo: Repo, verb: string): string {
+  const bin = repo.root ? './devspace' : 'devspace'
+  return [bin, verb, ...devspaceArgs(repo)].join(' ')
+}
+
 export class Supervisor {
   private readonly runner: Runner
   private readonly streamRunner: StreamRunner
