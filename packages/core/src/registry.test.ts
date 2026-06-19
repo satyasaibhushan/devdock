@@ -54,6 +54,37 @@ vars:
       OPTIONS_ONLY: 'worker',
     })
   })
+
+  it('captures WORKLOAD_TYPE options as the repo’s deployable workloads', () => {
+    const cfg = parseDevspaceConfig(`
+name: acs-org-management
+vars:
+  WORKLOAD_TYPE:
+    question: Which workload type?
+    default: "api"
+    options: ["api", "cron", "worker"]
+`)
+    expect(cfg.workloads).toEqual(['api', 'cron', 'worker'])
+    expect(cfg.defaultWorkload).toBe('api')
+  })
+
+  it('uses the first option as the default workload when none is declared', () => {
+    const cfg = parseDevspaceConfig(`
+name: cmc-webhook-server
+vars:
+  WORKLOAD_TYPE:
+    question: Which workload type?
+    options: ["worker"]
+`)
+    expect(cfg.workloads).toEqual(['worker'])
+    expect(cfg.defaultWorkload).toBe('worker')
+  })
+
+  it('leaves workloads unset when WORKLOAD_TYPE is not a question var with options', () => {
+    const cfg = parseDevspaceConfig('name: svc\nvars:\n  WORKLOAD_TYPE: api\n')
+    expect(cfg.workloads).toBeUndefined()
+    expect(cfg.defaultWorkload).toBeUndefined()
+  })
 })
 
 describe('sessionName', () => {
@@ -97,7 +128,17 @@ describe('scanRepos', () => {
     expect(repos.map((r) => r.id)).toEqual(['agents-api', 'agents-worker'])
     // path is the service dir — devspace commands run where the wrapper runs them.
     expect(repos[0]?.path).toBe(join(repo, '.devspace', 'agents-api'))
+    // root is the wrapper's dir (parent of .devspace) — devdock exports it as
+    // DEVSPACE_BINARY_DIR so relative Dockerfile/context paths resolve.
+    expect(repos[0]?.root).toBe(repo)
     expect(repos[0]?.name).toBe('agents-api')
     expect(repos[0]?.session).toBe('devdock-agents-api')
+  })
+
+  it('leaves root unset for a single-config repo at its own root', () => {
+    mkdirSync(join(root, 'svc-a'), { recursive: true })
+    writeFileSync(join(root, 'svc-a', 'devspace.yaml'), 'name: svc-a\n')
+    const repos = scanRepos({ roots: [root] })
+    expect(repos[0]?.root).toBeUndefined()
   })
 })

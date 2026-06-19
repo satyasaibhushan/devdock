@@ -1,7 +1,7 @@
 // supervisor — start/build/kill a repo's workload via tmux + devspace (spec §7).
 // Each `devspace dev` runs inside its own named tmux session so it survives
 // daemon restarts and the daemon never blocks on it (spec §5).
-import { type RunResult, run, runStream } from './exec.js'
+import { type RunResult, loginShell, run, runStream } from './exec.js'
 import type { Repo } from './types.js'
 
 /** Injectable command runner — defaults to the real `run`; swapped in tests. */
@@ -36,6 +36,20 @@ export function exactTarget(session: string): string {
   return `=${session}`
 }
 
+/** Build the shell command that runs `devspace <verb>` the way the user's
+ *  `./devspace` wrapper does: cd into the service dir, every `question:` var
+ *  pre-answered, and — for multi-service repos — DEVSPACE_BINARY_DIR exported to
+ *  the repo root first, so the config's relative Dockerfile/context paths
+ *  resolve. Run through `loginShell -lc` so docker/kubectl (off the daemon's
+ *  PATH) resolve exactly as they do in a terminal. */
+export function devspaceCommand(repo: Repo, verb: string): string {
+  const extra = devspaceArgs(repo)
+    .map((a) => (a.startsWith('-') ? a : shellQuote(a)))
+    .join(' ')
+  const cmd = `cd ${shellQuote(repo.path)} && devspace ${verb}${extra ? ` ${extra}` : ''}`
+  return repo.root ? `export DEVSPACE_BINARY_DIR=${shellQuote(repo.root)} && ${cmd}` : cmd
+}
+
 export class Supervisor {
   private readonly runner: Runner
   private readonly streamRunner: StreamRunner
@@ -51,10 +65,10 @@ export class Supervisor {
    *  With `pipeFile`, the pane is mirrored there via `tmux pipe-pane` so the
    *  daemon can tail the same output you'd see running `devspace dev` yourself. */
   async start(repo: Repo, pipeFile?: string): Promise<RunResult> {
-    const extra = devspaceArgs(repo)
-      .map((a) => (a.startsWith('-') ? a : shellQuote(a)))
-      .join(' ')
-    const inner = `cd ${shellQuote(repo.path)} && devspace dev${extra ? ` ${extra}` : ''}`
+    // Run the dev command through a login shell inside the session so it gets
+    // the same PATH/env the user has in a terminal (docker/kubectl resolve), and
+    // honors the wrapper's DEVSPACE_BINARY_DIR — matching build/kill exactly.
+    const inner = `${loginShell} -lc ${shellQuote(devspaceCommand(repo, 'dev'))}`
     const r = await this.runner('tmux', ['new-session', '-d', '-s', repo.session, inner])
     if (r.code === 0 && pipeFile) await this.pipe(repo, pipeFile)
     return r
@@ -71,19 +85,21 @@ export class Supervisor {
     ])
   }
 
-  /** Build & deploy without entering dev mode: `devspace deploy`. */
+  /** Build & deploy without entering dev mode: `devspace deploy`, through a
+   *  login shell so docker/kubectl resolve (see devspaceCommand). */
   build(repo: Repo, onLine?: LineSink): Promise<RunResult> {
-    const args = ['deploy', ...devspaceArgs(repo)]
-    if (!onLine) return this.runner('devspace', args, { cwd: repo.path })
-    return this.streamRunner('devspace', args, { cwd: repo.path }, onLine)
+    const args = ['-lc', devspaceCommand(repo, 'deploy')]
+    if (!onLine) return this.runner(loginShell, args)
+    return this.streamRunner(loginShell, args, {}, onLine)
   }
 
-  /** Tear down: `devspace purge`, then kill the tmux session if present. */
+  /** Tear down: `devspace purge` (through a login shell), then kill the tmux
+   *  session if present. */
   async kill(repo: Repo, onLine?: LineSink): Promise<RunResult> {
-    const args = ['purge', ...devspaceArgs(repo)]
+    const args = ['-lc', devspaceCommand(repo, 'purge')]
     const purge = onLine
-      ? await this.streamRunner('devspace', args, { cwd: repo.path }, onLine)
-      : await this.runner('devspace', args, { cwd: repo.path })
+      ? await this.streamRunner(loginShell, args, {}, onLine)
+      : await this.runner(loginShell, args)
     await this.runner('tmux', ['kill-session', '-t', exactTarget(repo.session)]).catch(
       () => undefined,
     )

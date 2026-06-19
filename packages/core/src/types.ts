@@ -19,6 +19,12 @@ export interface Repo {
   name: string
   /** Absolute path to the repo root. */
   path: string
+  /** For multi-service repos driven by a `./devspace` wrapper, the directory
+   *  that wrapper runs from (the parent of `.devspace/`). devdock exports it as
+   *  DEVSPACE_BINARY_DIR so the service config's relative Dockerfile/context
+   *  paths resolve — exactly what the wrapper does. Unset for single-config
+   *  repos, where `path` is the repo root and devspace runs there directly. */
+  root?: string
   /** Path to the discovered devspace.yaml. */
   configPath: string
   /** Kubernetes namespace, if declared in the config. */
@@ -32,8 +38,28 @@ export interface Repo {
   /** Answers for the config's `question:` vars, taken from their declared
    *  defaults — passed as `--var` so devspace never prompts for input. */
   varDefaults?: Record<string, string>
+  /** When one config deploys several workloads off a `WORKLOAD_TYPE` question
+   *  var (e.g. `['api','cron','worker']` → deployments `<name>-api`,
+   *  `<name>-worker`, …), the list of those workload types. Absent when the
+   *  repo has a single workload. The repo is still one row; workloads are
+   *  selected within it. */
+  workloads?: string[]
+  /** The workload acted on when none is specified — the `WORKLOAD_TYPE`
+   *  default (typically `api`). Only meaningful alongside `workloads`. */
+  defaultWorkload?: string
   /** The tmux session name devdock uses for this repo. */
   session: string
+}
+
+/** Per-workload reconciled view for a multi-workload repo (one entry per
+ *  `WORKLOAD_TYPE`). Single-workload repos have exactly one of these. */
+export interface WorkloadState {
+  /** Workload type, e.g. `api` | `cron` | `worker`. */
+  type: string
+  status: RepoStatus
+  pods: PodInfo[]
+  deployments: DeploymentInfo[]
+  hasSession: boolean
 }
 
 /** A pod observed in the cluster during reconciliation. */
@@ -56,9 +82,17 @@ export interface DeploymentInfo {
 /** The reconciled view of a single repo (spec §6). */
 export interface RepoState {
   repo: Repo
+  /** Aggregate status across workloads — the most attention-worthy one (see
+   *  `aggregateStatus`). For single-workload repos this is just its status. */
   status: RepoStatus
+  /** Per-workload breakdown; always at least one entry. The UI drives its
+   *  selector and running-workload pills off this. */
+  workloads: WorkloadState[]
+  /** Union of every workload's pods — kept for crash watching and callers that
+   *  treat the repo as a whole. */
   pods: PodInfo[]
   deployments: DeploymentInfo[]
+  /** Whether any workload has a live dev session. */
   hasSession: boolean
   /** epoch ms of last reconcile. */
   updatedAt: number

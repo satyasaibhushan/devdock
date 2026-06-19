@@ -29,12 +29,29 @@ export interface Repo {
   namespace?: string
   workload?: string
   ports: number[]
+  /** Deployable workload types (`api`/`cron`/`worker`) when one config deploys
+   *  several off a WORKLOAD_TYPE var. Absent for single-workload repos. */
+  workloads?: string[]
+  /** The workload acted on when none is chosen (the WORKLOAD_TYPE default). */
+  defaultWorkload?: string
   session: string
+}
+
+/** One workload's reconciled view inside a (possibly multi-workload) repo. */
+export interface WorkloadState {
+  type: string
+  status: RepoStatus
+  pods: PodInfo[]
+  deployments: DeploymentInfo[]
+  hasSession: boolean
 }
 
 export interface RepoState {
   repo: Repo
+  /** Aggregate status across workloads (the most attention-worthy). */
   status: RepoStatus
+  /** Per-workload breakdown; always at least one entry. */
+  workloads: WorkloadState[]
   pods: PodInfo[]
   deployments?: DeploymentInfo[]
   hasSession: boolean
@@ -49,8 +66,9 @@ export async function fetchRepos(): Promise<RepoState[]> {
   return res.json()
 }
 
-export async function runVerb(id: string, verb: Verb): Promise<void> {
-  const res = await fetch(`/repos/${encodeURIComponent(id)}/${verb}`, { method: 'POST' })
+export async function runVerb(id: string, verb: Verb, workload?: string): Promise<void> {
+  const q = workload ? `?workload=${encodeURIComponent(workload)}` : ''
+  const res = await fetch(`/repos/${encodeURIComponent(id)}/${verb}${q}`, { method: 'POST' })
   if (!res.ok) throw new Error(`${verb} ${id} → ${res.status}`)
 }
 
@@ -63,8 +81,9 @@ export function openEvents(): WebSocket {
   return new WebSocket(wsUrl('/events'))
 }
 
-export function openLogs(id: string): WebSocket {
-  return new WebSocket(wsUrl(`/repos/${encodeURIComponent(id)}/logs`))
+export function openLogs(id: string, workload?: string): WebSocket {
+  const q = workload ? `?workload=${encodeURIComponent(workload)}` : ''
+  return new WebSocket(wsUrl(`/repos/${encodeURIComponent(id)}/logs${q}`))
 }
 
 export function openTerminal(
@@ -72,9 +91,11 @@ export function openTerminal(
   mode: 'ro' | 'rw',
   cols?: number,
   rows?: number,
+  workload?: string,
 ): WebSocket {
   const size = cols && rows ? `&cols=${cols}&rows=${rows}` : ''
-  return new WebSocket(wsUrl(`/repos/${encodeURIComponent(id)}/terminal?mode=${mode}${size}`))
+  const wl = workload ? `&workload=${encodeURIComponent(workload)}` : ''
+  return new WebSocket(wsUrl(`/repos/${encodeURIComponent(id)}/terminal?mode=${mode}${size}${wl}`))
 }
 
 /** Control-frame prefix on the terminal socket: anything else is raw keystrokes. */

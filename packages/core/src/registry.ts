@@ -14,6 +14,10 @@ export function sessionName(id: string): string {
   return `devdock-${id}`
 }
 
+/** The question var whose options name a repo's deployable workloads. An org
+ *  convention (every multi-workload config uses it), not a per-repo hardcode. */
+const WORKLOAD_VAR = 'WORKLOAD_TYPE'
+
 /** Parse the relevant fields out of a devspace.yaml string. Pure + testable. */
 export function parseDevspaceConfig(yamlText: string): {
   name?: string
@@ -21,6 +25,10 @@ export function parseDevspaceConfig(yamlText: string): {
   workload?: string
   ports: number[]
   varDefaults: Record<string, string>
+  /** WORKLOAD_TYPE options, when it's a question var offering a real choice. */
+  workloads?: string[]
+  /** WORKLOAD_TYPE default (the workload acted on when none is chosen). */
+  defaultWorkload?: string
 } {
   let doc: unknown
   try {
@@ -39,6 +47,8 @@ export function parseDevspaceConfig(yamlText: string): {
   // declared default (or first option when there is no default) so verbs can
   // answer it via --var. Plain-value vars never prompt and need nothing.
   const varDefaults: Record<string, string> = {}
+  let workloads: string[] | undefined
+  let defaultWorkload: string | undefined
   for (const [key, value] of Object.entries(asRecord(d.vars) ?? {})) {
     const entry = asRecord(value)
     if (!entry || !('question' in entry)) continue
@@ -46,6 +56,15 @@ export function parseDevspaceConfig(yamlText: string): {
     const answer = entry.default ?? options[0]
     if (typeof answer === 'string' || typeof answer === 'number' || typeof answer === 'boolean') {
       varDefaults[key] = String(answer)
+    }
+    // WORKLOAD_TYPE's options are the repo's deployable workloads — what the
+    // detail-pane selector offers. Keep them in declared order.
+    if (key === WORKLOAD_VAR) {
+      const types = options.filter((o): o is string => typeof o === 'string')
+      if (types.length) {
+        workloads = types
+        defaultWorkload = typeof answer === 'string' ? answer : types[0]
+      }
     }
   }
 
@@ -64,7 +83,15 @@ export function parseDevspaceConfig(yamlText: string): {
     collectPorts(t.forward, ports)
   }
 
-  return { name, namespace, workload, ports: [...ports].sort((a, b) => a - b), varDefaults }
+  return {
+    name,
+    namespace,
+    workload,
+    ports: [...ports].sort((a, b) => a - b),
+    varDefaults,
+    workloads,
+    defaultWorkload,
+  }
 }
 
 function asRecord(v: unknown): Record<string, unknown> | undefined {
@@ -157,17 +184,27 @@ export function scanRepos(opts: ScanOptions = {}): Repo[] {
     if (seen.has(repoPath)) continue
     seen.add(repoPath)
 
+    // Multi-service repos keep configs at .devspace/<service>/devspace.yaml and
+    // are driven by a `./devspace` wrapper that runs devspace from the repo root
+    // (parent of .devspace). Record that root so verbs can set DEVSPACE_BINARY_DIR
+    // the way the wrapper does. Single-config repos run from `path` and need none.
+    const root =
+      basename(dirname(repoPath)) === '.devspace' ? dirname(dirname(repoPath)) : undefined
+
     const id = basename(repoPath)
     const cfg = parseDevspaceConfig(safeRead(configPath))
     repos.push({
       id,
       name: cfg.name ?? id,
       path: repoPath,
+      root,
       configPath,
       namespace: cfg.namespace,
       workload: cfg.workload,
       ports: cfg.ports,
       varDefaults: Object.keys(cfg.varDefaults).length ? cfg.varDefaults : undefined,
+      workloads: cfg.workloads,
+      defaultWorkload: cfg.defaultWorkload,
       session: sessionName(id),
     })
   }

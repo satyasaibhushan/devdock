@@ -6,6 +6,9 @@
 
   let repos = $state<RepoState[]>([])
   let selectedId = $state<string | null>(null)
+  // Which workload the detail pane acts on for a multi-workload repo. Null means
+  // "follow the repo default"; a value sticks until the user picks another.
+  let pickedType = $state<string | null>(null)
   let mode = $state<'ro' | 'rw'>('ro')
   let connected = $state(false)
   let busy = $state<{ id: string; verb: Verb } | null>(null)
@@ -33,23 +36,49 @@
   })
 
   const selected = $derived(repos.find((r) => r.repo.id === selectedId) ?? null)
+
+  // A repo can deploy several workloads (api/cron/worker) off one config. The
+  // detail pane works one workload at a time; the dropdown picks which. Single-
+  // workload repos have one entry (type ''), no dropdown.
+  const workloads = $derived(selected?.workloads ?? [])
+  const showSelector = $derived((selected?.repo.workloads?.length ?? 0) > 1)
+  // The active workload: the user's pick if the repo still offers it, else the
+  // repo default, else the first. `selected` is a fresh object each poll, so
+  // matching by type (not identity) keeps the selection across refreshes.
+  const active = $derived.by(() => {
+    if (!workloads.length) return null
+    return (
+      workloads.find((w) => w.type === pickedType) ??
+      workloads.find((w) => w.type === selected?.repo.defaultWorkload) ??
+      workloads[0]
+    )
+  })
+  // What to send the daemon as ?workload= — only for repos that have workloads
+  // (type carries meaning there); undefined for plain single-workload repos.
+  const wl = $derived(selected?.repo.workloads?.length ? active?.type : undefined)
+  // The status/pods shown and acted on are the active workload's, not the
+  // aggregate the list row shows.
+  const view = $derived(active ?? null)
+  const vstatus = $derived(view?.status ?? selected?.status ?? 'STOPPED')
+
   // Memoized primitives for the stream children. `selected` is a fresh object
   // every 4s poll, so passing `selected.repo.id` straight through would retrigger
   // the children's $effects — tearing down and redialing their WebSockets (and
   // the daemon-side PTY) on every refresh. A $derived string only propagates
   // when its value actually changes.
   const sid = $derived(selected?.repo.id ?? '')
-  const sstatus = $derived(selected?.status ?? '')
+  const swl = $derived(wl ?? '')
+  const sstatus = $derived(vstatus)
   // What the terminal would attach to (mirrors service.openTerminal): the tmux
   // session, a pod shell, or nothing. Keying the terminal on this — instead of
   // the raw status — keeps it connected across status flips that don't change
   // the attach target (BUILDING → RUNNING_MANAGED, RUNNING → CRASHED), so it
   // stops redialing mid-session.
   const sterm = $derived(
-    !selected ? 'none' : selected.hasSession ? 'tmux' : selected.pods.length ? 'pod' : 'none',
+    !view ? 'none' : view.hasSession ? 'tmux' : view.pods.length ? 'pod' : 'none',
   )
 
-  // Only the verbs that make sense for the repo's current state (spec §7).
+  // Only the verbs that make sense for the workload's current state (spec §7).
   const ACTIONS: Record<RepoStatus, Verb[]> = {
     STOPPED: ['start', 'build'],
     DEPLOYED: ['start', 'build', 'stop'],
@@ -59,16 +88,14 @@
     CRASHED: ['restart', 'stop'],
   }
   const verbs = $derived(
-    selected
-      ? ACTIONS[selected.status].filter((v) => v !== 'restart' || selected.repo.workload)
-      : [],
+    selected ? ACTIONS[vstatus].filter((v) => v !== 'restart' || selected.repo.workload || wl) : [],
   )
 
-  async function act(verb: Verb, id = selected?.repo.id) {
+  async function act(verb: Verb, id = selected?.repo.id, workload = wl) {
     if (!id || busy) return
     busy = { id, verb }
     try {
-      await runVerb(id, verb)
+      await runVerb(id, verb, workload)
       await refresh()
     } catch (e) {
       toast = `${verb} failed: ${e instanceof Error ? e.message : String(e)}`
@@ -102,9 +129,23 @@
     {#if selected}
       <div class="head">
         <div class="title">
-          <span class="dot {selected.status}"></span>
+          <span class="dot {vstatus}"></span>
           <h2>{selected.repo.id}</h2>
-          <span class="pill {selected.status}">{selected.status.replace('_', ' ').toLowerCase()}</span>
+          {#if showSelector}
+            <select
+              class="wlselect"
+              value={active?.type ?? ''}
+              onchange={(e) => (pickedType = e.currentTarget.value)}
+              aria-label="workload"
+            >
+              {#each workloads as w (w.type)}
+                <option value={w.type}>{w.type}{w.status !== 'STOPPED' ? ' ●' : ''}</option>
+              {/each}
+            </select>
+          {:else if wl && wl !== 'api'}
+            <span class="tag">{wl}</span>
+          {/if}
+          <span class="pill {vstatus}">{vstatus.replace('_', ' ').toLowerCase()}</span>
         </div>
         <div class="actions">
           {#each verbs as v (v)}
@@ -119,16 +160,16 @@
 
       <div class="meta">
         <code>{selected.repo.path}</code>
-        <span>· {selected.pods.length} pod{selected.pods.length === 1 ? '' : 's'}</span>
-        {#if selected.status === 'DEPLOYED'}<span>· deployment present, scaled to 0</span>{/if}
+        <span>· {view?.pods.length ?? 0} pod{(view?.pods.length ?? 0) === 1 ? '' : 's'}</span>
+        {#if vstatus === 'DEPLOYED'}<span>· deployment present, scaled to 0</span>{/if}
         {#if selected.repo.ports.length}<span>· :{selected.repo.ports.join(' :')}</span>{/if}
       </div>
 
       <div class="streams">
         <div class="block">
           <div class="bhead"><h3>Logs</h3></div>
-          {#key sid + sstatus}
-            <LogViewer id={sid} />
+          {#key sid + swl + sstatus}
+            <LogViewer id={sid} workload={wl} />
           {/key}
         </div>
 
@@ -140,8 +181,8 @@
               <button class:active={mode === 'rw'} onclick={() => (mode = 'rw')}>read-write</button>
             </div>
           </div>
-          {#key sid + mode + sterm}
-            <Terminal id={sid} {mode} />
+          {#key sid + swl + mode + sterm}
+            <Terminal id={sid} {mode} workload={wl} />
           {/key}
         </div>
       </div>
@@ -256,6 +297,32 @@
   .pill.DEPLOYED {
     color: #9fb6cc;
     border-color: #46566a;
+  }
+
+  .wlselect {
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 3px 6px;
+    border-radius: 6px;
+    border: 1px solid var(--line);
+    background: var(--panel2);
+    color: var(--ink);
+    cursor: pointer;
+  }
+  .wlselect:hover {
+    border-color: var(--accent);
+  }
+  /* The active workload's type, shown when it isn't the plain `api` default. */
+  .tag {
+    font-family: var(--mono);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 3px 8px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--accent) 18%, transparent);
+    color: var(--accent);
+    white-space: nowrap;
   }
 
   .actions {

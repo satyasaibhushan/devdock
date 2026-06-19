@@ -1,14 +1,14 @@
 <script lang="ts">
   import { openLogs } from './api'
 
-  let { id }: { id: string } = $props()
+  let { id, workload }: { id: string; workload?: string } = $props()
   let lines = $state<string[]>([])
   let box: HTMLDivElement
 
   $effect(() => {
-    // re-subscribe whenever the selected repo changes.
+    // re-subscribe whenever the selected repo (or workload) changes.
     lines = []
-    const ws = openLogs(id)
+    const ws = openLogs(id, workload)
     ws.onmessage = (ev) => {
       lines = [...lines.slice(-999), String(ev.data)]
       queueMicrotask(() => box?.scrollTo(0, box.scrollHeight))

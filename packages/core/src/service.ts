@@ -12,6 +12,7 @@ import { scanRepos } from './registry.js'
 import { StateStore } from './stateStore.js'
 import { Supervisor, devspaceArgs } from './supervisor.js'
 import type { Repo, RepoState, TermMode } from './types.js'
+import { assembleState, resolveWorkload, scopeRepo, workloadTypes } from './workloads.js'
 
 export interface ServiceOptions {
   roots?: string[]
@@ -87,19 +88,38 @@ export class Service {
     return repo
   }
 
+  /** Resolve a (repo, workload) request into the scoped repo to act on and the
+   *  per-workload key its logs/session/state live under. For single-workload
+   *  repos `type` is undefined and the key is just the id — behaviour and keys
+   *  are unchanged. For multi-workload repos the repo is cloned to the chosen
+   *  workload and everything is keyed `<id>::<type>`. */
+  private scoped(
+    id: string,
+    workload?: string,
+  ): {
+    base: Repo
+    repo: Repo
+    type?: string
+    key: string
+  } {
+    const base = this.repoOrThrow(id)
+    const type = resolveWorkload(base, workload)
+    return { base, repo: scopeRepo(base, type), type, key: workloadKey(id, type) }
+  }
+
   // ---- lifecycle verbs (spec §7) ----
   // Every verb narrates into the repo's log hub — the same output you'd see
   // running the devspace command in a terminal streams to the Logs panel live.
-  async start(id: string): Promise<RunResult> {
-    const repo = this.repoOrThrow(id)
-    const hub = this.hubFor(id)
-    const pipeFile = this.devLogPath(id)
+  async start(id: string, workload?: string): Promise<RunResult> {
+    const { repo, key } = this.scoped(id, workload)
+    const hub = this.hubFor(key)
+    const pipeFile = this.devLogPath(key)
     mkdirSync(dirname(pipeFile), { recursive: true })
     writeFileSync(pipeFile, '') // fresh run, fresh file — old output doesn't replay
     hub.push(`$ ${['devspace dev', ...devspaceArgs(repo)].join(' ')}`)
     const r = await this.supervisor.start(repo, pipeFile)
     if (r.code === 0) {
-      this.tailDevLog(id, pipeFile)
+      this.tailDevLog(key, pipeFile)
     } else {
       for (const line of nonEmptyLines(r.stderr)) hub.push(line)
       hub.push(`✗ devspace dev failed to start (exit ${r.code})`)
@@ -108,10 +128,10 @@ export class Service {
     return r
   }
 
-  async build(id: string): Promise<RunResult> {
-    const repo = this.repoOrThrow(id)
+  async build(id: string, workload?: string): Promise<RunResult> {
+    const { repo, key } = this.scoped(id, workload)
     const r = await this.narrate(
-      id,
+      key,
       ['devspace deploy', ...devspaceArgs(repo)].join(' '),
       (onLine) => this.supervisor.build(repo, onLine),
     )
@@ -119,28 +139,31 @@ export class Service {
     return r
   }
 
-  async stop(id: string): Promise<RunResult> {
-    const repo = this.repoOrThrow(id)
-    this.tailers.get(id)?.stop()
-    this.tailers.delete(id)
+  async stop(id: string, workload?: string): Promise<RunResult> {
+    const { repo, key } = this.scoped(id, workload)
+    this.tailers.get(key)?.stop()
+    this.tailers.delete(key)
     const r = await this.narrate(
-      id,
+      key,
       ['devspace purge', ...devspaceArgs(repo)].join(' '),
       (onLine) => this.supervisor.kill(repo, onLine),
     )
-    this.devTails.get(id)?.stop()
-    this.devTails.delete(id)
+    this.devTails.get(key)?.stop()
+    this.devTails.delete(key)
     await this.reconcileOne(id)
     return r
   }
 
   /** Roll the workload: `kubectl rollout restart deployment/<workload>`. */
-  async restart(id: string): Promise<RunResult> {
-    const repo = this.repoOrThrow(id)
-    if (!repo.workload) throw new Error(`no workload known for ${id}`)
-    const args = ['rollout', 'restart', `deployment/${repo.workload}`]
+  async restart(id: string, workload?: string): Promise<RunResult> {
+    const { base, repo, type, key } = this.scoped(id, workload)
+    // For a scoped workload the deployment is `<name>-<type>` (repo.name carries
+    // the suffix); single-workload repos use the deployment name from the config.
+    const deployment = type ? repo.name : base.workload
+    if (!deployment) throw new Error(`no workload known for ${id}`)
+    const args = ['rollout', 'restart', `deployment/${deployment}`]
     if (repo.namespace) args.push('-n', repo.namespace)
-    return this.narrate(id, `kubectl ${args.join(' ')}`, async (onLine) => {
+    return this.narrate(key, `kubectl ${args.join(' ')}`, async (onLine) => {
       const r = await this.runner('kubectl', args)
       for (const line of nonEmptyLines(r.stdout + r.stderr)) onLine(line)
       return r
@@ -166,32 +189,50 @@ export class Service {
   }
 
   // ---- reconciliation (spec §6) ----
-  async reconcileOne(id: string, cache?: ClusterCache): Promise<RepoState> {
+  async reconcileOne(id: string, cache?: ClusterCache, sessions?: Set<string>): Promise<RepoState> {
     const repo = this.repoOrThrow(id)
-    const hasSession = await this.supervisor.hasSession(repo)
-    const state = await this.reconciler.reconcile(repo, hasSession, cache)
-    if (hasSession && !this.devTails.has(id)) {
-      // live dev session without a pane mirror (daemon restarted under it, or
-      // the session was started outside devdock) — attach one so its output
-      // flows to the logs. pipe-pane -o is a no-op if a pipe already exists.
-      const file = this.devLogPath(id)
-      mkdirSync(dirname(file), { recursive: true })
-      await this.supervisor.pipe(repo, file)
-      this.tailDevLog(id, file)
-    } else if (!hasSession && this.devTails.has(id)) {
-      this.devTails.get(id)?.stop()
-      this.devTails.delete(id)
+    // One `tmux list-sessions` answers "is each workload's session live?" — the
+    // pass shares the set so a 47-repo reconcile isn't 47 has-session calls.
+    const live = sessions ?? new Set(await this.supervisor.listSessions())
+
+    const workloads = []
+    for (const type of workloadTypes(repo)) {
+      const scoped = scopeRepo(repo, type)
+      const key = workloadKey(id, type)
+      const hasSession = live.has(scoped.session)
+      workloads.push(
+        await this.reconciler.reconcileWorkload(
+          scoped,
+          hasSession,
+          cache ?? newClusterCache(),
+          type ?? repo.defaultWorkload ?? '',
+        ),
+      )
+      if (hasSession && !this.devTails.has(key)) {
+        // live dev session without a pane mirror (daemon restarted under it, or
+        // started outside devdock) — attach one so its output flows to the logs.
+        // pipe-pane -o is a no-op if a pipe already exists.
+        const file = this.devLogPath(key)
+        mkdirSync(dirname(file), { recursive: true })
+        await this.supervisor.pipe(scoped, file)
+        this.tailDevLog(key, file)
+      } else if (!hasSession && this.devTails.has(key)) {
+        this.devTails.get(key)?.stop()
+        this.devTails.delete(key)
+      }
     }
+    const state = assembleState(repo, workloads, Date.now())
     this.applyState(state)
     return state
   }
 
   async reconcileAll(): Promise<RepoState[]> {
-    // Share one cluster snapshot across the pass — repos in the same namespace
-    // reuse a single kubectl query instead of issuing one each.
+    // Share one cluster snapshot + one session list across the pass — repos in
+    // the same namespace reuse a single kubectl query instead of one each.
     const cache = newClusterCache()
+    const sessions = new Set(await this.supervisor.listSessions())
     const out: RepoState[] = []
-    for (const id of this.repos.keys()) out.push(await this.reconcileOne(id, cache))
+    for (const id of this.repos.keys()) out.push(await this.reconcileOne(id, cache, sessions))
     return out
   }
 
@@ -219,15 +260,17 @@ export class Service {
   }
 
   // ---- logs (spec §12) ----
-  /** Recent lines from the repo's hub (pod logs, dev-pane output, verb activity). */
-  logs(id: string, tail = 200): string[] {
-    this.ensureTailer(id)
-    return this.hubFor(id).recent(tail)
+  /** Recent lines from a workload's hub (pod logs, dev-pane output, verb activity). */
+  logs(id: string, tail = 200, workload?: string): string[] {
+    const { key } = this.scoped(id, workload)
+    this.ensureTailer(id, workload)
+    return this.hubFor(key).recent(tail)
   }
 
-  subscribeLogs(id: string, cb: (line: string) => void): () => void {
-    this.ensureTailer(id)
-    return this.hubFor(id).subscribe(cb)
+  subscribeLogs(id: string, cb: (line: string) => void, workload?: string): () => void {
+    const { key } = this.scoped(id, workload)
+    this.ensureTailer(id, workload)
+    return this.hubFor(key).subscribe(cb)
   }
 
   private hubFor(id: string): LogHub {
@@ -239,29 +282,33 @@ export class Service {
     return hub
   }
 
-  /** Where `tmux pipe-pane` mirrors a repo's `devspace dev` pane. */
-  private devLogPath(id: string): string {
-    return join(dirname(this.opts.stateFile), 'logs', `${id}.dev.log`)
+  /** Where `tmux pipe-pane` mirrors a workload's `devspace dev` pane. `key` is
+   *  the per-workload key (`<id>` or `<id>::<type>`); `::` is unfilesystemy so
+   *  it becomes `.`. */
+  private devLogPath(key: string): string {
+    return join(dirname(this.opts.stateFile), 'logs', `${key.replace('::', '.')}.dev.log`)
   }
 
-  /** (Re)follow the dev-pane mirror file into the repo's hub. */
-  private tailDevLog(id: string, file: string): void {
-    this.devTails.get(id)?.stop()
-    const tail = new FileTail(this.hubFor(id), this.streamSpawner)
+  /** (Re)follow the dev-pane mirror file into the workload's hub. */
+  private tailDevLog(key: string, file: string): void {
+    this.devTails.get(key)?.stop()
+    const tail = new FileTail(this.hubFor(key), this.streamSpawner)
     tail.start(file)
-    this.devTails.set(id, tail)
+    this.devTails.set(key, tail)
   }
 
-  private ensureTailer(id: string): void {
-    if (this.tailers.has(id)) return
-    const repo = this.repos.get(id)
-    const pod = this.states.get(id)?.pods[0]
-    if (!repo || !pod) return
-    const tailer = new LogTailer(this.streamSpawner, this.hubFor(id))
+  private ensureTailer(id: string, workload?: string): void {
+    const { repo, type, key } = this.scoped(id, workload)
+    if (this.tailers.has(key)) return
+    const state = this.states.get(id)
+    const pods = type ? (state?.workloads.find((w) => w.type === type)?.pods ?? []) : state?.pods
+    const pod = pods?.[0]
+    if (!pod) return
+    const tailer = new LogTailer(this.streamSpawner, this.hubFor(key))
     tailer.start(repo, pod)
     // feed crash detection from new log lines only — the hub's backlog may
     // hold old pod logs and verb output that must not re-trigger alerts.
-    const watcher = this.watcherFor(id)
+    const watcher = this.watcherFor(key)
     tailer.hub.subscribe(
       (line) => {
         const e = watcher.observeLog(pod.name, line)
@@ -269,7 +316,7 @@ export class Service {
       },
       { replay: false },
     )
-    this.tailers.set(id, tailer)
+    this.tailers.set(key, tailer)
   }
 
   // ---- terminal (spec §8) ----
@@ -277,12 +324,13 @@ export class Service {
    * Managed repos attach the devdock tmux session; externally-started
    * deployments (pods but no session) fall back to a `devspace enter` pod shell.
    */
-  async openTerminal(id: string, mode: TermMode, cols?: number, rows?: number) {
-    const repo = this.repoOrThrow(id)
+  async openTerminal(id: string, mode: TermMode, cols?: number, rows?: number, workload?: string) {
+    const { repo, type } = this.scoped(id, workload)
     if (await this.supervisor.hasSession(repo)) {
       return this.broker.open(repo, mode, cols, rows)
     }
-    const pods = this.states.get(id)?.pods ?? []
+    const state = this.states.get(id)
+    const pods = (type ? state?.workloads.find((w) => w.type === type)?.pods : state?.pods) ?? []
     if (pods.length > 0) {
       return this.broker.openShell(repo, mode, cols, rows, pods[0]?.name)
     }
@@ -308,4 +356,11 @@ export class Service {
 
 function nonEmptyLines(text: string): string[] {
   return text.split('\n').filter((l) => l.trim() !== '')
+}
+
+/** Per-workload key for logs/sessions/tailers. Single-workload repos (no
+ *  `type`) key on the bare id, so their behaviour and on-disk paths are
+ *  unchanged; multi-workload repos get `<id>::<type>`. */
+function workloadKey(id: string, type?: string): string {
+  return type ? `${id}::${type}` : id
 }

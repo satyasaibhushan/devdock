@@ -2,7 +2,15 @@
 // Queries kubectl for pod + deployment reality, checks the tmux session,
 // derives status.
 import { type RunResult, run } from './exec.js'
-import type { DeploymentInfo, PodInfo, Repo, RepoState, RepoStatus } from './types.js'
+import type {
+  DeploymentInfo,
+  PodInfo,
+  Repo,
+  RepoState,
+  RepoStatus,
+  WorkloadState,
+} from './types.js'
+import { assembleState } from './workloads.js'
 
 type Runner = (cmd: string, args: string[], opts?: { cwd?: string }) => Promise<RunResult>
 
@@ -121,21 +129,35 @@ export function newClusterCache(): ClusterCache {
 export class Reconciler {
   constructor(private readonly runner: Runner = run) {}
 
-  /** Reconcile one repo against the cluster + its tmux session. */
+  /** Reconcile one repo against the cluster + its tmux session. A single-workload
+   *  view; multi-workload repos reconcile each workload's scoped clone and
+   *  assemble the parts themselves (see Service.reconcileOne). */
   async reconcile(
     repo: Repo,
     hasSession: boolean,
     cache: ClusterCache = newClusterCache(),
   ): Promise<RepoState> {
+    const ws = await this.reconcileWorkload(repo, hasSession, cache, repo.defaultWorkload ?? '')
+    return assembleState(repo, [ws], nowMs())
+  }
+
+  /** Reconcile a single (already workload-scoped) repo into one WorkloadState.
+   *  `repo.name` carries the workload suffix for a scoped clone, so the same
+   *  name-prefix matching isolates that workload's pods and deployments. */
+  async reconcileWorkload(
+    repo: Repo,
+    hasSession: boolean,
+    cache: ClusterCache,
+    type: string,
+  ): Promise<WorkloadState> {
     const pods = await this.fetchPods(repo, cache)
     const deployments = matchDeployments(await this.fetchDeployments(repo, cache), repo.name)
     return {
-      repo,
+      type,
       status: deriveStatus(pods, hasSession, deployments.length > 0),
       pods,
       deployments,
       hasSession,
-      updatedAt: nowMs(),
     }
   }
 

@@ -16,6 +16,15 @@ function fakeClient(over: Partial<DaemonClient> = {}): DaemonClient {
       session: 'devdock-svc-a',
     },
     status: 'RUNNING_MANAGED',
+    workloads: [
+      {
+        type: '',
+        status: 'RUNNING_MANAGED',
+        pods: [{ name: 'p', phase: 'Running', ready: true, restartCount: 0 }],
+        deployments: [],
+        hasSession: true,
+      },
+    ],
     pods: [{ name: 'p', phase: 'Running', ready: true, restartCount: 0 }],
     deployments: [],
     hasSession: true,

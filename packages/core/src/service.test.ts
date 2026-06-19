@@ -25,6 +25,8 @@ function cannedRunner(podsJson: string, sessionExists: boolean, deploymentsJson 
   return vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
     if (cmd === 'tmux' && args[0] === 'has-session')
       return { code: sessionExists ? 0 : 1, stdout: '', stderr: '' }
+    if (cmd === 'tmux' && args[0] === 'list-sessions')
+      return { code: 0, stdout: sessionExists ? 'devdock-svc-a\n' : '', stderr: '' }
     if (cmd === 'kubectl' && args[0] === 'get')
       return { code: 0, stdout: args[1] === 'deployments' ? deploymentsJson : podsJson, stderr: '' }
     return { code: 0, stdout: '', stderr: '' }

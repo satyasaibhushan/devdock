@@ -35,7 +35,7 @@ function matchRoute(pathname: string): Route | undefined {
 
 function handle(ws: WebSocket, route: Route, url: URL, service: Service): void {
   if (route.kind === 'events') handleEvents(ws, service)
-  else if (route.kind === 'logs') handleLogs(ws, service, route.id)
+  else if (route.kind === 'logs') handleLogs(ws, service, route.id, url)
   else handleTerminal(ws, service, route.id, url)
 }
 
@@ -54,10 +54,15 @@ function handleEvents(ws: WebSocket, service: Service): void {
   })
 }
 
-function handleLogs(ws: WebSocket, service: Service, id: string): void {
-  const unsubscribe = service.subscribeLogs(id, (line) => {
-    if (ws.readyState === WebSocket.OPEN) ws.send(line)
-  })
+function handleLogs(ws: WebSocket, service: Service, id: string, url: URL): void {
+  const workload = url.searchParams.get('workload') ?? undefined
+  const unsubscribe = service.subscribeLogs(
+    id,
+    (line) => {
+      if (ws.readyState === WebSocket.OPEN) ws.send(line)
+    },
+    workload,
+  )
   ws.on('close', unsubscribe)
 }
 
@@ -75,6 +80,7 @@ function handleTerminal(ws: WebSocket, service: Service, id: string, url: URL): 
   // instead of starting at the 80x24 default and redrawing.
   const cols = dim(url, 'cols')
   const rows = dim(url, 'rows')
+  const workload = url.searchParams.get('workload') ?? undefined
   // The socket can close (or error) before openTerminal() resolves. Track that so
   // the PTY spawned by the pending promise is torn down immediately rather than
   // orphaned — orphaned attaches leak /dev/ptmx slots until the pool is exhausted.
@@ -84,7 +90,7 @@ function handleTerminal(ws: WebSocket, service: Service, id: string, url: URL): 
   })
   ws.on('error', () => ws.close())
   service
-    .openTerminal(id, mode, cols, rows)
+    .openTerminal(id, mode, cols, rows, workload)
     .then((term) => {
       if (socketClosed) {
         term.close()

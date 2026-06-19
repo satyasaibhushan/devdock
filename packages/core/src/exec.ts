@@ -1,6 +1,14 @@
 // Thin promise wrapper around child_process — devdock shells out to
 // trusted CLIs (devspace, kubectl, tmux) rather than reimplementing them.
 import { type ChildProcess, spawn } from 'node:child_process'
+import { env } from 'node:process'
+
+/** The user's interactive login shell. devdock shells out to `devspace`, which
+ *  in turn invokes docker/kubectl; on a typical machine those live in dirs like
+ *  ~/.rd/bin (Rancher Desktop) that the daemon's launchd PATH omits. Running a
+ *  verb through `loginShell -lc '…'` sources the user's profile, so the same
+ *  PATH/env the user has in a terminal applies and those tools resolve. */
+export const loginShell = env.SHELL || '/bin/zsh'
 
 export interface RunResult {
   code: number

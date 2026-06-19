@@ -38,6 +38,14 @@
   const label = (s: string) => s.replace('RUNNING_', '').replace('_', ' ').toLowerCase()
   const startable = (s: RepoStatus) => s === 'STOPPED' || s === 'DEPLOYED'
 
+  // For a multi-workload repo, the workload types that currently have something
+  // in the cluster (anything but STOPPED) — shown as pills so one row conveys
+  // "api + worker up, cron down" at a glance.
+  const runningWorkloads = (r: RepoState) =>
+    (r.repo.workloads?.length ?? 0) > 1
+      ? r.workloads.filter((w) => w.status !== 'STOPPED')
+      : []
+
   const COLLAPSE_KEY = 'devdock.collapsedSections'
   function readCollapsed(): Record<string, boolean> {
     try {
@@ -81,7 +89,15 @@
           >
             <span class="dot {r.status}" title={r.status}></span>
             <span class="id" title={r.repo.id}>{r.repo.id}</span>
-            <span class="st {r.status}">{label(r.status)}</span>
+            {#if runningWorkloads(r).length}
+              <span class="wpills">
+                {#each runningWorkloads(r) as w (w.type)}
+                  <span class="wpill {w.status}" title="{w.type}: {w.status}">{w.type}</span>
+                {/each}
+              </span>
+            {:else}
+              <span class="st {r.status}">{label(r.status)}</span>
+            {/if}
           </button>
           {#if startable(r.status)}
             <button
@@ -281,6 +297,43 @@
   }
   .st.DEPLOYED {
     color: #9fb6cc;
+  }
+  .wpills {
+    display: flex;
+    gap: 3px;
+    justify-content: flex-end;
+    flex-wrap: wrap;
+    max-width: 130px;
+  }
+  .wpill {
+    font-family: var(--mono);
+    font-size: 9px;
+    letter-spacing: 0.02em;
+    padding: 1px 5px;
+    border-radius: 999px;
+    border: 1px solid var(--line);
+    color: var(--muted);
+    white-space: nowrap;
+  }
+  .wpill.RUNNING_MANAGED {
+    color: var(--ok);
+    border-color: color-mix(in srgb, var(--ok) 40%, transparent);
+  }
+  .wpill.RUNNING_EXTERNAL {
+    color: var(--warn);
+    border-color: color-mix(in srgb, var(--warn) 40%, transparent);
+  }
+  .wpill.CRASHED {
+    color: var(--danger);
+    border-color: color-mix(in srgb, var(--danger) 40%, transparent);
+  }
+  .wpill.BUILDING {
+    color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  }
+  .wpill.DEPLOYED {
+    color: #9fb6cc;
+    border-color: #46566a;
   }
   .empty {
     color: var(--muted);
