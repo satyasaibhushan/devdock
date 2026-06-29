@@ -4,7 +4,12 @@
   import { Terminal } from '@xterm/xterm'
   import { openTerminal, sendResize } from './api'
 
-  let { id, mode, workload }: { id: string; mode: 'ro' | 'rw'; workload?: string } = $props()
+  let {
+    id,
+    mode,
+    workload,
+    kind = 'auto',
+  }: { id: string; mode: 'ro' | 'rw'; workload?: string; kind?: 'auto' | 'shell' } = $props()
   let host: HTMLDivElement
   let error = $state<string | null>(null)
 
@@ -42,7 +47,7 @@
 
     // Dial in at the fitted size so the PTY (and tmux) renders full-pane from
     // the first frame instead of an 80x24 postage stamp.
-    const ws = openTerminal(id, mode, term.cols, term.rows, workload)
+    const ws = openTerminal(id, mode, term.cols, term.rows, workload, kind)
     ws.onmessage = (ev) => {
       const data = String(ev.data)
       // The daemon sends a JSON envelope when it can't attach a PTY.

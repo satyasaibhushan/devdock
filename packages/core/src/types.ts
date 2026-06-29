@@ -10,6 +10,9 @@ export type RepoStatus =
   | 'STOPPED'
   | 'BUILDING'
   | 'DEPLOYED'
+  // Transient, held by the service for the whole restart (purge → deploy → dev)
+  // so the row never flickers through STOPPED/DEPLOYED mid-recycle.
+  | 'RESTARTING'
 
 /** A DevSpace-enabled repo discovered by the registry (spec §12). */
 export interface Repo {
@@ -106,6 +109,9 @@ export interface RepoState {
   hasSession: boolean
   /** epoch ms of last reconcile. */
   updatedAt: number
+  /** Per-repo command auto-run in the `devspace dev` session once its pod is up
+   *  (the app's start script). Undefined when none is configured. */
+  startupCommand?: string
 }
 
 /** Terminal access mode (spec §8). */

@@ -11,7 +11,7 @@ import { type ClusterCache, Reconciler, newClusterCache } from './reconciler.js'
 import { scanRepos } from './registry.js'
 import { StateStore } from './stateStore.js'
 import { Supervisor, verbLabel } from './supervisor.js'
-import type { Repo, RepoState, TermMode } from './types.js'
+import type { Repo, RepoState, RepoStatus, TermMode } from './types.js'
 import { assembleState, resolveWorkload, scopeRepo, workloadTypes } from './workloads.js'
 
 export interface ServiceOptions {
@@ -19,6 +19,11 @@ export interface ServiceOptions {
   stateFile?: string
   reconcileMs?: number
 }
+
+/** Grace after the dev pod reports ready before sending the startup command —
+ *  `devspace dev` opens its in-container terminal a beat after the pod is up, so
+ *  the keystrokes land at the shell prompt rather than mid-deploy output. */
+const STARTUP_RUN_DELAY_MS = 2500
 
 /** Injectable collaborators (defaults are the real implementations). */
 export interface ServiceDeps {
@@ -46,6 +51,12 @@ export class Service {
   private readonly tailers = new Map<string, LogTailer>()
   private readonly devTails = new Map<string, FileTail>()
   private readonly watchers = new Map<string, CrashWatch>()
+  /** Per-workload status override held during a multi-step verb (restart) so the
+   *  reconcile loop can't surface the STOPPED/DEPLOYED states it passes through. */
+  private readonly transitions = new Map<string, RepoStatus>()
+  /** Workload keys whose configured startup command is queued to run once the
+   *  dev session's pod is up. Cleared after it fires (once per start). */
+  private readonly pendingStartup = new Map<string, string>()
   private timer?: NodeJS.Timeout
 
   constructor(opts: ServiceOptions = {}, deps: ServiceDeps = {}) {
@@ -120,6 +131,11 @@ export class Service {
     const r = await this.supervisor.start(repo, pipeFile)
     if (r.code === 0) {
       this.tailDevLog(key, pipeFile)
+      // Queue the configured startup command to run in the dev session once its
+      // pod is ready (handled in reconcile). Only the tmux dev session gets it;
+      // `devspace enter` shells are separate PTYs, so they never receive it.
+      const startup = this.store.getStartup(id)
+      if (startup) this.pendingStartup.set(key, startup)
     } else {
       for (const line of nonEmptyLines(r.stderr)) hub.push(line)
       hub.push(`✗ devspace dev failed to start (exit ${r.code})`)
@@ -150,20 +166,77 @@ export class Service {
     return r
   }
 
-  /** Roll the workload: `kubectl rollout restart deployment/<workload>`. */
+  /** Clear a crashed dev session: drop the replaced dev pod and release the
+   *  session lock without purge or rebuild (image/deployment stay as deployed). */
+  async clear(id: string, workload?: string): Promise<RunResult> {
+    const { repo, key } = this.scoped(id, workload)
+    this.tailers.get(key)?.stop()
+    this.tailers.delete(key)
+    const r = await this.narrate(key, verbLabel(repo, 'reset pods'), (onLine) =>
+      this.supervisor.clear(repo, onLine),
+    )
+    this.devTails.get(key)?.stop()
+    this.devTails.delete(key)
+    await this.reconcileOne(id)
+    return r
+  }
+
+  /** Recycle the workload from any state: kill → build → start (purge, then
+   *  deploy, then dev). Available in every state as a one-click "start fresh".
+   *  Stops early if a step fails so a broken purge/deploy doesn't cascade.
+   *
+   *  The whole sequence is held under a RESTARTING status override so the row
+   *  shows one stable "restarting" state instead of flickering STOPPED → DEPLOYED
+   *  → RUNNING as each sub-step reconciles. */
   async restart(id: string, workload?: string): Promise<RunResult> {
-    const { base, repo, type, key } = this.scoped(id, workload)
-    // For a scoped workload the deployment is `<name>-<type>` (repo.name carries
-    // the suffix); single-workload repos use the deployment name from the config.
-    const deployment = type ? repo.name : base.workload
-    if (!deployment) throw new Error(`no workload known for ${id}`)
-    const args = ['rollout', 'restart', `deployment/${deployment}`]
-    if (repo.namespace) args.push('-n', repo.namespace)
-    return this.narrate(key, `kubectl ${args.join(' ')}`, async (onLine) => {
-      const r = await this.runner('kubectl', args)
-      for (const line of nonEmptyLines(r.stdout + r.stderr)) onLine(line)
-      return r
-    })
+    const { key } = this.scoped(id, workload)
+    this.transitions.set(key, 'RESTARTING')
+    await this.reconcileOne(id) // reflect RESTARTING immediately
+    try {
+      const killed = await this.stop(id, workload)
+      if (killed.code !== 0) return killed
+      const built = await this.build(id, workload)
+      if (built.code !== 0) return built
+      return await this.start(id, workload)
+    } finally {
+      this.transitions.delete(key)
+      await this.reconcileOne(id) // settle to the real, reconciled status
+    }
+  }
+
+  /** Take over an externally-run dev session ("move here"). `devspace dev`
+   *  replaces the target pod and then holds the session (port-forward/sync/
+   *  terminal) from whatever process started it; RUNNING_EXTERNAL means that
+   *  process is running outside devdock. We stop that process — which releases
+   *  devspace's namespace session lock and leaves the replaced dev pod running —
+   *  then run `devspace dev` here, which reconnects to that same pod. No purge or
+   *  deploy is involved, so the deployment/image and other workloads sharing the
+   *  namespace are never disturbed.
+   *
+   *  Held under the RESTARTING override so the row shows one stable state instead
+   *  of flickering as the sub-steps reconcile. */
+  async adopt(id: string, workload?: string): Promise<RunResult> {
+    const { repo, key } = this.scoped(id, workload)
+    this.transitions.set(key, 'RESTARTING')
+    await this.reconcileOne(id) // reflect RESTARTING immediately
+    const hub = this.hubFor(key)
+    try {
+      hub.push('$ move here — releasing the external devspace dev session')
+      const { pids } = await this.supervisor.stopExternalDev(repo, (l) => hub.push(l))
+      if (pids.length === 0) {
+        hub.push(
+          '! no live external session holds the lock (stale or owned elsewhere) — reconnecting to the existing dev pod',
+        )
+      } else {
+        hub.push(`✓ external session stopped (pid ${pids.join(', ')}); the dev pod is kept`)
+      }
+      // Reconnect: `devspace dev` takes over the freed lock and reuses the
+      // existing replaced pod — no rebuild, no redeploy, no purge.
+      return await this.start(id, workload)
+    } finally {
+      this.transitions.delete(key)
+      await this.reconcileOne(id) // settle to the real, reconciled status
+    }
   }
 
   /** Run a verb with a `$ cmd` header and ✓/✗ footer, streaming lines into the repo's hub. */
@@ -184,49 +257,101 @@ export class Service {
     return this.supervisor.exec(this.repoOrThrow(id), command)
   }
 
+  /** The configured startup command for a repo, if any. */
+  getStartupCommand(id: string): string | undefined {
+    this.repoOrThrow(id)
+    return this.store.getStartup(id)
+  }
+
+  /** Persist (or, for an empty command, clear) the repo's startup command. The
+   *  cached state is updated so `/repos` reflects it before the next reconcile. */
+  setStartupCommand(id: string, command: string): void {
+    this.repoOrThrow(id)
+    this.store.setStartup(id, command)
+    const state = this.states.get(id)
+    if (state) state.startupCommand = this.store.getStartup(id)
+  }
+
+  /** Run the queued startup command in the dev session after a short grace, so
+   *  the keystrokes land at the in-container shell `devspace dev` opens. */
+  private scheduleStartup(scoped: Repo, key: string, command: string): void {
+    setTimeout(() => {
+      const hub = this.hubFor(key)
+      hub.push(`$ ${command}  (startup)`)
+      void this.supervisor.exec(scoped, command).then((r) => {
+        if (r.code !== 0) hub.push(`✗ startup command exited ${r.code}`)
+      })
+    }, STARTUP_RUN_DELAY_MS)
+  }
+
   // ---- reconciliation (spec §6) ----
-  async reconcileOne(id: string, cache?: ClusterCache, sessions?: Set<string>): Promise<RepoState> {
+  async reconcileOne(
+    id: string,
+    cache?: ClusterCache,
+    sessions?: Map<string, boolean>,
+  ): Promise<RepoState> {
     const repo = this.repoOrThrow(id)
-    // One `tmux list-sessions` answers "is each workload's session live?" — the
-    // pass shares the set so a 47-repo reconcile isn't 47 has-session calls.
-    const live = sessions ?? new Set(await this.supervisor.listSessions())
+    // One `tmux list-panes -a` answers "is each workload's session live/dead?" —
+    // the pass shares the map so a 47-repo reconcile is a single tmux call.
+    const states = sessions ?? (await this.supervisor.sessionStates())
 
     const workloads = []
     for (const type of workloadTypes(repo)) {
       const scoped = scopeRepo(repo, type)
       const key = workloadKey(id, type)
-      const hasSession = live.has(scoped.session)
-      workloads.push(
-        await this.reconciler.reconcileWorkload(
-          scoped,
-          hasSession,
-          cache ?? newClusterCache(),
-          type ?? repo.defaultWorkload ?? '',
-        ),
+      const exists = states.has(scoped.session)
+      const sessionDead = states.get(scoped.session) === true
+      const hasSession = exists && !sessionDead
+      const ws = await this.reconciler.reconcileWorkload(
+        scoped,
+        hasSession,
+        cache ?? newClusterCache(),
+        type ?? repo.defaultWorkload ?? '',
+        sessionDead,
       )
-      if (hasSession && !this.devTails.has(key)) {
-        // live dev session without a pane mirror (daemon restarted under it, or
-        // started outside devdock) — attach one so its output flows to the logs.
-        // pipe-pane -o is a no-op if a pipe already exists.
+      // While a multi-step verb (restart) is in flight, force the transient
+      // status so the loop doesn't surface the intermediate STOPPED/DEPLOYED.
+      const transition = this.transitions.get(key)
+      if (transition) ws.status = transition
+      workloads.push(ws)
+
+      // Once the dev session's pod is up, fire any queued startup command into
+      // the session (the initial dev pod) — one shot per start.
+      if (ws.status === 'RUNNING_MANAGED' && this.pendingStartup.has(key)) {
+        const command = this.pendingStartup.get(key) as string
+        this.pendingStartup.delete(key)
+        this.scheduleStartup(scoped, key, command)
+      }
+      if (exists) {
+        // The session is present (alive or a dead/crashed shell). Keep its pane
+        // mirrored so its output — including the last lines before it died —
+        // flows to the logs.
         const file = this.devLogPath(key)
         mkdirSync(dirname(file), { recursive: true })
-        await this.supervisor.pipe(scoped, file)
-        this.tailDevLog(key, file)
-      } else if (!hasSession && this.devTails.has(key)) {
+        if (!sessionDead) {
+          // pipe-pane -o is a no-op if already piped; re-asserting it recovers a
+          // pipe dropped by a tmux server restart. keepalive backfills sessions
+          // started before remain-on-exit was set.
+          await this.supervisor.pipe(scoped, file)
+          if (!this.devTails.has(key)) await this.supervisor.keepalive(scoped)
+        }
+        if (!this.devTails.has(key)) this.tailDevLog(key, file)
+      } else if (this.devTails.has(key)) {
         this.devTails.get(key)?.stop()
         this.devTails.delete(key)
       }
     }
     const state = assembleState(repo, workloads, Date.now())
+    state.startupCommand = this.store.getStartup(id)
     this.applyState(state)
     return state
   }
 
   async reconcileAll(): Promise<RepoState[]> {
-    // Share one cluster snapshot + one session list across the pass — repos in
+    // Share one cluster snapshot + one session map across the pass — repos in
     // the same namespace reuse a single kubectl query instead of one each.
     const cache = newClusterCache()
-    const sessions = new Set(await this.supervisor.listSessions())
+    const sessions = await this.supervisor.sessionStates()
     const out: RepoState[] = []
     for (const id of this.repos.keys()) out.push(await this.reconcileOne(id, cache, sessions))
     return out
@@ -317,12 +442,24 @@ export class Service {
 
   // ---- terminal (spec §8) ----
   /**
-   * Managed repos attach the devdock tmux session; externally-started
-   * deployments (pods but no session) fall back to a `devspace enter` pod shell.
+   * Open a terminal for a workload.
+   *
+   * `kind: 'auto'` (the primary terminal) attaches the devdock tmux dev session
+   * when one exists, else falls back to a `devspace enter` pod shell — the right
+   * default for "show me what's running". `kind: 'shell'` always opens an
+   * independent pod shell, even when a managed session exists, so the UI can
+   * spawn extra terminals into the same pod alongside the dev session.
    */
-  async openTerminal(id: string, mode: TermMode, cols?: number, rows?: number, workload?: string) {
+  async openTerminal(
+    id: string,
+    mode: TermMode,
+    cols?: number,
+    rows?: number,
+    workload?: string,
+    kind: 'auto' | 'shell' = 'auto',
+  ) {
     const { repo, type } = this.scoped(id, workload)
-    if (await this.supervisor.hasSession(repo)) {
+    if (kind === 'auto' && (await this.supervisor.hasSession(repo))) {
       return this.broker.open(repo, mode, cols, rows)
     }
     const state = this.states.get(id)
@@ -330,7 +467,7 @@ export class Service {
     if (pods.length > 0) {
       return this.broker.openShell(repo, mode, cols, rows, pods[0]?.name)
     }
-    throw new Error(`${id} is not running — start it first`)
+    throw new Error(`${id} has no running pod to open a shell into — start it first`)
   }
 
   // ---- reconcile loop ----

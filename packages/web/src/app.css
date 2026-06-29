@@ -49,6 +49,16 @@ body {
 .dot.BUILDING {
   background: var(--accent);
 }
+/* mid-restart — accent, pulsing to read as actively in transition */
+.dot.RESTARTING {
+  background: var(--accent);
+  animation: dotpulse 1s ease-in-out infinite;
+}
+@keyframes dotpulse {
+  50% {
+    opacity: 0.35;
+  }
+}
 .dot.STOPPED {
   background: #5d6b78;
 }

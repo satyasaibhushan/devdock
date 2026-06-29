@@ -16,9 +16,12 @@ interface Persisted {
   /** last-known status per repo id, keyed for fast lookup across restarts. */
   status: Record<string, RepoStatus>
   grants: Grant[]
+  /** Optional per-repo command auto-run in the `devspace dev` session once its
+   *  pod is up (e.g. the app's start script). Keyed by repo id. */
+  startup: Record<string, string>
 }
 
-const EMPTY: Persisted = { status: {}, grants: [] }
+const EMPTY: Persisted = { status: {}, grants: [], startup: {} }
 
 export class StateStore {
   private data: Persisted
@@ -29,7 +32,11 @@ export class StateStore {
   private static load(file: string): Persisted {
     try {
       const parsed = JSON.parse(readFileSync(file, 'utf8')) as Partial<Persisted>
-      return { status: parsed.status ?? {}, grants: parsed.grants ?? [] }
+      return {
+        status: parsed.status ?? {},
+        grants: parsed.grants ?? [],
+        startup: parsed.startup ?? {},
+      }
     } catch {
       return structuredClone(EMPTY)
     }
@@ -62,6 +69,18 @@ export class StateStore {
 
   revokeGrant(repo: string): void {
     this.data.grants = this.data.grants.filter((g) => g.repo !== repo)
+    this.flush()
+  }
+
+  getStartup(repo: string): string | undefined {
+    return this.data.startup[repo]
+  }
+
+  /** Set (or, for an empty command, clear) the repo's startup command. */
+  setStartup(repo: string, command: string): void {
+    const trimmed = command.trim()
+    if (trimmed) this.data.startup[repo] = trimmed
+    else delete this.data.startup[repo]
     this.flush()
   }
 }

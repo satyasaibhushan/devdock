@@ -81,6 +81,10 @@ function handleTerminal(ws: WebSocket, service: Service, id: string, url: URL): 
   const cols = dim(url, 'cols')
   const rows = dim(url, 'rows')
   const workload = url.searchParams.get('workload') ?? undefined
+  // `kind=shell` forces an independent pod shell (a fresh `devspace enter` exec)
+  // even when a managed tmux session exists — the UI uses it for extra terminals
+  // into the same pod. Anything else is the default tmux-or-shell attach.
+  const kind = url.searchParams.get('kind') === 'shell' ? 'shell' : 'auto'
   // The socket can close (or error) before openTerminal() resolves. Track that so
   // the PTY spawned by the pending promise is torn down immediately rather than
   // orphaned — orphaned attaches leak /dev/ptmx slots until the pool is exhausted.
@@ -90,7 +94,7 @@ function handleTerminal(ws: WebSocket, service: Service, id: string, url: URL): 
   })
   ws.on('error', () => ws.close())
   service
-    .openTerminal(id, mode, cols, rows, workload)
+    .openTerminal(id, mode, cols, rows, workload, kind)
     .then((term) => {
       if (socketClosed) {
         term.close()

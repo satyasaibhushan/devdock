@@ -79,18 +79,37 @@ describe('PtyBroker', () => {
     }
     const broker = new PtyBroker(spawn)
     const term = await broker.openShell(repo, 'ro')
-    expect(calls).toEqual([{ file: 'devspace', args: ['enter'], cwd: '/p' }])
+    expect(calls).toEqual([
+      { file: 'devspace', args: ['enter', '--pick=false', '--wait'], cwd: '/p' },
+    ])
     term.write('whoami')
     expect(pty.written).toEqual([])
   })
 
-  it('openShell read-write holds the same per-repo lock as open', async () => {
+  it('openShell pins --pod when given one (shared namespace would mis-pick otherwise)', async () => {
+    const calls: Array<{ file: string; args: string[] }> = []
+    const spawn: PtySpawn = (file, args) => {
+      calls.push({ file, args })
+      return fakePty()
+    }
+    const broker = new PtyBroker(spawn)
+    await broker.openShell(repo, 'rw', 80, 24, 'svc-devspace-abc123')
+    expect(calls[0]).toEqual({
+      file: 'devspace',
+      args: ['enter', '--pod', 'svc-devspace-abc123', '--wait'],
+    })
+  })
+
+  it('openShell does not take the write-lock — pod shells are independent', async () => {
     const broker = new PtyBroker(spawnOf(fakePty()))
-    const term = await broker.openShell(repo, 'rw')
-    expect(broker.locks.isHeld('svc')).toBe(true)
-    await expect(broker.open(repo, 'rw')).rejects.toThrow(/write-lock/)
-    term.close()
+    // Each `devspace enter` is its own exec into the pod, so any number can run
+    // read-write at once (VS Code-style multiple terminals into one pod).
+    await broker.openShell(repo, 'rw')
     expect(broker.locks.isHeld('svc')).toBe(false)
+    await expect(broker.openShell(repo, 'rw')).resolves.toBeTruthy()
+    // The shared tmux session still locks, independently of the pod shells.
+    await broker.open(repo, 'rw')
+    expect(broker.locks.isHeld('svc')).toBe(true)
   })
 
   it('releases the lock when the pty exits', async () => {

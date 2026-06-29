@@ -19,8 +19,10 @@
     <string>7717</string>
     <key>DEVDOCK_ROOTS</key>
     <string>__ROOTS__</string>
+    <!-- /usr/sbin so `lsof` resolves (move-here resolves the dev session's
+         localhost port to its owning PID via lsof); /sbin for completeness. -->
     <key>PATH</key>
-    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
   </dict>
 
   <!-- Always-on: start at login, restart if it dies. -->

@@ -1,18 +1,33 @@
 <script lang="ts">
+  import ConfirmModal from './lib/ConfirmModal.svelte'
   import LogViewer from './lib/LogViewer.svelte'
   import RepoList from './lib/RepoList.svelte'
-  import Terminal from './lib/Terminal.svelte'
-  import { type RepoState, type RepoStatus, type Verb, fetchRepos, openEvents, runVerb } from './lib/api'
+  import StartupModal from './lib/StartupModal.svelte'
+  import TerminalPanel from './lib/TerminalPanel.svelte'
+  import {
+    type RepoState,
+    type Verb,
+    STATUS_VERBS,
+    adoptRepo,
+    fetchRepos,
+    openEvents,
+    runVerb,
+  } from './lib/api'
 
   let repos = $state<RepoState[]>([])
   let selectedId = $state<string | null>(null)
+  // The repo whose startup-script modal is open, or null when none.
+  let customizingId = $state<string | null>(null)
+  const customizing = $derived(repos.find((r) => r.repo.id === customizingId) ?? null)
   // Which workload the detail pane acts on for a multi-workload repo. Null means
   // "follow the repo default"; a value sticks until the user picks another.
   let pickedType = $state<string | null>(null)
-  let mode = $state<'ro' | 'rw'>('ro')
   let connected = $state(false)
   let busy = $state<{ id: string; verb: Verb } | null>(null)
   let toast = $state<string | null>(null)
+  // The "move external session here" confirmation flow.
+  let confirmAdopt = $state(false)
+  let adoptBusy = $state(false)
 
   async function refresh() {
     try {
@@ -78,20 +93,11 @@
     !view ? 'none' : view.hasSession ? 'tmux' : view.pods.length ? 'pod' : 'none',
   )
 
-  // Only the verbs that make sense for the workload's current state (spec §7).
-  const ACTIONS: Record<RepoStatus, Verb[]> = {
-    STOPPED: ['start', 'build'],
-    DEPLOYED: ['start', 'build', 'stop'],
-    BUILDING: ['stop'],
-    RUNNING_MANAGED: ['restart', 'stop'],
-    RUNNING_EXTERNAL: ['start', 'restart', 'stop'],
-    CRASHED: ['restart', 'stop'],
-  }
-  const verbs = $derived(
-    selected ? ACTIONS[vstatus].filter((v) => v !== 'restart' || selected.repo.workload || wl) : [],
-  )
+  const verbs = $derived(selected ? STATUS_VERBS[vstatus] : [])
 
-  async function act(verb: Verb, id = selected?.repo.id, workload = wl) {
+  // The detail pane acts on the chosen workload (`wl`); a list row acts on the
+  // repo's default workload, so it passes its own id and leaves `workload` unset.
+  async function act(verb: Verb, id = selected?.repo.id, workload = id === selected?.repo.id ? wl : undefined) {
     if (!id || busy) return
     busy = { id, verb }
     try {
@@ -102,6 +108,24 @@
       setTimeout(() => (toast = null), 4000)
     } finally {
       busy = null
+    }
+  }
+
+  // Take over an externally-managed session: purge it, then start a managed
+  // `devspace dev` in its place. Confirmed first since it kills running pods.
+  async function doAdopt() {
+    const id = selected?.repo.id
+    if (!id || adoptBusy) return
+    adoptBusy = true
+    try {
+      await adoptRepo(id, wl)
+      await refresh()
+      confirmAdopt = false
+    } catch (e) {
+      toast = `move here failed: ${e instanceof Error ? e.message : String(e)}`
+      setTimeout(() => (toast = null), 4000)
+    } finally {
+      adoptBusy = false
     }
   }
 </script>
@@ -120,8 +144,10 @@
       {repos}
       {selectedId}
       busyId={busy?.id ?? null}
+      busyVerb={busy?.verb ?? null}
       onselect={(id) => (selectedId = id)}
-      onstart={(id) => act('start', id)}
+      onaction={(id, verb) => act(verb, id)}
+      oncustomize={(id) => (customizingId = id)}
     />
   </aside>
 
@@ -148,12 +174,20 @@
           <span class="pill {vstatus}">{vstatus.replace('_', ' ').toLowerCase()}</span>
         </div>
         <div class="actions">
+          {#if vstatus === 'RUNNING_EXTERNAL'}
+            <button
+              class="adopt"
+              title="stop the external devspace dev process and reconnect here (keeps the dev pod)"
+              disabled={busy !== null || adoptBusy}
+              onclick={() => (confirmAdopt = true)}
+            >move here</button>
+          {/if}
           {#each verbs as v (v)}
             <button
               class:danger={v === 'stop'}
-              disabled={busy !== null}
+              disabled={busy !== null || adoptBusy}
               onclick={() => act(v)}
-            >{v === 'stop' ? 'kill' : v}</button>
+            >{v === 'stop' ? 'kill' : v === 'clear' ? 'clear pod' : v}</button>
           {/each}
         </div>
       </div>
@@ -174,15 +208,9 @@
         </div>
 
         <div class="block">
-          <div class="bhead">
-            <h3>Terminal</h3>
-            <div class="modes">
-              <button class:active={mode === 'ro'} onclick={() => (mode = 'ro')}>read-only</button>
-              <button class:active={mode === 'rw'} onclick={() => (mode = 'rw')}>read-write</button>
-            </div>
-          </div>
-          {#key sid + swl + mode + sterm}
-            <Terminal id={sid} {mode} workload={wl} />
+          <div class="bhead"><h3>Terminal</h3></div>
+          {#key sid + swl + sterm}
+            <TerminalPanel id={sid} workload={wl} attach={sterm} />
           {/key}
         </div>
       </div>
@@ -191,6 +219,31 @@
     {/if}
   </section>
 </main>
+
+{#if customizing}
+  {#key customizing.repo.id}
+    <StartupModal
+      repoId={customizing.repo.id}
+      initial={customizing.startupCommand ?? ''}
+      onclose={() => (customizingId = null)}
+      onsaved={(id, command) => {
+        const r = repos.find((x) => x.repo.id === id)
+        if (r) r.startupCommand = command || undefined
+      }}
+    />
+  {/key}
+{/if}
+
+{#if confirmAdopt && selected}
+  <ConfirmModal
+    title="Move external session here?"
+    message={`This stops the external "devspace dev" process driving ${selected.repo.id}${wl ? ` (${wl})` : ''} — the running dev pod is kept — then reconnects by running devspace dev here, so devdock manages it. No purge or redeploy; other services are untouched.`}
+    confirmLabel="Move here"
+    busy={adoptBusy}
+    onconfirm={doAdopt}
+    oncancel={() => (confirmAdopt = false)}
+  />
+{/if}
 
 {#if toast}<div class="toast">{toast}</div>{/if}
 
@@ -290,7 +343,8 @@
     color: var(--danger);
     border-color: color-mix(in srgb, var(--danger) 40%, transparent);
   }
-  .pill.BUILDING {
+  .pill.BUILDING,
+  .pill.RESTARTING {
     color: var(--accent);
     border-color: color-mix(in srgb, var(--accent) 40%, transparent);
   }
@@ -336,6 +390,14 @@
     border-color: var(--danger);
     color: var(--danger);
   }
+  .actions button.adopt {
+    background: color-mix(in srgb, var(--accent) 18%, transparent);
+    border-color: color-mix(in srgb, var(--accent) 50%, transparent);
+    color: var(--accent);
+  }
+  .actions button.adopt:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--accent) 28%, transparent);
+  }
 
   .meta {
     display: flex;
@@ -373,18 +435,6 @@
     letter-spacing: 0.05em;
     color: var(--muted);
     margin: 0;
-  }
-  .modes {
-    display: flex;
-    gap: 4px;
-  }
-  .modes button {
-    font-size: 11px;
-    padding: 3px 8px;
-  }
-  .modes button.active {
-    border-color: var(--accent);
-    color: var(--accent);
   }
 
   .placeholder {

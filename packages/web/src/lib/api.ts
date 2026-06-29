@@ -8,6 +8,7 @@ export type RepoStatus =
   | 'STOPPED'
   | 'BUILDING'
   | 'DEPLOYED'
+  | 'RESTARTING'
 
 export interface PodInfo {
   name: string
@@ -56,9 +57,28 @@ export interface RepoState {
   deployments?: DeploymentInfo[]
   hasSession: boolean
   updatedAt: number
+  /** Command auto-run in the `devspace dev` session once the pod is up. */
+  startupCommand?: string
 }
 
-export type Verb = 'start' | 'build' | 'stop' | 'restart'
+export type Verb = 'start' | 'build' | 'stop' | 'restart' | 'clear'
+
+// The verbs that make sense for a workload's current state — the single source
+// of truth shared by the detail pane and the list rows. `restart`
+// (kill → build → start) is offered in every state as a one-click recycle.
+//  - killed (STOPPED): build it first.
+//  - built (DEPLOYED): start it, or kill it.
+//  - running/building: kill it (start would just collide).
+//  - crashed: clear pod (reset dev pod, no image change), restart, or kill.
+export const STATUS_VERBS: Record<RepoStatus, Verb[]> = {
+  STOPPED: ['build', 'restart'],
+  DEPLOYED: ['start', 'restart', 'stop'],
+  BUILDING: ['restart', 'stop'],
+  RUNNING_MANAGED: ['restart', 'stop'],
+  RUNNING_EXTERNAL: ['restart', 'stop'],
+  CRASHED: ['clear', 'restart', 'stop'],
+  RESTARTING: ['restart', 'stop'],
+}
 
 export async function fetchRepos(): Promise<RepoState[]> {
   const res = await fetch('/repos')
@@ -70,6 +90,24 @@ export async function runVerb(id: string, verb: Verb, workload?: string): Promis
   const q = workload ? `?workload=${encodeURIComponent(workload)}` : ''
   const res = await fetch(`/repos/${encodeURIComponent(id)}/${verb}${q}`, { method: 'POST' })
   if (!res.ok) throw new Error(`${verb} ${id} → ${res.status}`)
+}
+
+/** Adopt an externally-managed workload: purge it, then start a managed
+ *  `devspace dev` session in its place. */
+export async function adoptRepo(id: string, workload?: string): Promise<void> {
+  const q = workload ? `?workload=${encodeURIComponent(workload)}` : ''
+  const res = await fetch(`/repos/${encodeURIComponent(id)}/adopt${q}`, { method: 'POST' })
+  if (!res.ok) throw new Error(`adopt ${id} → ${res.status}`)
+}
+
+/** Save (or clear, with an empty string) the repo's startup command. */
+export async function saveStartup(id: string, command: string): Promise<void> {
+  const res = await fetch(`/repos/${encodeURIComponent(id)}/startup`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ command }),
+  })
+  if (!res.ok) throw new Error(`save startup ${id} → ${res.status}`)
 }
 
 function wsUrl(path: string): string {
@@ -92,10 +130,14 @@ export function openTerminal(
   cols?: number,
   rows?: number,
   workload?: string,
+  kind: 'auto' | 'shell' = 'auto',
 ): WebSocket {
   const size = cols && rows ? `&cols=${cols}&rows=${rows}` : ''
   const wl = workload ? `&workload=${encodeURIComponent(workload)}` : ''
-  return new WebSocket(wsUrl(`/repos/${encodeURIComponent(id)}/terminal?mode=${mode}${size}${wl}`))
+  const k = kind === 'shell' ? '&kind=shell' : ''
+  return new WebSocket(
+    wsUrl(`/repos/${encodeURIComponent(id)}/terminal?mode=${mode}${size}${wl}${k}`),
+  )
 }
 
 /** Control-frame prefix on the terminal socket: anything else is raw keystrokes. */

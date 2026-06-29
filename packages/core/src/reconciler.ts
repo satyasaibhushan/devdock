@@ -19,7 +19,13 @@ export function deriveStatus(
   pods: PodInfo[],
   hasSession: boolean,
   hasDeployment = false,
+  sessionDead = false,
 ): RepoStatus {
+  // A managed dev session whose process exited (pane held open by
+  // remain-on-exit) is a crash to surface — not a silent demotion to
+  // RUNNING_EXTERNAL just because `devspace dev` is no longer running.
+  if (sessionDead) return 'CRASHED'
+
   const crashed = pods.some((p) => p.restartCount > 0 || p.phase === 'Failed')
   if (crashed) return 'CRASHED'
 
@@ -149,12 +155,13 @@ export class Reconciler {
     hasSession: boolean,
     cache: ClusterCache,
     type: string,
+    sessionDead = false,
   ): Promise<WorkloadState> {
     const pods = await this.fetchPods(repo, cache)
     const deployments = matchDeployments(await this.fetchDeployments(repo, cache), repo.name)
     return {
       type,
-      status: deriveStatus(pods, hasSession, deployments.length > 0),
+      status: deriveStatus(pods, hasSession, deployments.length > 0, sessionDead),
       pods,
       deployments,
       hasSession,

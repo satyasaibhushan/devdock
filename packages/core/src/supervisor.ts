@@ -31,9 +31,19 @@ export function devspaceArgs(repo: Repo): string[] {
 }
 
 /** tmux `-t` matches session names by prefix, so `devdock-dashboard` would hit
- *  `devdock-dashboard-api-accounts`. The `=` sigil forces an exact match. */
+ *  `devdock-dashboard-api-accounts`. The `=` sigil forces an exact match. Use
+ *  this for *session*-targeting commands (has-session, kill-session). */
 export function exactTarget(session: string): string {
   return `=${session}`
+}
+
+/** Pane-targeting commands (pipe-pane, send-keys, capture-pane) reject the bare
+ *  `=name` exact-match form with "can't find pane" — the sigil only resolves a
+ *  *session* there, not the pane it implies. Appending `:` (the session's active
+ *  window/pane) makes the exact match resolve to a pane. Without this every
+ *  `tmux pipe-pane` silently no-ops and the dev-pane log stays empty. */
+export function exactPane(session: string): string {
+  return `=${session}:`
 }
 
 /** Build the shell command that runs `devspace <verb>` the way the user's
@@ -79,19 +89,53 @@ export class Supervisor {
     // honors the wrapper's DEVSPACE_BINARY_DIR — matching build/kill exactly.
     const inner = `${loginShell} ${loginShellArgs} ${shellQuote(devspaceCommand(repo, 'dev'))}`
     const r = await this.runner('tmux', ['new-session', '-d', '-s', repo.session, inner])
-    if (r.code === 0 && pipeFile) await this.pipe(repo, pipeFile)
+    if (r.code !== 0) return r
+    // Keep the pane alive after `devspace dev` exits so a died session surfaces
+    // as CRASHED (with its last output) instead of the whole session vanishing
+    // and the workload silently flipping to RUNNING_EXTERNAL.
+    await this.keepalive(repo)
+    if (pipeFile) await this.pipe(repo, pipeFile)
     return r
   }
 
-  /** Mirror the session's pane to a file. `-o` makes it a no-op if already piped. */
-  pipe(repo: Repo, pipeFile: string): Promise<RunResult> {
+  /** Hold the pane open after its process exits (`remain-on-exit on`). Idempotent;
+   *  also applied on reconcile to sessions started before this was set. */
+  keepalive(repo: Repo): Promise<RunResult> {
+    return this.runner('tmux', [
+      'set-option',
+      '-w',
+      '-t',
+      exactPane(repo.session),
+      'remain-on-exit',
+      'on',
+    ])
+  }
+
+  /** Mirror the session's pane to a file — but only when it isn't already piped.
+   *  tmux's `pipe-pane -o` *toggles* rather than being idempotent (verified on
+   *  3.6b), so re-asserting it each reconcile would flip the mirror off every
+   *  other pass. We check `pane_pipe` ourselves so re-piping recovers a dropped
+   *  pipe (tmux server restart) without ever turning a live one off. */
+  async pipe(repo: Repo, pipeFile: string): Promise<RunResult> {
+    if (await this.isPiped(repo)) return { code: 0, stdout: '', stderr: '' }
     return this.runner('tmux', [
       'pipe-pane',
-      '-o',
       '-t',
-      exactTarget(repo.session),
+      exactPane(repo.session),
       `cat >> ${shellQuote(pipeFile)}`,
     ])
+  }
+
+  /** Whether the session's pane already has an open output pipe (`pane_pipe`). */
+  async isPiped(repo: Repo): Promise<boolean> {
+    const r = await this.runner('tmux', [
+      'display-message',
+      '-p',
+      '-t',
+      exactPane(repo.session),
+      '#{pane_pipe}',
+    ])
+    return r.code === 0 && r.stdout.trim() === '1'
   }
 
   /** Build & deploy without entering dev mode: `devspace deploy`, through a
@@ -115,9 +159,189 @@ export class Supervisor {
     return purge
   }
 
+  /** Clear a crashed dev session without touching the image or deployment.
+   *  Kills the local tmux session (alive or dead), releases this project's
+   *  namespace session lock, then runs `devspace reset pods` to remove the
+   *  replaced dev pod and restore the original deployment. No purge, no rebuild. */
+  async clear(repo: Repo, onLine?: LineSink): Promise<RunResult> {
+    await this.runner('tmux', ['kill-session', '-t', exactTarget(repo.session)]).catch(
+      () => undefined,
+    )
+    await this.releaseSessionLock(repo)
+    const args = [loginShellArgs, devspaceCommand(repo, 'reset pods')]
+    return onLine
+      ? await this.streamRunner(loginShell, args, {}, onLine)
+      : await this.runner(loginShell, args)
+  }
+
+  /** Remove this project's entry from the `devspace-dependencies` ConfigMap so
+   *  a future `devspace dev` is not blocked by a stale session lock. Best-effort. */
+  private async releaseSessionLock(repo: Repo): Promise<void> {
+    if (!repo.namespace) return
+    const getArgs = ['get', 'configmap', 'devspace-dependencies', '-o', 'json', '-n', repo.namespace]
+    const r = await this.runner('kubectl', getArgs).catch(() => undefined)
+    if (!r || r.code !== 0) return
+    let data: Record<string, string>
+    try {
+      data = (JSON.parse(r.stdout)?.data ?? {}) as Record<string, string>
+    } catch {
+      return
+    }
+    if (!(repo.name in data)) return
+    const escaped = repo.name.replace(/~/g, '~0').replace(/\//g, '~1')
+    await this.runner('kubectl', [
+      'patch',
+      'configmap',
+      'devspace-dependencies',
+      '-n',
+      repo.namespace,
+      '--type=json',
+      '-p',
+      JSON.stringify([{ op: 'remove', path: `/data/${escaped}` }]),
+    ]).catch(() => undefined)
+  }
+
   /** Run a one-off command inside the repo's dev session via `tmux send-keys`. */
   exec(repo: Repo, command: string): Promise<RunResult> {
-    return this.runner('tmux', ['send-keys', '-t', exactTarget(repo.session), command, 'Enter'])
+    return this.runner('tmux', ['send-keys', '-t', exactPane(repo.session), command, 'Enter'])
+  }
+
+  /** PID(s) of the external `devspace dev` session holding this workload's lock —
+   *  what Move-Here stops so devdock can take over. DevSpace enforces one session
+   *  per project via a `devspace-dependencies` ConfigMap in the namespace: one
+   *  key per project (the devspace.yaml `name`, which is `repo.name`) whose value
+   *  records the owner as `server: http://localhost:<port>` + a runID. A new
+   *  `devspace dev` reads that entry and *pings* the server; if it answers it
+   *  refuses ("another session already running"), if not it takes the lock over.
+   *
+   *  So the owner is exactly whatever process listens on that port. We read the
+   *  lock, resolve the port to its listening PID, and return it. A stale lock
+   *  (entry present but nothing listening) returns [] — the owner is already gone
+   *  and `devspace dev` will take over on its own. When the ConfigMap can't be
+   *  read (no namespace, RBAC, kubectl missing) we fall back to scanning for the
+   *  `devspace dev` process by its cwd (and WORKLOAD_TYPE for one-config repos). */
+  async externalDevPids(repo: Repo): Promise<number[]> {
+    const lock = await this.lockOwner(repo)
+    if (!lock.readable) return this.externalDevPidsByProcess(repo)
+    if (lock.port === undefined) return [] // no lock entry — nothing to take over
+    const pid = await this.pidOnPort(lock.port)
+    return pid === undefined ? [] : [pid] // no listener — stale lock, owner gone
+  }
+
+  /** Read this project's entry in the namespace's `devspace-dependencies`
+   *  ConfigMap (the session lock). `readable:false` means the ConfigMap couldn't
+   *  be fetched at all (fall back to a process scan); `readable:true` with no
+   *  `port` means there is no live lock for this project. */
+  private async lockOwner(repo: Repo): Promise<{ readable: boolean; port?: number }> {
+    const args = ['get', 'configmap', 'devspace-dependencies', '-o', 'json']
+    if (repo.namespace) args.push('-n', repo.namespace)
+    const r = await this.runner('kubectl', args).catch(() => undefined)
+    if (!r || r.code !== 0) return { readable: false }
+    let data: Record<string, string>
+    try {
+      data = (JSON.parse(r.stdout)?.data ?? {}) as Record<string, string>
+    } catch {
+      return { readable: false }
+    }
+    const payload = data[repo.name]
+    if (!payload) return { readable: true }
+    // payload is small YAML: `server: http://localhost:8091\nrunID: ...`
+    const serverLine = payload.split('\n').find((l) => l.trim().startsWith('server:'))
+    const m = serverLine?.match(/:(\d+)\s*$/)
+    return { readable: true, port: m ? Number(m[1]) : undefined }
+  }
+
+  /** The PID listening on a TCP port (the devspace session's localhost server),
+   *  or undefined when nothing listens there. */
+  private async pidOnPort(port: number): Promise<number | undefined> {
+    const r = await this.runner('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-Fp']).catch(
+      () => undefined,
+    )
+    if (!r || r.code !== 0) return undefined
+    const p = r.stdout.split('\n').find((l) => l.startsWith('p'))
+    return p ? Number(p.slice(1)) : undefined
+  }
+
+  /** Fallback owner lookup when the lock ConfigMap is unreadable: match a
+   *  `devspace dev` process by its service-dir cwd (devspaceCommand cd's there,
+   *  as the user's wrapper does), and — for a one-config multi-workload repo —
+   *  the `WORKLOAD_TYPE` var, so we never touch a sibling workload. */
+  private async externalDevPidsByProcess(repo: Repo): Promise<number[]> {
+    const ps = await this.runner('ps', ['-axww', '-o', 'pid=,command=']).catch(() => undefined)
+    if (!ps || ps.code !== 0) return []
+    const wlType = repo.varDefaults?.WORKLOAD_TYPE
+    const out: number[] = []
+    for (const line of ps.stdout.split('\n')) {
+      const m = line.trim().match(/^(\d+)\s+(.+)$/)
+      if (!m) continue
+      const cmd = m[2] as string
+      // `devspace dev` only — not deploy/purge/enter/logs (which don't hold the
+      // session). `\bdev\b` excludes `deploy`; the adjacency excludes a `dev` in
+      // a binary path like /Users/dev/.
+      if (!/devspace\s+dev\b/.test(cmd)) continue
+      if (wlType && !cmd.includes(`WORKLOAD_TYPE=${wlType}`)) continue
+      if ((await this.cwdOf(Number(m[1]))) === repo.path) out.push(Number(m[1]))
+    }
+    return out
+  }
+
+  /** The working directory of a process (macOS/Linux via lsof), or undefined. */
+  private async cwdOf(pid: number): Promise<string | undefined> {
+    const r = await this.runner('lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-Fn']).catch(
+      () => undefined,
+    )
+    if (!r || r.code !== 0) return undefined
+    // -Fn field output: a line per field, the cwd path on an `n`-prefixed line.
+    const n = r.stdout.split('\n').find((l) => l.startsWith('n'))
+    return n ? n.slice(1) : undefined
+  }
+
+  /** Whether a process is still alive (`kill -0`). */
+  private async alive(pid: number): Promise<boolean> {
+    const r = await this.runner('kill', ['-0', String(pid)]).catch(() => undefined)
+    return !!r && r.code === 0
+  }
+
+  /** Stop the external `devspace dev` session holding this workload's lock so
+   *  devdock can take over. SIGTERM first — devspace then releases its namespace
+   *  session lock and tears down its port-forward/sync cleanly while LEAVING the
+   *  replaced dev pod running — then SIGKILL anything that lingers. It signals
+   *  only the lock's owning process (resolved from the ConfigMap's server port,
+   *  see externalDevPids); it never runs `devspace purge`/`deploy`, so the
+   *  deployment, image, and any other workloads in the namespace are untouched.
+   *  Returns the pids it signalled (empty when the lock is already free/stale —
+   *  `devspace dev` then reconnects to the existing dev pod by itself). */
+  async stopExternalDev(
+    repo: Repo,
+    onLine?: LineSink,
+    grace: { tries?: number; intervalMs?: number } = {},
+  ): Promise<{ pids: number[] }> {
+    const tries = grace.tries ?? 20
+    const intervalMs = grace.intervalMs ?? 300
+    const pids = await this.externalDevPids(repo)
+    for (const pid of pids) {
+      onLine?.(`stopping external devspace dev (pid ${pid})`)
+      await this.runner('kill', ['-TERM', String(pid)]).catch(() => undefined)
+    }
+    // Give devspace time (default ~6s) to release its session and exit cleanly.
+    for (let i = 0; i < tries; i++) {
+      if (!(await this.anyAlive(pids))) break
+      await delay(intervalMs)
+    }
+    for (const pid of pids) {
+      if (await this.alive(pid)) {
+        onLine?.(`force-killing devspace dev (pid ${pid})`)
+        await this.runner('kill', ['-KILL', String(pid)]).catch(() => undefined)
+      }
+    }
+    return { pids }
+  }
+
+  private async anyAlive(pids: number[]): Promise<boolean> {
+    for (const pid of pids) {
+      if (await this.alive(pid)) return true
+    }
+    return false
   }
 
   /** Whether a tmux session exists for this repo. */
@@ -135,9 +359,29 @@ export class Supervisor {
       .map((s) => s.trim())
       .filter((s) => s.startsWith('devdock-'))
   }
+
+  /** devdock sessions mapped to whether their dev process has exited — i.e. all
+   *  panes are dead (held open by `remain-on-exit`). One `list-panes -a` answers
+   *  the whole reconcile pass, so it's a single tmux call regardless of repo
+   *  count. A session present here with `false` is a healthy managed dev session;
+   *  `true` means `devspace dev` exited and the session is a crashed shell. */
+  async sessionStates(): Promise<Map<string, boolean>> {
+    const r = await this.runner('tmux', ['list-panes', '-a', '-F', '#{session_name} #{pane_dead}'])
+    const out = new Map<string, boolean>()
+    if (r.code !== 0) return out
+    for (const line of r.stdout.split('\n')) {
+      const [name, dead] = line.trim().split(' ')
+      if (!name?.startsWith('devdock-')) continue
+      // A session is dead only if every one of its panes is dead.
+      out.set(name, (out.get(name) ?? true) && dead === '1')
+    }
+    return out
+  }
 }
 
 /** Minimal POSIX single-quote escaping for embedding a path in a shell string. */
 export function shellQuote(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`
 }
+
+const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))

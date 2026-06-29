@@ -38,6 +38,12 @@ describe('deriveStatus (spec §6 table)', () => {
   it('running pods outrank the deployment flag', () => {
     expect(deriveStatus([ready], false, true)).toBe('RUNNING_EXTERNAL')
   })
+  it('a dead managed session → CRASHED, not silently RUNNING_EXTERNAL', () => {
+    // devspace dev exited but the pane is held open (remain-on-exit) and pods
+    // linger: surface the crash instead of pretending it runs externally.
+    expect(deriveStatus([ready], false, true, true)).toBe('CRASHED')
+    expect(deriveStatus([], false, false, true)).toBe('CRASHED')
+  })
 })
 
 describe('parsePods', () => {

@@ -29,7 +29,11 @@ fn daemon_url() -> String {
 }
 
 fn web_url() -> String {
-    std::env::var("DEVDOCK_WEB").unwrap_or_else(|_| "http://127.0.0.1:5273".into())
+    // The daemon serves the built web UI off its own port (see packages/daemon
+    // routes.ts), so the always-on daemon is also the always-on UI — no separate
+    // dev server to keep alive. Override with DEVDOCK_WEB to point at `vite dev`
+    // (http://127.0.0.1:5273) while developing the web package.
+    std::env::var("DEVDOCK_WEB").unwrap_or_else(|_| daemon_url())
 }
 
 /// A glanceable dot for each reconciled status (spec §6).

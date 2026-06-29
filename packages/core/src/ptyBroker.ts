@@ -106,21 +106,42 @@ export class PtyBroker {
     this.spawn = spawn
   }
 
-  /** Attach the repo's tmux dev session. Read-write requires (and holds) the repo's write-lock. */
+  /**
+   * Attach the repo's tmux dev session. This is one shared screen, so a
+   * read-write attach takes (and holds) the repo's single-writer lock — two
+   * writers on the same session would fight over the keyboard.
+   */
   open(repo: Repo, mode: TermMode, cols = 80, rows = 24): Promise<TermSession> {
-    return this.attach(repo, mode, 'tmux', attachArgs(repo.session, mode), undefined, cols, rows)
+    return this.attach(repo, mode, 'tmux', attachArgs(repo.session, mode), undefined, cols, rows, {
+      lock: true,
+    })
   }
 
   /**
    * Shell into the repo's running container via `devspace enter` — the fallback
    * for externally-started deployments that have pods but no devdock tmux
-   * session. Runs in the repo directory so devspace resolves namespace/selector
-   * from the project's own devspace.yaml (which imports/vars make unparseable
-   * statically). Passing the pod skips devspace's interactive picker.
+   * session, and the target for every extra "+" terminal. Runs in the repo
+   * directory so devspace resolves namespace and container from the project's
+   * own devspace.yaml (which imports/vars make unparseable statically).
+   *
+   * We pin `--pod <name>` to the pod the reconciler already attributed to this
+   * workload. This is essential because all workloads share one namespace: an
+   * unscoped `devspace enter --pick=false` auto-picks the first matching pod in
+   * the namespace — i.e. a *different* service's pod — so without `--pod` a shell
+   * for `career-service-agents` lands in `dashboard-api-accounts`. `--wait` then
+   * covers a pod that's still `ContainerCreating`. The name can in theory go
+   * stale (the pod rolled since the last reconcile), but that surfaces as a
+   * retryable "pod not found" — far better than silently entering the wrong
+   * service. Without a pod name we fall back to the selector-based auto-pick.
+   *
+   * No write-lock: each `devspace enter` is an independent exec into the pod (its
+   * own TTY, like a fresh SSH session), so any number can run read-write at once
+   * without conflict — that's what lets the UI open multiple terminals into one
+   * pod (VS Code style). The lock only guards the single shared tmux session.
    */
   openShell(repo: Repo, mode: TermMode, cols = 80, rows = 24, pod?: string): Promise<TermSession> {
-    const args = pod ? ['enter', '--pod', pod] : ['enter']
-    return this.attach(repo, mode, 'devspace', args, repo.path, cols, rows)
+    const args = pod ? ['enter', '--pod', pod, '--wait'] : ['enter', '--pick=false', '--wait']
+    return this.attach(repo, mode, 'devspace', args, repo.path, cols, rows, { lock: false })
   }
 
   private async attach(
@@ -131,9 +152,10 @@ export class PtyBroker {
     cwd: string | undefined,
     cols: number,
     rows: number,
+    opts: { lock: boolean },
   ): Promise<TermSession> {
     let token: symbol | null = null
-    if (mode === 'rw') {
+    if (mode === 'rw' && opts.lock) {
       token = this.locks.acquire(repo.id)
       if (!token) throw new Error(`write-lock held for ${repo.id}`)
     }

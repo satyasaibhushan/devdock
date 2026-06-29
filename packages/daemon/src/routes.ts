@@ -1,9 +1,27 @@
 // HTTP control + queries (spec §13). Thin Fastify routes over the core Service.
+import { existsSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import fastifyStatic from '@fastify/static'
 import type { Service } from '@devdock/core'
 import Fastify, { type FastifyInstance } from 'fastify'
 
+/** The built web UI (`packages/web/dist`), relative to this module at
+ *  `packages/daemon/dist/routes.js`. Bundled into the daemon so port 7717
+ *  serves the UI too — there's no separate dev server to keep alive. */
+const WEB_DIST = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'web', 'dist')
+
 export function buildApp(service: Service): FastifyInstance {
   const app = Fastify({ logger: false })
+
+  // Serve the web UI off the same origin as the API, so its relative fetches and
+  // ws:// connections (api.ts uses location.host) just work with no proxy. The
+  // wildcard `/*` is the lowest-priority match — every API route below is more
+  // specific, so this only catches `/`, `/assets/*`, favicon, etc. Skipped when
+  // unbuilt (tests, `pnpm build` not yet run) so it's a no-op there.
+  if (existsSync(WEB_DIST)) {
+    app.register(fastifyStatic, { root: WEB_DIST })
+  }
 
   app.get('/health', async () => ({ ok: true }))
 
@@ -47,7 +65,24 @@ export function buildApp(service: Service): FastifyInstance {
     },
   )
 
-  const verbs = ['start', 'build', 'stop', 'restart'] as const
+  app.put<{ Params: { id: string }; Body: { command?: string } }>(
+    '/repos/:id/startup',
+    async (req, reply) => {
+      const command = req.body?.command
+      if (typeof command !== 'string') {
+        return reply.code(400).send({ error: 'command must be a string' })
+      }
+      try {
+        service.setStartupCommand(req.params.id, command)
+        return { ok: true, startupCommand: service.getStartupCommand(req.params.id) ?? null }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        return reply.code(message.includes('unknown repo') ? 404 : 500).send({ error: message })
+      }
+    },
+  )
+
+  const verbs = ['start', 'build', 'stop', 'restart', 'adopt', 'clear'] as const
   for (const verb of verbs) {
     app.post<{ Params: { id: string }; Querystring: { workload?: string } }>(
       `/repos/:id/${verb}`,

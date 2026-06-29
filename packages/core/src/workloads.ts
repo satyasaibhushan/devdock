@@ -14,6 +14,7 @@ import type { Repo, RepoState, RepoStatus, WorkloadState } from './types.js'
  *  attention-worthy workload wins. CRASHED first (needs a look), STOPPED last
  *  (nothing to see). */
 const STATUS_PRIORITY: RepoStatus[] = [
+  'RESTARTING',
   'CRASHED',
   'RUNNING_MANAGED',
   'RUNNING_EXTERNAL',
