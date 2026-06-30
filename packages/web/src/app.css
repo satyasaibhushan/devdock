@@ -62,7 +62,7 @@ body {
 .dot.STOPPED {
   background: #5d6b78;
 }
-/* built but scaled to zero — hollow: the shape is there, nothing inside runs */
+/* deployment exists — hollow: the workload is deployed, not dev-session managed */
 .dot.DEPLOYED {
   background: transparent;
   border: 2px solid #7f93a8;

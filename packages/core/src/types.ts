@@ -1,8 +1,8 @@
 // Shared domain types for @devdock/core.
 
 /** Reconciled lifecycle state of a repo's workload (see spec §6).
- *  STOPPED = nothing in the cluster; DEPLOYED = deployment objects exist but
- *  no pods run (built then scaled to zero); the rest are pod/session-derived. */
+ *  STOPPED = nothing in the cluster; DEPLOYED = deployment objects exist in
+ *  deploy-only mode; the rest are pod/session-derived. */
 export type RepoStatus =
   | 'RUNNING_MANAGED'
   | 'RUNNING_EXTERNAL'
@@ -22,6 +22,9 @@ export interface Repo {
   name: string
   /** Absolute path to the repo root. */
   path: string
+  /** Top-level ~/Code bucket the repo came from, when it follows the local
+   *  backend/frontend layout. */
+  codeArea?: 'backend' | 'frontend'
   /** For multi-service repos driven by a `./devspace` wrapper, the directory
    *  that wrapper runs from (the parent of `.devspace/`). devdock exports it as
    *  DEVSPACE_BINARY_DIR so the service config's relative Dockerfile/context

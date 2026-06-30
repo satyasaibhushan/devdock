@@ -17,6 +17,13 @@ export type StreamRunner = (
 
 export type LineSink = (line: string) => void
 
+export interface SessionState {
+  /** true when every pane in the session is a dead remain-on-exit pane. */
+  dead: boolean
+  /** tmux session creation time as epoch ms, when available. */
+  createdAt?: number
+}
+
 /** Args that make devspace run without user input: every `question:` var is
  *  answered with its declared default (what the user's ddev/dpurge/ddep
  *  aliases do by hand), and the namespace is pinned when the config names one
@@ -172,6 +179,17 @@ export class Supervisor {
     return onLine
       ? await this.streamRunner(loginShell, args, {}, onLine)
       : await this.runner(loginShell, args)
+  }
+
+  /** Retire a local dev session that no longer has an attributed pod. This is
+   *  lighter than `clear`: no reset pods, no purge, no rebuild. It just removes
+   *  devdock's stale tmux session and releases this project's DevSpace lock so
+   *  reconciliation can fall back to the actual cluster deployment state. */
+  async retireSession(repo: Repo): Promise<void> {
+    await this.runner('tmux', ['kill-session', '-t', exactTarget(repo.session)]).catch(
+      () => undefined,
+    )
+    await this.releaseSessionLock(repo)
   }
 
   /** Remove this project's entry from the `devspace-dependencies` ConfigMap so
@@ -365,15 +383,25 @@ export class Supervisor {
    *  the whole reconcile pass, so it's a single tmux call regardless of repo
    *  count. A session present here with `false` is a healthy managed dev session;
    *  `true` means `devspace dev` exited and the session is a crashed shell. */
-  async sessionStates(): Promise<Map<string, boolean>> {
-    const r = await this.runner('tmux', ['list-panes', '-a', '-F', '#{session_name} #{pane_dead}'])
-    const out = new Map<string, boolean>()
+  async sessionStates(): Promise<Map<string, SessionState>> {
+    const r = await this.runner('tmux', [
+      'list-panes',
+      '-a',
+      '-F',
+      '#{session_name} #{pane_dead} #{session_created}',
+    ])
+    const out = new Map<string, SessionState>()
     if (r.code !== 0) return out
     for (const line of r.stdout.split('\n')) {
-      const [name, dead] = line.trim().split(' ')
+      const [name, dead, created] = line.trim().split(' ')
       if (!name?.startsWith('devdock-')) continue
+      const previous = out.get(name)
+      const createdAt = created && /^\d+$/.test(created) ? Number(created) * 1000 : undefined
       // A session is dead only if every one of its panes is dead.
-      out.set(name, (out.get(name) ?? true) && dead === '1')
+      out.set(name, {
+        dead: (previous?.dead ?? true) && dead === '1',
+        createdAt: previous?.createdAt ?? createdAt,
+      })
     }
     return out
   }

@@ -10,7 +10,7 @@ import { PtyBroker } from './ptyBroker.js'
 import { type ClusterCache, Reconciler, newClusterCache } from './reconciler.js'
 import { scanRepos } from './registry.js'
 import { StateStore } from './stateStore.js'
-import { Supervisor, verbLabel } from './supervisor.js'
+import { Supervisor, type SessionState, verbLabel } from './supervisor.js'
 import type { Repo, RepoState, RepoStatus, TermMode } from './types.js'
 import { assembleState, resolveWorkload, scopeRepo, workloadTypes } from './workloads.js'
 
@@ -24,6 +24,7 @@ export interface ServiceOptions {
  *  `devspace dev` opens its in-container terminal a beat after the pod is up, so
  *  the keystrokes land at the shell prompt rather than mid-deploy output. */
 const STARTUP_RUN_DELAY_MS = 2500
+const STALE_NO_POD_SESSION_MS = 30 * 60 * 1000
 
 /** Injectable collaborators (defaults are the real implementations). */
 export interface ServiceDeps {
@@ -288,7 +289,7 @@ export class Service {
   async reconcileOne(
     id: string,
     cache?: ClusterCache,
-    sessions?: Map<string, boolean>,
+    sessions?: Map<string, SessionState>,
   ): Promise<RepoState> {
     const repo = this.repoOrThrow(id)
     // One `tmux list-panes -a` answers "is each workload's session live/dead?" —
@@ -299,9 +300,10 @@ export class Service {
     for (const type of workloadTypes(repo)) {
       const scoped = scopeRepo(repo, type)
       const key = workloadKey(id, type)
-      const exists = states.has(scoped.session)
-      const sessionDead = states.get(scoped.session) === true
-      const hasSession = exists && !sessionDead
+      const session = states.get(scoped.session)
+      let exists = !!session
+      let sessionDead = session?.dead === true
+      let hasSession = exists && !sessionDead
       const ws = await this.reconciler.reconcileWorkload(
         scoped,
         hasSession,
@@ -309,9 +311,24 @@ export class Service {
         type ?? repo.defaultWorkload ?? '',
         sessionDead,
       )
+
       // While a multi-step verb (restart) is in flight, force the transient
       // status so the loop doesn't surface the intermediate STOPPED/DEPLOYED.
       const transition = this.transitions.get(key)
+      if (!transition && this.shouldRetireNoPodSession(ws, session)) {
+        const target = ws.deployments.length > 0 ? 'DEPLOYED' : 'STOPPED'
+        this.hubFor(key).push(
+          `! stale dev session retired: no matching pods; reconciled to ${target.toLowerCase()}`,
+        )
+        await this.supervisor.retireSession(scoped)
+        this.devTails.get(key)?.stop()
+        this.devTails.delete(key)
+        exists = false
+        sessionDead = false
+        hasSession = false
+        ws.hasSession = false
+        ws.status = target
+      }
       if (transition) ws.status = transition
       workloads.push(ws)
 
@@ -369,6 +386,15 @@ export class Service {
     if (!prev || prev.status !== state.status) {
       this.events.emit('status', state)
     }
+  }
+
+  private shouldRetireNoPodSession(
+    ws: { pods: unknown[]; deployments: unknown[] },
+    session: SessionState | undefined,
+  ): boolean {
+    if (!session || ws.pods.length > 0) return false
+    if (session.dead && ws.deployments.length > 0) return true
+    return session.createdAt !== undefined && Date.now() - session.createdAt >= STALE_NO_POD_SESSION_MS
   }
 
   private watcherFor(id: string): CrashWatch {

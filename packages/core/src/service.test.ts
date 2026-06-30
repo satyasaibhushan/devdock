@@ -82,6 +82,72 @@ describe('Service', () => {
     expect(svc.get('svc-a')?.status).toBe('DEPLOYED')
   })
 
+  it('retires an old no-pod dev session and reconciles back to DEPLOYED', async () => {
+    const deploymentsJson = JSON.stringify({
+      items: [{ metadata: { name: 'svc-a' }, spec: { replicas: 0 }, status: {} }],
+    })
+    const runner = vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
+      if (cmd === 'tmux' && args[0] === 'list-panes') {
+        return { code: 0, stdout: 'devdock-svc-a 0 1\n', stderr: '' }
+      }
+      if (cmd === 'kubectl' && args[0] === 'get') {
+        if (args[1] === 'deployments') return { code: 0, stdout: deploymentsJson, stderr: '' }
+        if (args[1] === 'configmap') return { code: 0, stdout: '{"data":{}}', stderr: '' }
+        return { code: 0, stdout: '{"items":[]}', stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+    const svc = new Service({ roots: [root], stateFile }, { runner })
+    svc.rescan()
+    await svc.reconcileAll()
+    expect(svc.get('svc-a')?.status).toBe('DEPLOYED')
+    expect(svc.get('svc-a')?.hasSession).toBe(false)
+    expect(runner).toHaveBeenCalledWith('tmux', ['kill-session', '-t', '=devdock-svc-a'])
+  })
+
+  it('keeps a fresh no-pod dev session in BUILDING', async () => {
+    const nowSeconds = Math.floor(Date.now() / 1000)
+    const deploymentsJson = JSON.stringify({
+      items: [{ metadata: { name: 'svc-a' }, spec: { replicas: 0 }, status: {} }],
+    })
+    const runner = vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
+      if (cmd === 'tmux' && args[0] === 'list-panes') {
+        return { code: 0, stdout: `devdock-svc-a 0 ${nowSeconds}\n`, stderr: '' }
+      }
+      if (cmd === 'kubectl' && args[0] === 'get') {
+        return {
+          code: 0,
+          stdout: args[1] === 'deployments' ? deploymentsJson : '{"items":[]}',
+          stderr: '',
+        }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+    const svc = new Service({ roots: [root], stateFile }, { runner })
+    svc.rescan()
+    await svc.reconcileAll()
+    expect(svc.get('svc-a')?.status).toBe('BUILDING')
+    expect(runner).not.toHaveBeenCalledWith('tmux', ['kill-session', '-t', '=devdock-svc-a'])
+  })
+
+  it('keeps a fresh failed no-pod session as CRASHED when no deployment exists', async () => {
+    const nowSeconds = Math.floor(Date.now() / 1000)
+    const runner = vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
+      if (cmd === 'tmux' && args[0] === 'list-panes') {
+        return { code: 0, stdout: `devdock-svc-a 1 ${nowSeconds}\n`, stderr: '' }
+      }
+      if (cmd === 'kubectl' && args[0] === 'get') {
+        return { code: 0, stdout: '{"items":[]}', stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+    const svc = new Service({ roots: [root], stateFile }, { runner })
+    svc.rescan()
+    await svc.reconcileAll()
+    expect(svc.get('svc-a')?.status).toBe('CRASHED')
+    expect(runner).not.toHaveBeenCalledWith('tmux', ['kill-session', '-t', '=devdock-svc-a'])
+  })
+
   it('emits a status event on change', async () => {
     const svc = new Service(
       { roots: [root], stateFile },

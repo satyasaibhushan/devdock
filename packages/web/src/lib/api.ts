@@ -27,6 +27,7 @@ export interface Repo {
   id: string
   name: string
   path: string
+  codeArea?: 'backend' | 'frontend'
   namespace?: string
   workload?: string
   ports: number[]

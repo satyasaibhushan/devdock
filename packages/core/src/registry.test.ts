@@ -150,7 +150,10 @@ describe('scanRepos', () => {
     mkdirSync(join(repo, '.devspace', 'agents-api'), { recursive: true })
     mkdirSync(join(repo, '.devspace', 'agents-worker'), { recursive: true })
     writeFileSync(join(repo, '.devspace', 'agents-api', 'devspace.yaml'), 'name: agents-api\n')
-    writeFileSync(join(repo, '.devspace', 'agents-worker', 'devspace.yaml'), 'name: agents-worker\n')
+    writeFileSync(
+      join(repo, '.devspace', 'agents-worker', 'devspace.yaml'),
+      'name: agents-worker\n',
+    )
 
     const base = scanRepos({ roots: [root] })[0]
     expect(base?.workloads).toEqual(['api', 'worker'])
@@ -172,5 +175,17 @@ describe('scanRepos', () => {
     writeFileSync(join(root, 'svc-a', 'devspace.yaml'), 'name: svc-a\n')
     const repos = scanRepos({ roots: [root] })
     expect(repos[0]?.root).toBeUndefined()
+  })
+
+  it('classifies repos from the local Code frontend/backend buckets', () => {
+    const codeRoot = join(root, 'Code')
+    mkdirSync(join(codeRoot, 'frontend', 'jobs-ui'), { recursive: true })
+    mkdirSync(join(codeRoot, 'backend', 'jobs-api'), { recursive: true })
+    writeFileSync(join(codeRoot, 'frontend', 'jobs-ui', 'devspace.yaml'), 'name: jobs-ui\n')
+    writeFileSync(join(codeRoot, 'backend', 'jobs-api', 'devspace.yaml'), 'name: jobs-api\n')
+
+    const repos = scanRepos({ roots: [codeRoot] })
+    expect(repos.find((r) => r.id === 'jobs-ui')?.codeArea).toBe('frontend')
+    expect(repos.find((r) => r.id === 'jobs-api')?.codeArea).toBe('backend')
   })
 })

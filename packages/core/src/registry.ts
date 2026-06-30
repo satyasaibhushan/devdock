@@ -206,6 +206,7 @@ export function scanRepos(opts: ScanOptions = {}): Repo[] {
       id,
       name: cfg.name ?? id,
       path: repoPath,
+      codeArea: codeAreaOf(repoPath),
       root,
       configPath,
       namespace: cfg.namespace,
@@ -253,13 +254,18 @@ function baseRepo(root: string, members: Repo[]): Repo {
   const id = basename(root)
   const tagged = members
     .map((m) => ({ ...m, workloadType: workloadTypeOf(id, m) }))
-    .sort((a, b) => apiFirst(a.workloadType) - apiFirst(b.workloadType) || a.workloadType.localeCompare(b.workloadType))
+    .sort(
+      (a, b) =>
+        apiFirst(a.workloadType) - apiFirst(b.workloadType) ||
+        a.workloadType.localeCompare(b.workloadType),
+    )
   const types = tagged.map((m) => m.workloadType)
   const first = tagged[0] as Repo
   return {
     id,
     name: id,
     path: root,
+    codeArea: codeAreaOf(root),
     root,
     configPath: first.configPath,
     namespace: first.namespace,
@@ -282,6 +288,21 @@ function workloadTypeOf(id: string, m: Repo): string {
 
 function apiFirst(type: string): number {
   return type === 'api' ? 0 : 1
+}
+
+function codeAreaOf(path: string): Repo['codeArea'] | undefined {
+  const parts = path.split(/[\\/]+/).filter(Boolean)
+  for (let i = 0; i < parts.length - 1; i++) {
+    if (parts[i] !== 'Code') continue
+    const area = parts[i + 1]
+    if (area === 'backend' || area === 'frontend') return area
+  }
+  // Keep tests and unusual roots platform-tolerant when the path starts at Code.
+  if (parts[0] === 'Code') {
+    const area = parts[1]
+    if (area === 'backend' || area === 'frontend') return area
+  }
+  return undefined
 }
 
 function safeRead(path: string): string {

@@ -195,7 +195,7 @@
       <div class="meta">
         <code>{selected.repo.path}</code>
         <span>· {view?.pods.length ?? 0} pod{(view?.pods.length ?? 0) === 1 ? '' : 's'}</span>
-        {#if vstatus === 'DEPLOYED'}<span>· deployment present, scaled to 0</span>{/if}
+        {#if vstatus === 'DEPLOYED'}<span>· deployment present</span>{/if}
         {#if selected.repo.ports.length}<span>· :{selected.repo.ports.join(' :')}</span>{/if}
       </div>
 

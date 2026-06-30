@@ -167,18 +167,35 @@ describe('Supervisor', () => {
 
   it('sessionStates maps devdock sessions to whether their pane has died', async () => {
     const runner = vi.fn(async () =>
-      ok('devdock-svc-a 0\nother 1\ndevdock-svc-b 1\ndevdock-svc-a 0\n'),
+      ok('devdock-svc-a 0 100\nother 1 101\ndevdock-svc-b 1 102\ndevdock-svc-a 0 100\n'),
     )
     const states = await new Supervisor(runner).sessionStates()
     expect(runner).toHaveBeenCalledWith('tmux', [
       'list-panes',
       '-a',
       '-F',
-      '#{session_name} #{pane_dead}',
+      '#{session_name} #{pane_dead} #{session_created}',
     ])
-    expect(states.get('devdock-svc-a')).toBe(false) // live pane → not dead
-    expect(states.get('devdock-svc-b')).toBe(true) // pane dead → crashed shell
+    expect(states.get('devdock-svc-a')).toEqual({ dead: false, createdAt: 100000 })
+    expect(states.get('devdock-svc-b')).toEqual({ dead: true, createdAt: 102000 })
     expect(states.has('other')).toBe(false) // non-devdock sessions ignored
+  })
+
+  it('retires a stale session without resetting pods or purging', async () => {
+    const calls: { cmd: string; args: string[] }[] = []
+    const nsRepo: Repo = { ...repo, namespace: 'panels' }
+    const runner = vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
+      calls.push({ cmd, args })
+      if (cmd === 'kubectl' && args.includes('get')) {
+        return ok(JSON.stringify({ data: { 'svc-a': 'server: http://localhost:8091\nrunID: x' } }))
+      }
+      return ok()
+    })
+    await new Supervisor(runner).retireSession(nsRepo)
+    expect(calls[0]).toEqual({ cmd: 'tmux', args: ['kill-session', '-t', '=devdock-svc-a'] })
+    expect(calls.some((c) => c.cmd === 'kubectl' && c.args.includes('patch'))).toBe(true)
+    expect(calls.some((c) => c.args.includes(devspaceCommand(nsRepo, 'reset pods')))).toBe(false)
+    expect(calls.some((c) => c.args.includes(devspaceCommand(nsRepo, 'purge')))).toBe(false)
   })
 
   describe('externalDevPids / stopExternalDev (move here)', () => {

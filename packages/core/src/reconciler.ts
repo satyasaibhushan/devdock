@@ -20,6 +20,7 @@ export function deriveStatus(
   hasSession: boolean,
   hasDeployment = false,
   sessionDead = false,
+  opts: { deployedWhenRunning?: boolean } = {},
 ): RepoStatus {
   // A managed dev session whose process exited (pane held open by
   // remain-on-exit) is a crash to surface — not a silent demotion to
@@ -30,6 +31,10 @@ export function deriveStatus(
   if (crashed) return 'CRASHED'
 
   const anyReady = pods.some((p) => p.ready)
+  const hasDevspacePod = pods.some((p) => p.name.includes('-devspace'))
+  if (opts.deployedWhenRunning && hasDeployment && !hasSession && !hasDevspacePod) {
+    return 'DEPLOYED'
+  }
   if (anyReady) return hasSession ? 'RUNNING_MANAGED' : 'RUNNING_EXTERNAL'
 
   // Pods exist but none ready yet → still coming up.
@@ -161,7 +166,9 @@ export class Reconciler {
     const deployments = matchDeployments(await this.fetchDeployments(repo, cache), repo.name)
     return {
       type,
-      status: deriveStatus(pods, hasSession, deployments.length > 0, sessionDead),
+      status: deriveStatus(pods, hasSession, deployments.length > 0, sessionDead, {
+        deployedWhenRunning: repo.codeArea === 'frontend',
+      }),
       pods,
       deployments,
       hasSession,

@@ -38,6 +38,17 @@ describe('deriveStatus (spec §6 table)', () => {
   it('running pods outrank the deployment flag', () => {
     expect(deriveStatus([ready], false, true)).toBe('RUNNING_EXTERNAL')
   })
+  it('frontend deploy-only pods report DEPLOYED instead of external', () => {
+    expect(deriveStatus([ready], false, true, false, { deployedWhenRunning: true })).toBe(
+      'DEPLOYED',
+    )
+  })
+  it('frontend devspace pods still report external when unmanaged', () => {
+    const devspacePod = { ...ready, name: 'svc-devspace-abc' }
+    expect(deriveStatus([devspacePod], false, true, false, { deployedWhenRunning: true })).toBe(
+      'RUNNING_EXTERNAL',
+    )
+  })
   it('a dead managed session → CRASHED, not silently RUNNING_EXTERNAL', () => {
     // devspace dev exited but the pane is held open (remain-on-exit) and pods
     // linger: surface the crash instead of pretending it runs externally.
@@ -182,6 +193,26 @@ describe('Reconciler', () => {
     )
     expect(state.status).toBe('DEPLOYED')
     expect(state.deployments.map((d) => d.name)).toEqual(['svc', 'svc-devspace'])
+  })
+
+  it('a frontend deployment pod with no session reports DEPLOYED', async () => {
+    const frontend = { ...repo, codeArea: 'frontend' as const }
+    const podsJson = JSON.stringify({
+      items: [
+        {
+          metadata: { name: 'svc-67f88768bb-tjp67' },
+          status: { phase: 'Running', containerStatuses: [{ ready: true, restartCount: 0 }] },
+        },
+      ],
+    })
+    const deploymentsJson = JSON.stringify({
+      items: [{ metadata: { name: 'svc' }, spec: { replicas: 1 }, status: { readyReplicas: 1 } }],
+    })
+    const state = await new Reconciler(clusterRunner(podsJson, deploymentsJson)).reconcile(
+      frontend,
+      false,
+    )
+    expect(state.status).toBe('DEPLOYED')
   })
 
   it("another repo's deployments don't flip this repo to DEPLOYED", async () => {
