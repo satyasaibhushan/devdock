@@ -1,5 +1,15 @@
-import { describe, expect, it, vi } from 'vitest'
-import { PtyBroker, type PtyLike, type PtySpawn, WriteLock, attachArgs } from './ptyBroker.js'
+import { chmodSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import {
+  PtyBroker,
+  type PtyLike,
+  type PtySpawn,
+  WriteLock,
+  attachArgs,
+  ensureExecutable,
+} from './ptyBroker.js'
 import type { Repo } from './types.js'
 
 const repo: Repo = {
@@ -15,6 +25,25 @@ describe('attachArgs', () => {
   it('uses -r for read-only and matches the session name exactly', () => {
     expect(attachArgs('s', 'ro')).toEqual(['attach', '-r', '-t', '=s'])
     expect(attachArgs('s', 'rw')).toEqual(['attach', '-t', '=s'])
+  })
+})
+
+describe('ensureExecutable', () => {
+  const dirs: string[] = []
+  afterEach(() => {
+    for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('adds executable bits to a helper left non-executable by package extraction', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'devdock-pty-'))
+    dirs.push(dir)
+    const helper = join(dir, 'spawn-helper')
+    writeFileSync(helper, '#!/bin/sh\n')
+    chmodSync(helper, 0o644)
+
+    ensureExecutable(helper)
+
+    expect(statSync(helper).mode & 0o111).toBe(0o111)
   })
 })
 

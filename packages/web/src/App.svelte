@@ -71,6 +71,13 @@
   // What to send the daemon as ?workload= — only for repos that have workloads
   // (type carries meaning there); undefined for plain single-workload repos.
   const wl = $derived(selected?.repo.workloads?.length ? active?.type : undefined)
+  const workloadLabel = $derived.by(() => {
+    if (!selected) return null
+    if (showSelector) return null
+    if (selected.repo.codeArea === 'frontend') return 'ui'
+    if (wl && wl !== 'api') return wl
+    return null
+  })
   // The status/pods shown and acted on are the active workload's, not the
   // aggregate the list row shows.
   const view = $derived(active ?? null)
@@ -168,8 +175,8 @@
                 <option value={w.type}>{w.type}{w.status !== 'STOPPED' ? ' ●' : ''}</option>
               {/each}
             </select>
-          {:else if wl && wl !== 'api'}
-            <span class="tag">{wl}</span>
+          {:else if workloadLabel}
+            <span class="tag">{workloadLabel}</span>
           {/if}
           <span class="pill {vstatus}">{vstatus.replace('_', ' ').toLowerCase()}</span>
         </div>

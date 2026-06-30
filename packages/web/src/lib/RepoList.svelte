@@ -50,13 +50,22 @@
 
   const label = (s: string) => s.replace('RUNNING_', '').replace('_', ' ').toLowerCase()
 
-  // For a multi-workload repo, the workload types that currently have something
-  // in the cluster (anything but STOPPED) — shown as pills so one row conveys
-  // "api + worker up, cron down" at a glance.
-  const runningWorkloads = (r: RepoState) =>
-    (r.repo.workloads?.length ?? 0) > 1
-      ? r.workloads.filter((w) => w.status !== 'STOPPED')
-      : []
+  type WorkloadPill = { key: string; label: string; status: RepoStatus }
+
+  // Workload types that currently have something in the cluster (anything but
+  // STOPPED). Multi-workload repos show their real api/worker/etc. types; a
+  // frontend repo's single workload is presented as `ui` so UI repos scan the
+  // same way as backend workload rows.
+  const workloadPills = (r: RepoState): WorkloadPill[] => {
+    const active = r.workloads.filter((w) => w.status !== 'STOPPED')
+    if ((r.repo.workloads?.length ?? 0) > 1) {
+      return active.map((w) => ({ key: w.type, label: w.type, status: w.status }))
+    }
+    if (r.repo.codeArea === 'frontend') {
+      return active.map((w) => ({ key: w.type || 'ui', label: 'ui', status: w.status }))
+    }
+    return []
+  }
 
   const COLLAPSE_KEY = 'devdock.collapsedSections'
   function readCollapsed(): Record<string, boolean> {
@@ -172,10 +181,10 @@
           >
             <span class="dot {r.status}" title={r.status}></span>
             <span class="id" title={r.repo.id}>{r.repo.id}</span>
-            {#if runningWorkloads(r).length}
+            {#if workloadPills(r).length}
               <span class="wpills">
-                {#each runningWorkloads(r) as w (w.type)}
-                  <span class="wpill {w.status}" title="{w.type}: {w.status}">{w.type}</span>
+                {#each workloadPills(r) as w (w.key)}
+                  <span class="wpill {w.status}" title="{w.label}: {w.status}">{w.label}</span>
                 {/each}
               </span>
             {:else}

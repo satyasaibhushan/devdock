@@ -1,5 +1,9 @@
 // ptyBroker — node-pty ↔ `tmux attach`, with a single write-lock per repo (spec §8).
 // Read-only is the default; read-write is a held lock (spec design rule §5).
+import { chmodSync, existsSync, statSync } from 'node:fs'
+import { createRequire } from 'node:module'
+import { dirname, join } from 'node:path'
+import { arch, platform } from 'node:process'
 import type { Repo, TermMode } from './types.js'
 
 /**
@@ -36,6 +40,7 @@ export type PtySpawn = (
 /** Lazy real node-pty spawner (imported only when no spawner is injected). */
 async function defaultSpawn(): Promise<PtySpawn> {
   const pty = await import('node-pty')
+  ensureNodePtySpawnHelperExecutable()
   return (file, args, opts) => {
     const p = pty.spawn(file, args, {
       cols: opts.cols,
@@ -57,6 +62,34 @@ async function defaultSpawn(): Promise<PtySpawn> {
       },
     }
   }
+}
+
+/** node-pty launches child processes through a small native `spawn-helper`.
+ *  Some pnpm/prebuild extraction paths can leave that helper without executable
+ *  bits, which makes every terminal fail with the opaque "posix_spawnp failed".
+ *  Repair it once before the first PTY spawn. */
+export function ensureNodePtySpawnHelperExecutable(): void {
+  const require = createRequire(import.meta.url)
+  let pkgRoot: string
+  try {
+    pkgRoot = dirname(require.resolve('node-pty/package.json'))
+  } catch {
+    return
+  }
+  for (const helper of [
+    join(pkgRoot, 'prebuilds', `${platform}-${arch}`, 'spawn-helper'),
+    join(pkgRoot, 'build', 'Release', 'spawn-helper'),
+  ]) {
+    if (!existsSync(helper)) continue
+    ensureExecutable(helper)
+    return
+  }
+}
+
+export function ensureExecutable(path: string): void {
+  const mode = statSync(path).mode
+  if ((mode & 0o111) === 0o111) return
+  chmodSync(path, mode | 0o755)
 }
 
 /** The tmux command a terminal of `mode` attaches with (spec §8).
