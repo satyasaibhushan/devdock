@@ -1,6 +1,6 @@
 // The MCP server is a thin client of the one brain — the daemon's HTTP API
 // (spec §19.1). It never spins its own Service, so it can never diverge.
-import type { RepoState } from '@devdock/core'
+import type { AuthState, NamespaceInfo, RepoState, RunOutcome, TermInfo } from '@devdock/core'
 
 export interface VerbResult {
   ok: boolean
@@ -8,46 +8,104 @@ export interface VerbResult {
   stderr: string
 }
 
+/** exec additionally reports stdout (usually empty: tmux send-keys is
+ *  fire-and-forget — the output lands in the dev session, not here). */
+export interface ExecResult extends VerbResult {
+  stdout: string
+}
+
+/** Lifecycle verbs the daemon exposes as POST /repos/:id/<verb>. */
+export type RepoVerb = 'start' | 'build' | 'stop' | 'restart' | 'adopt' | 'clear'
+
+export interface TermOpenOpts {
+  repo?: string
+  workload?: string
+  kind?: 'auto' | 'shell' | 'local'
+  cwd?: string
+}
+
 /** The subset of the daemon HTTP contract the MCP tools call. */
 export interface DaemonClient {
   list(): Promise<RepoState[]>
   status(id: string): Promise<RepoState>
-  start(id: string): Promise<VerbResult>
-  build(id: string): Promise<VerbResult>
-  stop(id: string): Promise<VerbResult>
-  logs(id: string, tail?: number): Promise<string[]>
-  exec(id: string, command: string): Promise<VerbResult>
+  verb(verb: RepoVerb, id: string, workload?: string): Promise<VerbResult>
+  logs(id: string, tail?: number, workload?: string): Promise<string[]>
+  exec(id: string, command: string, workload?: string): Promise<ExecResult>
+  setStartup(id: string, command: string): Promise<void>
+  namespace(): Promise<NamespaceInfo>
+  setNamespace(ns: string): Promise<NamespaceInfo>
+  auth(): Promise<AuthState>
+  authLogin(): Promise<AuthState>
+  termList(): Promise<TermInfo[]>
+  termOpen(opts: TermOpenOpts): Promise<TermInfo>
+  termRun(tid: string, command: string, timeoutMs?: number): Promise<RunOutcome>
+  termRead(tid: string, tail?: number): Promise<string>
+  termClose(tid: string): Promise<void>
 }
 
 /** A DaemonClient backed by the running daemon's HTTP endpoints. */
 export function httpClient(baseUrl: string): DaemonClient {
   const url = (path: string) => `${baseUrl.replace(/\/$/, '')}${path}`
   const id = (s: string) => encodeURIComponent(s)
+  const wl = (workload?: string) => (workload ? `?workload=${id(workload)}` : '')
 
-  async function getJson<T>(path: string): Promise<T> {
-    const res = await fetch(url(path))
-    if (!res.ok) throw new Error(`GET ${path} → ${res.status}`)
-    return res.json() as Promise<T>
+  async function request<T>(path: string, init?: RequestInit): Promise<T> {
+    const res = await fetch(url(path), init)
+    const data = (await res.json().catch(() => ({}))) as T & { error?: string }
+    if (!res.ok) throw new Error(data.error ?? `${init?.method ?? 'GET'} ${path} → ${res.status}`)
+    return data
   }
 
-  async function post(path: string, body?: unknown): Promise<VerbResult> {
-    const res = await fetch(url(path), {
+  const post = <T>(path: string, body?: unknown) =>
+    request<T>(path, {
       method: 'POST',
       headers: body ? { 'content-type': 'application/json' } : undefined,
       body: body ? JSON.stringify(body) : undefined,
     })
-    const data = (await res.json().catch(() => ({}))) as Partial<VerbResult> & { error?: string }
-    if (!res.ok) throw new Error(data.error ?? `POST ${path} → ${res.status}`)
-    return { ok: data.ok ?? false, code: data.code ?? 0, stderr: data.stderr ?? '' }
-  }
+
+  const asVerb = (r: Partial<VerbResult>): VerbResult => ({
+    ok: r.ok ?? false,
+    code: r.code ?? 0,
+    stderr: r.stderr ?? '',
+  })
 
   return {
-    list: () => getJson<RepoState[]>('/repos'),
-    status: (i) => getJson<RepoState>(`/repos/${id(i)}`),
-    start: (i) => post(`/repos/${id(i)}/start`),
-    build: (i) => post(`/repos/${id(i)}/build`),
-    stop: (i) => post(`/repos/${id(i)}/stop`),
-    logs: (i, tail = 200) => getJson<string[]>(`/repos/${id(i)}/logs?tail=${tail}`),
-    exec: (i, command) => post(`/repos/${id(i)}/exec`, { command }),
+    list: () => request<RepoState[]>('/repos'),
+    status: (i) => request<RepoState>(`/repos/${id(i)}`),
+    verb: async (verb, i, workload) =>
+      asVerb(await post<Partial<VerbResult>>(`/repos/${id(i)}/${verb}${wl(workload)}`)),
+    logs: (i, tail, workload) =>
+      request<string[]>(
+        `/repos/${id(i)}/logs?tail=${tail ?? 200}${workload ? `&workload=${id(workload)}` : ''}`,
+      ),
+    exec: async (i, command, workload) => {
+      const r = await post<Partial<ExecResult>>(`/repos/${id(i)}/exec${wl(workload)}`, { command })
+      return { ...asVerb(r), stdout: r.stdout ?? '' }
+    },
+    setStartup: async (i, command) => {
+      await request(`/repos/${id(i)}/startup`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ command }),
+      })
+    },
+    namespace: () => request<NamespaceInfo>('/namespace'),
+    setNamespace: (ns) =>
+      request<NamespaceInfo>('/namespace', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ namespace: ns }),
+      }),
+    auth: () => request<AuthState>('/auth'),
+    authLogin: () => post<AuthState>('/auth/login'),
+    termList: () => request<TermInfo[]>('/terminals'),
+    termOpen: (opts) => post<TermInfo>('/terminals', opts),
+    termRun: (tid, command, timeoutMs) =>
+      post<RunOutcome>(`/terminals/${id(tid)}/run`, { command, timeoutMs }),
+    termRead: async (tid, tail = 200) =>
+      (await request<{ output: string }>(`/terminals/${id(tid)}/output?tail=${tail}`)).output,
+    termClose: async (tid) => {
+      await request(`/terminals/${id(tid)}`, { method: 'DELETE' })
+    },
   }
 }

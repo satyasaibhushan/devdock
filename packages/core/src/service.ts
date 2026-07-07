@@ -12,6 +12,7 @@ import { type ClusterCache, Reconciler, newClusterCache } from './reconciler.js'
 import { scanRepos } from './registry.js'
 import { StateStore } from './stateStore.js'
 import { type SessionState, type StreamRunner, Supervisor, verbLabel } from './supervisor.js'
+import { type RunOutcome, type TermInfo, type TermKind, TermRegistry } from './termRegistry.js'
 import type { Repo, RepoState, RepoStatus, TermMode } from './types.js'
 import { assembleState, resolveWorkload, scopeRepo, workloadTypes } from './workloads.js'
 
@@ -103,6 +104,8 @@ export class Service {
   private timer?: NodeJS.Timeout
   private authTimer?: NodeJS.Timeout
   private readonly auth: AuthManager
+  /** Agent-opened terminals (MCP): id → live PTY session + scrollback. */
+  private readonly terms = new TermRegistry()
 
   constructor(opts: ServiceOptions = {}, deps: ServiceDeps = {}) {
     this.opts = {
@@ -392,9 +395,11 @@ export class Service {
     return r
   }
 
-  /** Send a one-off command into the repo's dev session (spec §8). */
-  async exec(id: string, command: string): Promise<RunResult> {
-    return this.supervisor.exec(this.repoOrThrow(id), command)
+  /** Send a one-off command into the workload's dev session (spec §8).
+   *  `tmux send-keys` under the hood: keystrokes only, no output capture —
+   *  callers that need the output should use a registered terminal instead. */
+  async exec(id: string, command: string, workload?: string): Promise<RunResult> {
+    return this.supervisor.exec(this.scoped(id, workload).repo, command)
   }
 
   /** The configured startup command for a repo, if any. */
@@ -762,6 +767,44 @@ export class Service {
     throw new Error(`${id} has no running pod to open a shell into — start it first`)
   }
 
+  // ---- registered terminals (spec §8 — the MCP's terminal surface) ----
+  // Headless terminals: opened wide (no attached viewer to fit to), tracked by
+  // id in the registry so request/response clients can run/read/close them.
+
+  /** Open a terminal and register it. `local` spawns a login shell on the
+   *  devdock host; `auto`/`shell` open the workload's dev session / pod shell. */
+  async openRegisteredTerminal(opts: {
+    repo?: string
+    workload?: string
+    kind?: TermKind
+    cwd?: string
+  }): Promise<TermInfo> {
+    const kind = opts.kind ?? (opts.repo ? 'auto' : 'local')
+    if (kind === 'local') {
+      const session = await this.broker.openLocal('rw', 200, 50, opts.cwd)
+      return this.terms.add({ kind }, session)
+    }
+    if (!opts.repo) throw new Error(`repo required for a ${kind} terminal`)
+    const session = await this.openTerminal(opts.repo, 'rw', 200, 50, opts.workload, kind)
+    return this.terms.add({ kind, repo: opts.repo, workload: opts.workload }, session)
+  }
+
+  listTerminals(): TermInfo[] {
+    return this.terms.list()
+  }
+
+  readTerminal(id: string, tail?: number): string {
+    return this.terms.read(id, tail)
+  }
+
+  runInTerminal(id: string, command: string, timeoutMs?: number): Promise<RunOutcome> {
+    return this.terms.run(id, command, timeoutMs)
+  }
+
+  closeTerminal(id: string): void {
+    this.terms.close(id)
+  }
+
   // ---- kubernetes auth (owned by AuthManager, surfaced over /auth) ----
   authState(): AuthState {
     return this.auth.snapshot()
@@ -787,6 +830,7 @@ export class Service {
     await this.reconcileAll()
     this.timer = setInterval(() => {
       void this.reconcileAll()
+      this.terms.sweep() // reap idle/dead agent terminals alongside each pass
     }, this.opts.reconcileMs)
     this.authTimer = setInterval(() => {
       void this.auth.maintain().catch(() => undefined)
@@ -799,6 +843,7 @@ export class Service {
     if (this.authTimer) clearInterval(this.authTimer)
     this.authTimer = undefined
     for (const t of this.tailers.values()) t.stop()
+    this.terms.closeAll()
   }
 }
 

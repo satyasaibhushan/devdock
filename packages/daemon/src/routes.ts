@@ -72,22 +72,101 @@ export function buildApp(service: Service): FastifyInstance {
     },
   )
 
-  app.post<{ Params: { id: string }; Body: { command?: string } }>(
-    '/repos/:id/exec',
+  app.post<{
+    Params: { id: string }
+    Querystring: { workload?: string }
+    Body: { command?: string }
+  }>('/repos/:id/exec', async (req, reply) => {
+    const command = req.body?.command
+    if (typeof command !== 'string' || !command.trim()) {
+      return reply.code(400).send({ error: 'command required' })
+    }
+    try {
+      const result = await service.exec(req.params.id, command, req.query.workload)
+      return {
+        ok: result.code === 0,
+        code: result.code,
+        stdout: result.stdout,
+        stderr: result.stderr,
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      return reply.code(message.includes('unknown repo') ? 404 : 500).send({ error: message })
+    }
+  })
+
+  // Registered terminals — the MCP's stateful shell surface (open a terminal,
+  // type into it, read what happened). Request/response over the same
+  // PtyBroker sessions the WS terminal uses.
+  app.get('/terminals', async () => service.listTerminals())
+
+  app.post<{ Body: { repo?: string; workload?: string; kind?: string; cwd?: string } }>(
+    '/terminals',
+    async (req, reply) => {
+      const { repo, workload, cwd } = req.body ?? {}
+      const kind = req.body?.kind
+      if (kind !== undefined && kind !== 'auto' && kind !== 'shell' && kind !== 'local') {
+        return reply.code(400).send({ error: `invalid kind: ${kind}` })
+      }
+      try {
+        return await service.openRegisteredTerminal({ repo, workload, kind, cwd })
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        const code = message.includes('repo required')
+          ? 400
+          : message.includes('unknown repo')
+            ? 404
+            : message.includes('write-lock') || message.includes('no running pod')
+              ? 409
+              : 500
+        return reply.code(code).send({ error: message })
+      }
+    },
+  )
+
+  app.post<{ Params: { tid: string }; Body: { command?: string; timeoutMs?: number } }>(
+    '/terminals/:tid/run',
     async (req, reply) => {
       const command = req.body?.command
       if (typeof command !== 'string' || !command.trim()) {
         return reply.code(400).send({ error: 'command required' })
       }
       try {
-        const result = await service.exec(req.params.id, command)
-        return { ok: result.code === 0, code: result.code, stderr: result.stderr }
+        return await service.runInTerminal(req.params.tid, command, req.body?.timeoutMs)
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
-        return reply.code(message.includes('unknown repo') ? 404 : 500).send({ error: message })
+        const code = message.includes('unknown terminal')
+          ? 404
+          : message.includes('busy') || message.includes('exited')
+            ? 409
+            : 500
+        return reply.code(code).send({ error: message })
       }
     },
   )
+
+  app.get<{ Params: { tid: string }; Querystring: { tail?: string } }>(
+    '/terminals/:tid/output',
+    async (req, reply) => {
+      const tail = Number(req.query.tail ?? 200)
+      try {
+        return { output: service.readTerminal(req.params.tid, Number.isFinite(tail) ? tail : 200) }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        return reply.code(message.includes('unknown terminal') ? 404 : 500).send({ error: message })
+      }
+    },
+  )
+
+  app.delete<{ Params: { tid: string } }>('/terminals/:tid', async (req, reply) => {
+    try {
+      service.closeTerminal(req.params.tid)
+      return { ok: true }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      return reply.code(message.includes('unknown terminal') ? 404 : 500).send({ error: message })
+    }
+  })
 
   app.put<{ Params: { id: string }; Body: { command?: string } }>(
     '/repos/:id/startup',

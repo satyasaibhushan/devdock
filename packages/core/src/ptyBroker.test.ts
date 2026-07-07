@@ -142,6 +142,22 @@ describe('PtyBroker', () => {
     })
   })
 
+  it('openLocal spawns a login shell, defaulting to $SHELL and the home directory', async () => {
+    const calls: Array<{ file: string; args: string[]; cwd?: string }> = []
+    const spawn: PtySpawn = (file, args, opts) => {
+      calls.push({ file, args, cwd: opts.cwd })
+      return fakePty()
+    }
+    const broker = new PtyBroker(spawn)
+    await broker.openLocal('rw', 80, 24, '/somewhere')
+    expect(calls[0]).toEqual({
+      file: process.env.SHELL ?? '/bin/zsh',
+      args: ['-l'],
+      cwd: '/somewhere',
+    })
+    expect(broker.locks.isHeld('local')).toBe(false)
+  })
+
   it('openShell pins -n when the repo carries a namespace (config or session pin)', async () => {
     const calls: Array<{ file: string; args: string[] }> = []
     const spawn: PtySpawn = (file, args) => {

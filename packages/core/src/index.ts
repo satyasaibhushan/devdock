@@ -66,6 +66,14 @@ export {
   type ToolStatus,
 } from './preflight.js'
 export {
+  TermRegistry,
+  renderPtyText,
+  RUN_MAX_TIMEOUT_MS,
+  type TermInfo,
+  type TermKind,
+  type RunOutcome,
+} from './termRegistry.js'
+export {
   AuthManager,
   OFF_NETWORK_HINT,
   jwtExpiryMs,

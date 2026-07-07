@@ -2,6 +2,7 @@
 // Read-only is the default; read-write is a held lock (spec design rule §5).
 import { chmodSync, existsSync, statSync } from 'node:fs'
 import { createRequire } from 'node:module'
+import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { arch, platform } from 'node:process'
 import type { Repo, TermMode } from './types.js'
@@ -139,6 +140,9 @@ export class WriteLock {
 export interface TermSession {
   readonly mode: TermMode
   onData(cb: (data: string) => void): void
+  /** Fires when the underlying PTY exits (shell exited, attach detached).
+   *  Optional: pre-existing test fakes may not implement it. */
+  onExit?(cb: () => void): void
   /** Forward input to the PTY. Read-only sessions let wheel reports through
    *  (scrolling) and drop everything else. */
   write(data: string): void
@@ -196,6 +200,24 @@ export class PtyBroker {
     return this.attach(repo, mode, 'devspace', args, repo.path, cols, rows, { lock: false })
   }
 
+  /**
+   * A plain login shell on the devdock host — no repo, no pod. This is the
+   * "open a terminal on my machine" surface for agents (MCP term_open with
+   * kind=local). Independent PTYs, so no write-lock; any number can coexist.
+   */
+  openLocal(mode: TermMode, cols = 80, rows = 24, cwd?: string): Promise<TermSession> {
+    const shell = process.env.SHELL ?? '/bin/zsh'
+    const local: Repo = {
+      id: 'local',
+      name: 'local',
+      path: cwd ?? homedir(),
+      configPath: '',
+      ports: [],
+      session: '',
+    }
+    return this.attach(local, mode, shell, ['-l'], local.path, cols, rows, { lock: false })
+  }
+
   private async attach(
     repo: Repo,
     mode: TermMode,
@@ -247,11 +269,18 @@ export class PtyBroker {
       const timer: ReturnType<typeof setTimeout> = setTimeout(teardown, PTY_TEARDOWN_GRACE_MS)
       timer.unref?.()
     }
-    pty.onExit(close)
+    // One subscription on the pty, fanned out: the broker's own teardown first,
+    // then any session-level listeners (e.g. the terminal registry's liveness).
+    const exitListeners: Array<() => void> = []
+    pty.onExit(() => {
+      close()
+      for (const l of exitListeners) l()
+    })
 
     return {
       mode,
       onData: (cb) => pty.onData(cb),
+      onExit: (cb) => exitListeners.push(cb),
       write: (data) => {
         // rw: everything. ro: wheel reports only — scroll, never type.
         if (mode === 'rw' || isWheelReport(data)) pty.write(data)

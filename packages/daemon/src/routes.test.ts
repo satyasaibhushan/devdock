@@ -128,6 +128,79 @@ describe('daemon routes', () => {
     expect(res.statusCode).toBe(404)
   })
 
+  it('terminal lifecycle: open local, list, run, read output, close', async () => {
+    let dataCb: (d: string) => void = () => {}
+    const session = {
+      mode: 'rw' as const,
+      onData: (cb: (d: string) => void) => {
+        dataCb = cb
+      },
+      onExit: () => {},
+      write: (d: string) => dataCb(`${d}\nran it\n`), // echo back like a shell
+      resize: () => {},
+      close: vi.fn(),
+    }
+    const broker = { openLocal: vi.fn(async () => session) }
+    const svc = new Service(
+      { roots: [root], stateFile: join(root, 'state.json') },
+      { runner: vi.fn(async () => ({ code: 0, stdout: '', stderr: '' })), broker: broker as never },
+    )
+    const app = buildApp(svc)
+
+    const opened = await app.inject({ method: 'POST', url: '/terminals', payload: {} })
+    expect(opened.statusCode).toBe(200)
+    const tid = opened.json().id
+    expect(tid).toBe('t1')
+    expect(opened.json()).toMatchObject({ kind: 'local', alive: true })
+
+    const list = await app.inject({ method: 'GET', url: '/terminals' })
+    expect(list.json()).toHaveLength(1)
+
+    const run = await app.inject({
+      method: 'POST',
+      url: `/terminals/${tid}/run`,
+      payload: { command: 'do thing' },
+    })
+    expect(run.statusCode).toBe(200)
+    expect(run.json().output).toContain('ran it')
+    expect(run.json().timedOut).toBe(false)
+
+    const out = await app.inject({ method: 'GET', url: `/terminals/${tid}/output?tail=5` })
+    expect(out.json().output).toContain('ran it')
+
+    const closed = await app.inject({ method: 'DELETE', url: `/terminals/${tid}` })
+    expect(closed.json()).toEqual({ ok: true })
+    expect(session.close).toHaveBeenCalled()
+    expect((await app.inject({ method: 'GET', url: '/terminals' })).json()).toEqual([])
+  }, 15_000)
+
+  it('terminal routes validate input and unknown ids', async () => {
+    const { svc } = makeService()
+    const app = buildApp(svc)
+    const badKind = await app.inject({
+      method: 'POST',
+      url: '/terminals',
+      payload: { kind: 'nope' },
+    })
+    expect(badKind.statusCode).toBe(400)
+    const noRepo = await app.inject({
+      method: 'POST',
+      url: '/terminals',
+      payload: { kind: 'shell' },
+    })
+    expect(noRepo.statusCode).toBe(400)
+    const noCmd = await app.inject({ method: 'POST', url: '/terminals/t9/run', payload: {} })
+    expect(noCmd.statusCode).toBe(400)
+    const unknownRun = await app.inject({
+      method: 'POST',
+      url: '/terminals/t9/run',
+      payload: { command: 'ls' },
+    })
+    expect(unknownRun.statusCode).toBe(404)
+    expect((await app.inject({ method: 'GET', url: '/terminals/t9/output' })).statusCode).toBe(404)
+    expect((await app.inject({ method: 'DELETE', url: '/terminals/t9' })).statusCode).toBe(404)
+  })
+
   it('GET /auth reports the auth snapshot (no-oidc test cluster → ok)', async () => {
     const { svc } = makeService()
     await svc.startLoop() // the daemon probes auth at boot; before that the phase is 'unknown'
