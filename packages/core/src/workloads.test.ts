@@ -37,7 +37,8 @@ const multiConfig: Repo = {
   name: 'career-service-agents',
   path: '/home/me/Code/career-service-agents',
   root: '/home/me/Code/career-service-agents',
-  configPath: '/home/me/Code/career-service-agents/.devspace/career-service-agents-api/devspace.yaml',
+  configPath:
+    '/home/me/Code/career-service-agents/.devspace/career-service-agents-api/devspace.yaml',
   ports: [],
   workloads: ['api', 'worker'],
   defaultWorkload: 'api',

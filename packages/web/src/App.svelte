@@ -1,17 +1,24 @@
 <script lang="ts">
+  import AuthBanner from './lib/AuthBanner.svelte'
   import ConfirmModal from './lib/ConfirmModal.svelte'
   import LogViewer from './lib/LogViewer.svelte'
+  import NamespacePicker from './lib/NamespacePicker.svelte'
   import RepoList from './lib/RepoList.svelte'
   import StartupModal from './lib/StartupModal.svelte'
   import TerminalPanel from './lib/TerminalPanel.svelte'
   import {
+    type AuthState,
+    type NamespaceInfo,
     type RepoState,
     type Verb,
     STATUS_VERBS,
     adoptRepo,
+    fetchAuth,
+    fetchNamespace,
     fetchRepos,
     openEvents,
     runVerb,
+    switchNamespace,
   } from './lib/api'
 
   let repos = $state<RepoState[]>([])
@@ -25,6 +32,11 @@
   let connected = $state(false)
   let busy = $state<{ id: string; verb: Verb } | null>(null)
   let toast = $state<string | null>(null)
+  // The kube context's namespace + the selectable list (null until first fetch).
+  let nsInfo = $state<NamespaceInfo | null>(null)
+  let nsBusy = $state(false)
+  // Kubernetes OIDC auth (null until first fetch / older daemon).
+  let auth = $state<AuthState | null>(null)
   // The "move external session here" confirmation flow.
   let confirmAdopt = $state(false)
   let adoptBusy = $state(false)
@@ -36,6 +48,37 @@
       if (!selectedId && repos.length) selectedId = repos[0]?.repo.id ?? null
     } catch {
       connected = false
+    }
+    // Polled alongside repos so a `kn` run in a terminal shows up here too.
+    // Skipped mid-switch so the poll can't flash the old namespace back.
+    if (!nsBusy) {
+      try {
+        nsInfo = await fetchNamespace()
+      } catch {
+        /* older daemon or offline — the picker just stays hidden */
+      }
+    }
+    try {
+      auth = await fetchAuth()
+    } catch {
+      /* older daemon or offline — the banner just stays hidden */
+    }
+  }
+
+  // Switch the kube context's namespace (what `kn <ns>` does), then re-pull
+  // everything so statuses reflect the new namespace right away.
+  async function changeNamespace(ns: string) {
+    if (nsBusy) return
+    nsBusy = true
+    try {
+      nsInfo = await switchNamespace(ns)
+      await refresh()
+    } catch (e) {
+      toast = `namespace switch failed: ${e instanceof Error ? e.message : String(e)}`
+      setTimeout(() => (toast = null), 4000)
+      throw e // lets the picker snap its select back
+    } finally {
+      nsBusy = false
     }
   }
 
@@ -143,6 +186,19 @@
     <span class="cdot" class:on={connected}></span>
     {connected ? 'daemon connected' : 'daemon offline'}
   </span>
+  <div class="hright">
+    {#if auth}
+      <AuthBanner {auth} onchanged={(next) => (auth = next)} />
+    {/if}
+    {#if nsInfo}
+      <NamespacePicker
+        current={nsInfo.current}
+        known={nsInfo.known}
+        busy={nsBusy}
+        onswitch={changeNamespace}
+      />
+    {/if}
+  </div>
 </header>
 
 <main>
@@ -287,6 +343,13 @@
   }
   .cdot.on {
     background: var(--ok);
+  }
+  /* right-aligned header controls (the namespace selector) */
+  .hright {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 14px;
   }
 
   main {

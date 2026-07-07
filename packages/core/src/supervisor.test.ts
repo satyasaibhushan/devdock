@@ -82,6 +82,20 @@ describe('Supervisor', () => {
     ])
   })
 
+  it('start turns on mouse mode so a wheel scrolls tmux history instead of leaking arrow keys', async () => {
+    const runner = vi.fn(async () => ok())
+    await new Supervisor(runner).start(repo)
+    // option commands need the `=name:` target form, like pipe-pane (bare
+    // `=name` is rejected with "no such session" on tmux 3.6b).
+    expect(runner).toHaveBeenCalledWith('tmux', [
+      'set-option',
+      '-t',
+      '=devdock-svc-a:',
+      'mouse',
+      'on',
+    ])
+  })
+
   it('does not pipe when the session failed to start', async () => {
     const runner = vi.fn(async () => ({ code: 1, stdout: '', stderr: 'duplicate session' }))
     await new Supervisor(runner).start(repo, '/tmp/svc-a.dev.log')
@@ -218,7 +232,7 @@ describe('Supervisor', () => {
         if (cmd === 'lsof') {
           // Lock path: `-iTCP:<port> -sTCP:LISTEN` → the listening pid (if any).
           const tcp = args.find((a) => a.startsWith('-iTCP:'))
-          const p = tcp ? Number(tcp.slice('-iTCP:'.length)) : NaN
+          const p = tcp ? Number(tcp.slice('-iTCP:'.length)) : Number.NaN
           const pid = listeners[p]
           return pid ? ok(`p${pid}\n`) : { code: 1, stdout: '', stderr: '' }
         }

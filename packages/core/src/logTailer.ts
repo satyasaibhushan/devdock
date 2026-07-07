@@ -99,31 +99,3 @@ export class LogTailer {
     this.child = undefined
   }
 }
-
-/** Follows a file (`tail -n +1 -F`) into a LogHub — used for the tmux pane
- *  output of `devspace dev`, mirrored to a file via `tmux pipe-pane`. */
-export class FileTail {
-  private child?: ChildProcess
-  private readonly lines: LineSplitter
-  constructor(
-    readonly hub: LogHub,
-    private readonly spawnFn: SpawnFn = spawnStream,
-  ) {
-    this.lines = new LineSplitter((line) => this.hub.push(line))
-  }
-
-  start(path: string): void {
-    if (this.child) return
-    // -n +1: replay the (freshly truncated) file from the top; -F: survive
-    // rotation/truncation and a file that doesn't exist yet.
-    const child = this.spawnFn('tail', ['-n', '+1', '-F', path])
-    child.stdout?.on('data', (d: Buffer) => this.lines.ingest(d.toString()))
-    this.child = child
-  }
-
-  stop(): void {
-    this.lines.flush()
-    this.child?.kill('SIGTERM')
-    this.child = undefined
-  }
-}

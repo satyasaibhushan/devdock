@@ -2,10 +2,12 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { AuthManager } from './auth.js'
 import { type RunResult, loginShell } from './exec.js'
 import type { SpawnFn } from './logTailer.js'
 import { PtyBroker } from './ptyBroker.js'
 import { Service } from './service.js'
+import { StateStore } from './stateStore.js'
 
 let root: string
 let stateFile: string
@@ -82,7 +84,7 @@ describe('Service', () => {
     expect(svc.get('svc-a')?.status).toBe('DEPLOYED')
   })
 
-  it('retires an old no-pod dev session and reconciles back to DEPLOYED', async () => {
+  it('retires an old no-pod dev session only after the condition persists', async () => {
     const deploymentsJson = JSON.stringify({
       items: [{ metadata: { name: 'svc-a' }, spec: { replicas: 0 }, status: {} }],
     })
@@ -97,12 +99,146 @@ describe('Service', () => {
       }
       return { code: 0, stdout: '', stderr: '' }
     })
-    const svc = new Service({ roots: [root], stateFile }, { runner })
+    const svc = new Service(
+      { roots: [root], stateFile },
+      { runner, streamSpawner: fakeStreamSpawner().spawner },
+    )
     svc.rescan()
+    const t0 = Date.now()
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(t0)
+
+    // First no-pod observation starts the stale timer — no retire yet, even
+    // though the session itself is ancient (created at epoch).
+    await svc.reconcileAll()
+    expect(svc.get('svc-a')?.status).toBe('BUILDING')
+    expect(runner).not.toHaveBeenCalledWith('tmux', ['kill-session', '-t', '=devdock-svc-a'])
+
+    // The condition has now held continuously past the threshold → retire.
+    nowSpy.mockReturnValue(t0 + 31 * 60 * 1000)
     await svc.reconcileAll()
     expect(svc.get('svc-a')?.status).toBe('DEPLOYED')
     expect(svc.get('svc-a')?.hasSession).toBe(false)
     expect(runner).toHaveBeenCalledWith('tmux', ['kill-session', '-t', '=devdock-svc-a'])
+    nowSpy.mockRestore()
+  })
+
+  it('a transient kubectl failure never retires the session or drops the status', async () => {
+    const podsJson = JSON.stringify({
+      items: [
+        {
+          metadata: { name: 'svc-a-app-1' },
+          status: { phase: 'Running', containerStatuses: [{ ready: true, restartCount: 0 }] },
+        },
+      ],
+    })
+    let kubectlDown = false
+    const runner = vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
+      if (cmd === 'tmux' && args[0] === 'list-panes') {
+        // an old, healthy session (created at epoch — well past any age gate)
+        return { code: 0, stdout: 'devdock-svc-a 0 1\n', stderr: '' }
+      }
+      if (cmd === 'kubectl' && args[0] === 'get') {
+        if (kubectlDown) return { code: 1, stdout: '', stderr: 'Unable to connect to the server' }
+        return {
+          code: 0,
+          stdout: args[1] === 'deployments' ? '{"items":[]}' : podsJson,
+          stderr: '',
+        }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+    const svc = new Service(
+      { roots: [root], stateFile },
+      { runner, streamSpawner: fakeStreamSpawner().spawner },
+    )
+    svc.rescan()
+    await svc.reconcileAll()
+    expect(svc.get('svc-a')?.status).toBe('RUNNING_MANAGED')
+
+    kubectlDown = true
+    await svc.reconcileAll()
+    // unknown ≠ gone: last known status holds, session untouched
+    expect(svc.get('svc-a')?.status).toBe('RUNNING_MANAGED')
+    expect(runner).not.toHaveBeenCalledWith('tmux', ['kill-session', '-t', '=devdock-svc-a'])
+
+    kubectlDown = false
+    await svc.reconcileAll()
+    expect(svc.get('svc-a')?.status).toBe('RUNNING_MANAGED')
+  })
+
+  it('a momentary empty pod read on an old session does not retire it', async () => {
+    const podsJson = JSON.stringify({
+      items: [
+        {
+          metadata: { name: 'svc-a-app-1' },
+          status: { phase: 'Running', containerStatuses: [{ ready: true, restartCount: 0 }] },
+        },
+      ],
+    })
+    let podsGone = false
+    const runner = vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
+      if (cmd === 'tmux' && args[0] === 'list-panes') {
+        return { code: 0, stdout: 'devdock-svc-a 0 1\n', stderr: '' }
+      }
+      if (cmd === 'kubectl' && args[0] === 'get') {
+        const pods = podsGone ? '{"items":[]}' : podsJson
+        return { code: 0, stdout: args[1] === 'deployments' ? '{"items":[]}' : pods, stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+    const svc = new Service(
+      { roots: [root], stateFile },
+      { runner, streamSpawner: fakeStreamSpawner().spawner },
+    )
+    svc.rescan()
+    await svc.reconcileAll()
+    expect(svc.get('svc-a')?.status).toBe('RUNNING_MANAGED')
+
+    podsGone = true
+    await svc.reconcileAll() // pod recreating / blip — timer starts, nothing retired
+    expect(runner).not.toHaveBeenCalledWith('tmux', ['kill-session', '-t', '=devdock-svc-a'])
+
+    podsGone = false
+    await svc.reconcileAll()
+    expect(svc.get('svc-a')?.status).toBe('RUNNING_MANAGED')
+  })
+
+  it('auto-reconnects a dead dev session whose pod is still running', async () => {
+    const podsJson = JSON.stringify({
+      items: [
+        {
+          metadata: { name: 'svc-a-devspace-1' },
+          status: { phase: 'Running', containerStatuses: [{ ready: true, restartCount: 0 }] },
+        },
+      ],
+    })
+    const runner = vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
+      if (cmd === 'tmux' && args[0] === 'list-panes') {
+        // pane_dead=1: devspace dev exited (dropped connection) — pod remains
+        return { code: 0, stdout: 'devdock-svc-a 1 1\n', stderr: '' }
+      }
+      if (cmd === 'kubectl' && args[0] === 'get') {
+        if (args[1] === 'configmap') return { code: 0, stdout: '{"data":{}}', stderr: '' }
+        return {
+          code: 0,
+          stdout: args[1] === 'deployments' ? '{"items":[]}' : podsJson,
+          stderr: '',
+        }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+    const svc = new Service(
+      { roots: [root], stateFile },
+      { runner, streamSpawner: fakeStreamSpawner().spawner },
+    )
+    svc.rescan()
+    await svc.reconcileAll()
+    // the dead shell is retired and `devspace dev` relaunched to reattach
+    await vi.waitFor(() => {
+      expect(runner).toHaveBeenCalledWith('tmux', ['kill-session', '-t', '=devdock-svc-a'])
+      expect(runner).toHaveBeenCalledWith('tmux', expect.arrayContaining(['new-session']))
+    })
+    expect(svc.logs('svc-a').some((l) => l.includes('reconnecting'))).toBe(true)
   })
 
   it('keeps a fresh no-pod dev session in BUILDING', async () => {
@@ -198,8 +334,9 @@ describe('Service', () => {
     await svc.openTerminal('svc-a', 'ro')
     expect(spawns[0]?.file).toBe('devspace')
     // Pin the reconciled pod so the shell can't auto-pick a different service's
-    // pod from the shared namespace; --wait covers a pod still coming up.
-    expect(spawns[0]?.args).toEqual(['enter', '--pod', 'svc-a-devspace-1', '--wait'])
+    // pod from the shared namespace; --wait covers a pod still coming up; -n
+    // pins the namespace so a later global switch can't redirect the shell.
+    expect(spawns[0]?.args).toEqual(['enter', '--pod', 'svc-a-devspace-1', '--wait', '-n', 'ns'])
     expect(spawns[0]?.cwd).toBe(join(root, 'svc-a'))
   })
 
@@ -225,7 +362,13 @@ describe('Service', () => {
     const spawns: Array<{ file: string; args: string[] }> = []
     const broker = new PtyBroker((file, args) => {
       spawns.push({ file, args })
-      return { onData: () => {}, onExit: () => {}, write: () => {}, resize: () => {}, kill: () => {} }
+      return {
+        onData: () => {},
+        onExit: () => {},
+        write: () => {},
+        resize: () => {},
+        kill: () => {},
+      }
     })
     // A managed session IS present, so kind:'auto' would attach tmux…
     const svc = new Service(
@@ -242,7 +385,7 @@ describe('Service', () => {
     // pinned to the reconciled pod so it can't drift to another service's pod.
     await svc.openTerminal('svc-a', 'rw', undefined, undefined, undefined, 'shell')
     expect(spawns[1]?.file).toBe('devspace')
-    expect(spawns[1]?.args).toEqual(['enter', '--pod', 'svc-a-devspace-1', '--wait'])
+    expect(spawns[1]?.args).toEqual(['enter', '--pod', 'svc-a-devspace-1', '--wait', '-n', 'ns'])
   })
 
   it('narrates verb activity into the repo logs, even with no pods', async () => {
@@ -264,7 +407,7 @@ describe('Service', () => {
     expect(lines).toContain('✓ devspace purge -n ns')
   })
 
-  it('start mirrors the dev pane into the logs (pipe-pane + tail -F)', async () => {
+  it('start mirrors the dev pane to the on-disk dev log only — never into Logs', async () => {
     const runner = cannedRunner('{"items":[]}', true)
     const { spawner, spawns } = fakeStreamSpawner()
     const svc = new Service({ roots: [root], stateFile }, { runner, streamSpawner: spawner })
@@ -277,11 +420,13 @@ describe('Service', () => {
       '=devdock-svc-a:',
       expect.stringContaining('svc-a.dev.log'),
     ])
-    expect(spawns[0]?.cmd).toBe('tail')
+    // The pane is the Terminal panel's content; tailing it into the log hub
+    // would make Logs a duplicate of the Terminal. Only the verb marker lands.
+    expect(spawns.map((s) => s.cmd)).not.toContain('tail')
     expect(svc.logs('svc-a')[0]).toBe('$ devspace dev -n ns')
   })
 
-  it('reattaches the dev-pane mirror when a live session has none (daemon restart)', async () => {
+  it('re-pipes a live session found on reconcile (daemon restart) and backfills mouse mode', async () => {
     const runner = cannedRunner('{"items":[]}', true)
     const { spawner, spawns } = fakeStreamSpawner()
     const svc = new Service({ roots: [root], stateFile }, { runner, streamSpawner: spawner })
@@ -289,7 +434,75 @@ describe('Service', () => {
     await svc.reconcileAll()
 
     expect(runner).toHaveBeenCalledWith('tmux', expect.arrayContaining(['pipe-pane']))
-    expect(spawns.map((s) => s.cmd)).toEqual(['tail'])
+    expect(runner).toHaveBeenCalledWith('tmux', [
+      'set-option',
+      '-t',
+      '=devdock-svc-a:',
+      'mouse',
+      'on',
+    ])
+    expect(spawns.map((s) => s.cmd)).not.toContain('tail')
+  })
+
+  it('fires a queued startup command even when the daemon restarts mid-deploy', async () => {
+    // start() queues the configured command while the pod is still deploying…
+    const before = new Service(
+      { roots: [root], stateFile },
+      { runner: cannedRunner('{"items":[]}', true), streamSpawner: fakeStreamSpawner().spawner },
+    )
+    before.rescan()
+    before.setStartupCommand('svc-a', 'pnpm run dev')
+    await before.start('svc-a')
+
+    // …the daemon restarts inside the deploy window (fresh Service, same store),
+    // and the pod only becomes ready on the new process's watch.
+    const readyPod = JSON.stringify({
+      items: [
+        {
+          metadata: { name: 'svc-a-app-1' },
+          status: { phase: 'Running', containerStatuses: [{ ready: true, restartCount: 0 }] },
+        },
+      ],
+    })
+    vi.useFakeTimers()
+    try {
+      const runner = cannedRunner(readyPod, true)
+      const after = new Service(
+        { roots: [root], stateFile },
+        { runner, streamSpawner: fakeStreamSpawner().spawner },
+      )
+      after.rescan()
+      await after.reconcileAll()
+      expect(after.get('svc-a')?.status).toBe('RUNNING_MANAGED')
+      await vi.advanceTimersByTimeAsync(3000) // past the startup grace
+      expect(runner).toHaveBeenCalledWith('tmux', [
+        'send-keys',
+        '-t',
+        '=devdock-svc-a:',
+        'pnpm run dev',
+        'Enter',
+      ])
+
+      // One shot per start: the queue entry was consumed with the send.
+      runner.mockClear()
+      await after.reconcileAll()
+      await vi.advanceTimersByTimeAsync(3000)
+      expect(runner).not.toHaveBeenCalledWith('tmux', expect.arrayContaining(['send-keys']))
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('stop clears a still-queued startup command — a canceled start must not fire later', async () => {
+    const svc = new Service(
+      { roots: [root], stateFile },
+      { runner: cannedRunner('{"items":[]}', true), streamSpawner: fakeStreamSpawner().spawner },
+    )
+    svc.rescan()
+    svc.setStartupCommand('svc-a', 'pnpm run dev')
+    await svc.start('svc-a')
+    await svc.stop('svc-a')
+    expect(new StateStore(stateFile).getPendingStartup('svc-a')).toBeUndefined()
   })
 
   it('restart recycles the workload: kill → build → start', async () => {
@@ -307,6 +520,98 @@ describe('Service', () => {
     expect(runner).toHaveBeenCalledWith('tmux', expect.arrayContaining(['new-session']))
   })
 
+  it('namespaceInfo unions the context namespace, remembered ones, and repo-declared ones', async () => {
+    const runner = vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
+      if (cmd === 'kubectl' && args[0] === 'config' && args[1] === 'view')
+        return { code: 0, stdout: 'saibhushan\n', stderr: '' }
+      if (cmd === 'kubectl') return { code: 0, stdout: '{"items":[]}', stderr: '' }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+    const svc = new Service({ roots: [root], stateFile }, { runner })
+    svc.rescan()
+    const info = await svc.namespaceInfo()
+    expect(info.current).toBe('saibhushan')
+    // svc-a's config declares `namespace: ns` — offered alongside the current
+    expect(info.known).toEqual(expect.arrayContaining(['ns', 'saibhushan']))
+  })
+
+  it('setNamespace switches the kube context (the kn alias) and remembers the namespace', async () => {
+    const runner = vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
+      if (cmd === 'kubectl' && args[0] === 'config' && args[1] === 'view')
+        return { code: 0, stdout: 'saibhushan', stderr: '' }
+      if (cmd === 'kubectl') return { code: 0, stdout: '{"items":[]}', stderr: '' }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+    const svc = new Service({ roots: [root], stateFile }, { runner })
+    svc.rescan()
+    const info = await svc.setNamespace('panels')
+    expect(runner).toHaveBeenCalledWith('kubectl', [
+      'config',
+      'set-context',
+      '--current',
+      '--namespace=panels',
+    ])
+    expect(info.known).toContain('panels')
+    await expect(svc.setNamespace('Not A Namespace!')).rejects.toThrow(/invalid namespace/)
+    // let the switch-triggered background reconcile settle before teardown
+    await new Promise((r) => setTimeout(r, 0))
+  })
+
+  it('pins a session to the namespace it started in and releases the pin on stop', async () => {
+    mkdirSync(join(root, 'svc-b'), { recursive: true })
+    writeFileSync(join(root, 'svc-b', 'devspace.yaml'), 'name: svc-b\ndeployments:\n  app: {}\n')
+    let contextNs = 'saibhushan'
+    const runner = vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
+      if (cmd === 'kubectl' && args[0] === 'config' && args[1] === 'view')
+        return { code: 0, stdout: contextNs, stderr: '' }
+      if (cmd === 'kubectl') return { code: 0, stdout: '{"items":[]}', stderr: '' }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+    const svc = new Service(
+      { roots: [root], stateFile },
+      { runner, streamSpawner: fakeStreamSpawner().spawner },
+    )
+    svc.rescan()
+    await svc.start('svc-b')
+
+    // `devspace dev` ran pinned to the start-time context namespace
+    // (the inner command is login-shell wrapped, so quotes are nested/escaped)
+    const dev = runner.mock.calls.find(
+      (c) => c[0] === 'tmux' && (c[1] as string[])[0] === 'new-session',
+    )
+    expect(String((dev?.[1] as string[]).at(-1))).toMatch(/devspace dev -n \S*saibhushan/)
+
+    // the user switches the global namespace — svc-b's cluster queries still
+    // target its own namespace, so its pods can't "disappear" and get retired
+    contextNs = 'panels'
+    runner.mockClear()
+    await svc.reconcileAll()
+    expect(runner).toHaveBeenCalledWith('kubectl', [
+      'get',
+      'pods',
+      '-o',
+      'json',
+      '-n',
+      'saibhushan',
+    ])
+
+    // stop purges in the pinned namespace, then releases the pin…
+    runner.mockClear()
+    await svc.stop('svc-b')
+    const purge = runner.mock.calls.find(
+      (c) => c[0] === loginShell && String((c[1] as string[])[1]).includes('devspace purge'),
+    )
+    expect(String((purge?.[1] as string[])[1])).toContain("-n 'saibhushan'")
+
+    // …so the next start pins to wherever the context points now
+    runner.mockClear()
+    await svc.start('svc-b')
+    const dev2 = runner.mock.calls.find(
+      (c) => c[0] === 'tmux' && (c[1] as string[])[0] === 'new-session',
+    )
+    expect(String((dev2?.[1] as string[]).at(-1))).toMatch(/devspace dev -n \S*panels/)
+  })
+
   it('restart holds one RESTARTING status, never flickering through STOPPED/DEPLOYED', async () => {
     const runner = cannedRunner('{"items":[]}', false)
     const { spawner } = fakeStreamSpawner()
@@ -321,5 +626,43 @@ describe('Service', () => {
     expect(seen[0]).toBe('RESTARTING')
     expect(seen).not.toContain('DEPLOYED')
     expect(seen.at(-1)).not.toBe('RESTARTING') // settles to the real status at the end
+  })
+
+  it('refuses verbs while kubernetes login is required, without spawning devspace', async () => {
+    const runner = cannedRunner('{"items":[]}', false)
+    const auth = {
+      snapshot: () => ({ oidc: true, phase: 'login_required', checkedAt: Date.now() }),
+      ensure: async () => ({
+        oidc: true,
+        phase: 'login_required',
+        message: 'kubernetes login required — sign in from the office network',
+        checkedAt: Date.now(),
+      }),
+      kubectlAllowed: () => true,
+      init: async () => ({ oidc: true, phase: 'login_required', checkedAt: Date.now() }),
+    } as unknown as AuthManager
+    const svc = new Service({ roots: [root], stateFile }, { runner, auth })
+    svc.rescan()
+    const r = await svc.start('svc-a')
+    expect(r.code).toBe(1)
+    expect(r.stderr).toContain('kubernetes auth')
+    // the verb never reached tmux/devspace
+    expect(runner.mock.calls.some((c) => c[0] === 'tmux' && c[1][0] === 'new-session')).toBe(false)
+    // …and the failure is narrated into the workload's log hub
+    expect(svc.logs('svc-a').some((l) => l.includes('office network'))).toBe(true)
+  })
+
+  it('gates reconcile kubectl calls through the auth manager', async () => {
+    const runner = cannedRunner('{"items":[]}', false)
+    const auth = {
+      snapshot: () => ({ oidc: true, phase: 'login_required', checkedAt: Date.now() }),
+      kubectlAllowed: (args: string[]) => args[0] === 'config',
+      init: async () => ({ oidc: true, phase: 'login_required', checkedAt: Date.now() }),
+    } as unknown as AuthManager
+    const svc = new Service({ roots: [root], stateFile }, { runner, auth })
+    svc.rescan()
+    await svc.reconcileAll()
+    // no kubectl API call leaked past the gate (each would spawn a kubelogin)
+    expect(runner.mock.calls.some((c) => c[0] === 'kubectl' && c[1][0] !== 'config')).toBe(false)
   })
 })

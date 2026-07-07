@@ -173,10 +173,18 @@ describe('Reconciler', () => {
     expect(state.pods).toHaveLength(1)
   })
 
-  it('treats a kubectl failure as no pods', async () => {
+  it('flags a kubectl failure as unreachable — unknown, not "no pods"', async () => {
     const runner = vi.fn(async () => ({ code: 1, stdout: '', stderr: 'boom' }))
     const state = await new Reconciler(runner).reconcile(repo, false)
+    // the reconciler-level fallback still derives STOPPED, but the flag lets
+    // the service hold the last known status and skip retire decisions
     expect(state.status).toBe('STOPPED')
+    expect(state.workloads[0]?.unreachable).toBe(true)
+  })
+
+  it('does not flag a successful empty read as unreachable', async () => {
+    const state = await new Reconciler(clusterRunner('{"items":[]}')).reconcile(repo, false)
+    expect(state.workloads[0]?.unreachable).toBeUndefined()
   })
 
   it('a deployment with no pods → DEPLOYED, attributed by name', async () => {

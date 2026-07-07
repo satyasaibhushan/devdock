@@ -81,6 +81,63 @@ export const STATUS_VERBS: Record<RepoStatus, Verb[]> = {
   RESTARTING: ['restart', 'stop'],
 }
 
+/** The global namespace view — the kube context's current namespace plus every
+ *  namespace devdock has learned (cluster-wide listing is RBAC-forbidden). */
+export interface NamespaceInfo {
+  current: string
+  known: string[]
+}
+
+export async function fetchNamespace(): Promise<NamespaceInfo> {
+  const res = await fetch('/namespace')
+  if (!res.ok) throw new Error(`GET /namespace → ${res.status}`)
+  return res.json()
+}
+
+/** Switch the kube context's namespace (the UI face of the user's `kn` alias). */
+export async function switchNamespace(namespace: string): Promise<NamespaceInfo> {
+  const res = await fetch('/namespace', {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ namespace }),
+  })
+  if (!res.ok) {
+    const body = (await res.json().catch(() => null)) as { error?: string } | null
+    throw new Error(body?.error ?? `PUT /namespace → ${res.status}`)
+  }
+  return res.json()
+}
+
+/** Kubernetes OIDC auth, owned by the daemon (one shared login for everything). */
+export interface AuthState {
+  /** false = this cluster doesn't use oidc-login; the banner never shows. */
+  oidc: boolean
+  phase: 'unknown' | 'ok' | 'login_required' | 'logging_in' | 'error'
+  message?: string
+  tokenExpiresAt?: number
+  checkedAt: number
+}
+
+export async function fetchAuth(): Promise<AuthState> {
+  const res = await fetch('/auth')
+  if (!res.ok) throw new Error(`GET /auth → ${res.status}`)
+  return res.json()
+}
+
+/** Kick off the (single-flight) interactive login; poll /auth for the outcome. */
+export async function startAuthLogin(): Promise<AuthState> {
+  const res = await fetch('/auth/login', { method: 'POST' })
+  if (!res.ok) throw new Error(`POST /auth/login → ${res.status}`)
+  return res.json()
+}
+
+/** The UI face of `rm -r ~/.kube/cache/oidc-login`. */
+export async function clearAuthCache(): Promise<AuthState> {
+  const res = await fetch('/auth/clear', { method: 'POST' })
+  if (!res.ok) throw new Error(`POST /auth/clear → ${res.status}`)
+  return res.json()
+}
+
 export async function fetchRepos(): Promise<RepoState[]> {
   const res = await fetch('/repos')
   if (!res.ok) throw new Error(`GET /repos → ${res.status}`)

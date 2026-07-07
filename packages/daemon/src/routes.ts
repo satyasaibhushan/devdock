@@ -2,8 +2,8 @@
 import { existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import fastifyStatic from '@fastify/static'
 import type { Service } from '@devdock/core'
+import fastifyStatic from '@fastify/static'
 import Fastify, { type FastifyInstance } from 'fastify'
 
 /** The built web UI (`packages/web/dist`), relative to this module at
@@ -24,6 +24,30 @@ export function buildApp(service: Service): FastifyInstance {
   }
 
   app.get('/health', async () => ({ ok: true }))
+
+  // The global namespace selector: reads/moves the kube context's namespace
+  // (what the user's `kn` alias does), so the UI and terminal always agree.
+  app.get('/namespace', async () => service.namespaceInfo())
+
+  app.put<{ Body: { namespace?: string } }>('/namespace', async (req, reply) => {
+    const namespace = req.body?.namespace
+    if (typeof namespace !== 'string' || !namespace.trim()) {
+      return reply.code(400).send({ error: 'namespace required' })
+    }
+    try {
+      return await service.setNamespace(namespace)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      return reply.code(message.includes('invalid namespace') ? 400 : 500).send({ error: message })
+    }
+  })
+
+  // Kubernetes OIDC auth, owned by the daemon (one login for all verbs). GET
+  // is the UI's poll; login/clear return the immediate snapshot — the browser
+  // flow finishes in the background and later polls pick up the outcome.
+  app.get('/auth', async () => service.authState())
+  app.post('/auth/login', async () => service.authLogin())
+  app.post('/auth/clear', async () => service.authClearCache())
 
   app.get('/repos', async () => service.list())
 

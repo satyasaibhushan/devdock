@@ -1,7 +1,7 @@
 // @devdock/daemon — the only brain. Composes the core Service with HTTP + WS.
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { Service, checkTools, missingToolWarnings } from '@devdock/core'
+import { Service, checkTools, missingToolWarnings, pathShadowWarnings } from '@devdock/core'
 import { buildApp } from './routes.js'
 import { attachWs } from './wsServer.js'
 
@@ -12,6 +12,12 @@ async function main() {
   for (const w of missingToolWarnings(await checkTools())) {
     console.warn(`devdock: ${w}`)
   }
+  // Slow-tools check runs in the background — boot shouldn't wait on a login shell.
+  void pathShadowWarnings()
+    .then((ws) => {
+      for (const w of ws) console.warn(`devdock: ${w}`)
+    })
+    .catch(() => undefined)
 
   const roots = (process.env.DEVDOCK_ROOTS ?? join(homedir(), 'Code')).split(':').filter(Boolean)
   const service = new Service({

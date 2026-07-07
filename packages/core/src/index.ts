@@ -30,7 +30,6 @@ export {
 } from './reconciler.js'
 export {
   LogTailer,
-  FileTail,
   LogHub,
   RingBuffer,
   type LogSubscriber,
@@ -40,6 +39,7 @@ export {
   PtyBroker,
   WriteLock,
   attachArgs,
+  isWheelReport,
   type PtyLike,
   type PtySpawn,
   type TermSession,
@@ -55,13 +55,24 @@ export {
   Service,
   type ServiceOptions,
   type ServiceDeps,
+  type NamespaceInfo,
 } from './service.js'
 export {
   checkTools,
   missingToolWarnings,
+  pathShadowWarnings,
   DEFAULT_TOOLS,
   type ToolCheck,
   type ToolStatus,
 } from './preflight.js'
+export {
+  AuthManager,
+  OFF_NETWORK_HINT,
+  jwtExpiryMs,
+  type AuthState,
+  type AuthPhase,
+  type AuthRunner,
+  type AuthManagerOptions,
+} from './auth.js'
 
 export const version = '0.0.0'

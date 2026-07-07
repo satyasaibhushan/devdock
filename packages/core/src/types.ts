@@ -76,6 +76,11 @@ export interface WorkloadState {
   pods: PodInfo[]
   deployments: DeploymentInfo[]
   hasSession: boolean
+  /** True when the kubectl queries behind this view failed (cluster
+   *  unreachable, expired credentials, kube context switched away). pods and
+   *  deployments are then unknown — not gone — and must not drive destructive
+   *  decisions such as retiring a dev session. */
+  unreachable?: boolean
 }
 
 /** A pod observed in the cluster during reconciliation. */

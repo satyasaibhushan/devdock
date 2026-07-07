@@ -2,23 +2,49 @@
   import { openLogs } from './api'
 
   let { id, workload }: { id: string; workload?: string } = $props()
-  let lines = $state<string[]>([])
+
+  // Hard cap on retained lines — the pane is a recent-history view, not an
+  // archive. Old lines are purged as new ones arrive so a long-running session
+  // can't grow the DOM/memory without bound. (The daemon's per-workload ring
+  // buffer is capped at 1000 lines too, so this is also all it can replay.)
+  const MAX_LINES = 1000
+
+  // Lines carry a monotonic seq used as the render key: when old lines are
+  // purged the survivors keep their keys, so Svelte only mounts the new rows
+  // instead of re-rendering the whole pane on every message.
+  type Line = { seq: number; text: string }
+  let lines = $state<Line[]>([])
   let box: HTMLDivElement
 
   $effect(() => {
     // re-subscribe whenever the selected repo (or workload) changes.
     lines = []
-    const ws = openLogs(id, workload)
-    ws.onmessage = (ev) => {
-      lines = [...lines.slice(-999), String(ev.data)]
+    let seq = 0
+    // Chatty services can emit hundreds of lines a second; a state update per
+    // WebSocket message would re-render per line. Buffer and flush per frame.
+    let pending: Line[] = []
+    let raf = 0
+    const flush = () => {
+      raf = 0
+      lines = [...lines, ...pending].slice(-MAX_LINES)
+      pending = []
       queueMicrotask(() => box?.scrollTo(0, box.scrollHeight))
     }
-    return () => ws.close()
+    const ws = openLogs(id, workload)
+    ws.onmessage = (ev) => {
+      pending.push({ seq: seq++, text: String(ev.data) })
+      if (pending.length > MAX_LINES) pending = pending.slice(-MAX_LINES)
+      if (!raf) raf = requestAnimationFrame(flush)
+    }
+    return () => {
+      if (raf) cancelAnimationFrame(raf)
+      ws.close()
+    }
   })
 </script>
 
 <div class="logs" bind:this={box}>
-  {#each lines as line, i (i)}<div class="line">{line}</div>{:else}<div class="empty">Waiting for log output…</div>{/each}
+  {#each lines as line (line.seq)}<div class="line">{line.text}</div>{:else}<div class="empty">Waiting for log output…</div>{/each}
 </div>
 
 <style>

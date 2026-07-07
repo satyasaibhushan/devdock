@@ -22,11 +22,13 @@
 
   $effect(() => {
     error = null
+    // NOTE: no `disableStdin` for read-only — it would also swallow the mouse
+    // reports that make wheel-scrolling work (tmux mouse mode). Read-only is
+    // enforced by only forwarding wheel reports (below), and again daemon-side.
     const term = new Terminal({
       fontFamily: monoStack(),
       fontSize: 12,
       cursorBlink: mode === 'rw',
-      disableStdin: mode === 'ro',
       scrollback: 5000,
       theme: { background: '#0b0f14', foreground: '#c9d6e2' },
     })
@@ -67,7 +69,14 @@
     ws.onerror = () => {
       error = 'connection to daemon lost'
     }
-    if (mode === 'rw') term.onData((d) => ws.readyState === ws.OPEN && ws.send(d))
+    // rw forwards everything; ro forwards only SGR mouse-wheel reports so the
+    // attached tmux session can scroll its history — keystrokes never leave the
+    // browser (and the daemon's broker drops anything but wheel reports anyway).
+    const WHEEL_REPORT = /^(?:\x1b\[<6[45];\d+;\d+[Mm])+$/
+    term.onData((d) => {
+      if (mode === 'ro' && !WHEEL_REPORT.test(d)) return
+      if (ws.readyState === ws.OPEN) ws.send(d)
+    })
 
     // Refit when the panel itself resizes (not just the window) and keep the
     // daemon-side PTY in sync so tmux redraws at the real size.

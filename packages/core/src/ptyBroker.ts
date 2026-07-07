@@ -94,9 +94,23 @@ export function ensureExecutable(path: string): void {
 
 /** The tmux command a terminal of `mode` attaches with (spec §8).
  *  `=` forces an exact session-name match — tmux `-t` matching is otherwise
- *  prefix-based and could attach a sibling repo's session. */
-export function attachArgs(session: string, mode: TermMode): string[] {
-  return mode === 'ro' ? ['attach', '-r', '-t', `=${session}`] : ['attach', '-t', `=${session}`]
+ *  prefix-based and could attach a sibling repo's session.
+ *  Read-only deliberately does NOT use tmux's `-r` flag: a `-r` client ignores
+ *  ALL input, including the mouse-wheel reports that scroll pane history. The
+ *  broker enforces read-only itself by letting only wheel reports through
+ *  (see isWheelReport) — scrolling works, typing doesn't. */
+export function attachArgs(session: string, _mode: TermMode): string[] {
+  return ['attach', '-t', `=${session}`]
+}
+
+/** One or more SGR mouse *wheel* reports (button 64 = up, 65 = down) and
+ *  nothing else. This is the only input a read-only terminal may deliver to
+ *  its PTY: enough for tmux (or a full-screen app) to scroll, never enough to
+ *  type — any keystroke or click fails the match and is dropped. */
+// biome-ignore lint/suspicious/noControlCharactersInRegex: matching the ESC of SGR mouse reports is the point
+const WHEEL_REPORT_RE = /^(?:\x1b\[<6[45];\d+;\d+[Mm])+$/
+export function isWheelReport(data: string): boolean {
+  return WHEEL_REPORT_RE.test(data)
 }
 
 /** Single-writer lock: one read-write terminal per repo at a time (spec §5). */
@@ -125,7 +139,8 @@ export class WriteLock {
 export interface TermSession {
   readonly mode: TermMode
   onData(cb: (data: string) => void): void
-  /** Forward input to the pod. No-op for read-only sessions. */
+  /** Forward input to the PTY. Read-only sessions let wheel reports through
+   *  (scrolling) and drop everything else. */
   write(data: string): void
   resize(cols: number, rows: number): void
   close(): void
@@ -174,6 +189,10 @@ export class PtyBroker {
    */
   openShell(repo: Repo, mode: TermMode, cols = 80, rows = 24, pod?: string): Promise<TermSession> {
     const args = pod ? ['enter', '--pod', pod, '--wait'] : ['enter', '--pick=false', '--wait']
+    // Pin the namespace when the repo has one (config-declared or session-
+    // pinned) — otherwise `devspace enter` searches the kube context's current
+    // namespace, which may have moved since this workload started.
+    if (repo.namespace) args.push('-n', repo.namespace)
     return this.attach(repo, mode, 'devspace', args, repo.path, cols, rows, { lock: false })
   }
 
@@ -234,7 +253,8 @@ export class PtyBroker {
       mode,
       onData: (cb) => pty.onData(cb),
       write: (data) => {
-        if (mode === 'rw') pty.write(data)
+        // rw: everything. ro: wheel reports only — scroll, never type.
+        if (mode === 'rw' || isWheelReport(data)) pty.write(data)
       },
       resize: (c, r) => pty.resize(c, r),
       close,

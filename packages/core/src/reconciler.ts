@@ -127,10 +127,12 @@ export function parseDeployments(json: string): DeploymentInfo[] {
  *  Repos sharing a namespace share the answer — a 47-repo pass costs one
  *  `get pods` + one `get deployments` per namespace, not one pair per repo.
  *  Make a fresh cache per pass; a single-repo reconcile after a verb uses its
- *  own so it never sees pre-verb data. */
+ *  own so it never sees pre-verb data. `null` records a query that FAILED —
+ *  "couldn't ask" is cached too (don't re-ask a broken kubectl 47 times) but
+ *  stays distinguishable from a genuine empty result. */
 export interface ClusterCache {
-  pods: Map<string, PodInfo[]>
-  deployments: Map<string, DeploymentInfo[]>
+  pods: Map<string, PodInfo[] | null>
+  deployments: Map<string, DeploymentInfo[] | null>
 }
 
 export function newClusterCache(): ClusterCache {
@@ -162,9 +164,11 @@ export class Reconciler {
     type: string,
     sessionDead = false,
   ): Promise<WorkloadState> {
-    const pods = await this.fetchPods(repo, cache)
-    const deployments = matchDeployments(await this.fetchDeployments(repo, cache), repo.name)
-    return {
+    const rawPods = await this.fetchPods(repo, cache)
+    const rawDeployments = await this.fetchDeployments(repo, cache)
+    const pods = rawPods ?? []
+    const deployments = matchDeployments(rawDeployments ?? [], repo.name)
+    const ws: WorkloadState = {
       type,
       status: deriveStatus(pods, hasSession, deployments.length > 0, sessionDead, {
         deployedWhenRunning: repo.codeArea === 'frontend',
@@ -173,35 +177,45 @@ export class Reconciler {
       deployments,
       hasSession,
     }
+    // A failed query means the cluster view is unknown, not empty — flag it so
+    // the service can hold the last known status and skip retire decisions.
+    if (rawPods === null || rawDeployments === null) ws.unreachable = true
+    return ws
   }
 
-  private async fetchPods(repo: Repo, cache: ClusterCache): Promise<PodInfo[]> {
+  /** `null` = the query failed (cluster unreachable / bad credentials), which
+   *  is NOT the same as an empty pod list. */
+  private async fetchPods(repo: Repo, cache: ClusterCache): Promise<PodInfo[] | null> {
     const key = `${repo.namespace ?? ''}|${repo.selector ?? ''}`
     let pods = cache.pods.get(key)
-    if (!pods) {
+    if (pods === undefined) {
       const args = ['get', 'pods', '-o', 'json']
       if (repo.namespace) args.push('-n', repo.namespace)
       if (repo.selector) args.push('-l', repo.selector)
       const r = await this.runner('kubectl', args).catch(() => undefined)
-      // A failure caches as empty too — don't re-ask a broken kubectl 47 times.
-      pods = !r || r.code !== 0 ? [] : parsePods(r.stdout)
+      pods = !r || r.code !== 0 ? null : parsePods(r.stdout)
       cache.pods.set(key, pods)
     }
+    if (pods === null) return null
     // Attribute pods to this repo by name (devspace names pods after the
     // project) unless an explicit label selector already scoped the query.
     return repo.selector ? pods : matchPods(pods, repo.name)
   }
 
   /** Namespace-wide deployment objects; the caller attributes by name. No label
-   *  selector here — deployments follow the same naming convention as pods. */
-  private async fetchDeployments(repo: Repo, cache: ClusterCache): Promise<DeploymentInfo[]> {
+   *  selector here — deployments follow the same naming convention as pods.
+   *  `null` = the query failed, distinguishable from "no deployments". */
+  private async fetchDeployments(
+    repo: Repo,
+    cache: ClusterCache,
+  ): Promise<DeploymentInfo[] | null> {
     const key = repo.namespace ?? ''
     let deployments = cache.deployments.get(key)
-    if (!deployments) {
+    if (deployments === undefined) {
       const args = ['get', 'deployments', '-o', 'json']
       if (repo.namespace) args.push('-n', repo.namespace)
       const r = await this.runner('kubectl', args).catch(() => undefined)
-      deployments = !r || r.code !== 0 ? [] : parseDeployments(r.stdout)
+      deployments = !r || r.code !== 0 ? null : parseDeployments(r.stdout)
       cache.deployments.set(key, deployments)
     }
     return deployments

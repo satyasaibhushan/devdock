@@ -22,8 +22,8 @@ const repo: Repo = {
 }
 
 describe('attachArgs', () => {
-  it('uses -r for read-only and matches the session name exactly', () => {
-    expect(attachArgs('s', 'ro')).toEqual(['attach', '-r', '-t', '=s'])
+  it('matches the session name exactly; no -r even for read-only (it would block wheel scrolling)', () => {
+    expect(attachArgs('s', 'ro')).toEqual(['attach', '-t', '=s'])
     expect(attachArgs('s', 'rw')).toEqual(['attach', '-t', '=s'])
   })
 })
@@ -90,6 +90,19 @@ describe('PtyBroker', () => {
     expect(broker.locks.isHeld('svc')).toBe(false)
   })
 
+  it('read-only sessions let mouse-wheel reports through (scrolling), nothing else', async () => {
+    const pty = fakePty()
+    const broker = new PtyBroker(spawnOf(pty))
+    const term = await broker.open(repo, 'ro')
+    const wheelUp = '\x1b[<64;10;5M'
+    const wheelBurst = '\x1b[<65;10;5M\x1b[<65;10;5M'
+    term.write(wheelUp)
+    term.write(wheelBurst)
+    term.write('\x1b[<0;10;5M') // a click is not a wheel report
+    term.write('q\x1b[<64;10;5M') // smuggling a key alongside a wheel report
+    expect(pty.written).toEqual([wheelUp, wheelBurst])
+  })
+
   it('read-write holds the lock until close, blocking a second rw', async () => {
     const broker = new PtyBroker(spawnOf(fakePty()))
     const term = await broker.open(repo, 'rw')
@@ -127,6 +140,24 @@ describe('PtyBroker', () => {
       file: 'devspace',
       args: ['enter', '--pod', 'svc-devspace-abc123', '--wait'],
     })
+  })
+
+  it('openShell pins -n when the repo carries a namespace (config or session pin)', async () => {
+    const calls: Array<{ file: string; args: string[] }> = []
+    const spawn: PtySpawn = (file, args) => {
+      calls.push({ file, args })
+      return fakePty()
+    }
+    const broker = new PtyBroker(spawn)
+    await broker.openShell({ ...repo, namespace: 'panels' }, 'ro', 80, 24, 'svc-devspace-abc123')
+    expect(calls[0]?.args).toEqual([
+      'enter',
+      '--pod',
+      'svc-devspace-abc123',
+      '--wait',
+      '-n',
+      'panels',
+    ])
   })
 
   it('openShell does not take the write-lock — pod shells are independent', async () => {

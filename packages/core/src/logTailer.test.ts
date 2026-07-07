@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events'
 import { describe, expect, it, vi } from 'vitest'
-import { FileTail, LogHub, LogTailer, RingBuffer, cleanLine } from './logTailer.js'
+import { LogHub, LogTailer, RingBuffer, cleanLine } from './logTailer.js'
 import type { PodInfo, Repo } from './types.js'
 
 function fakeChild() {
@@ -120,22 +120,5 @@ describe('LogTailer', () => {
     tailer.start(repo, pod)
     fake.stdout.emit('data', Buffer.from('pod log\n'))
     expect(hub.recent()).toEqual(['verb output', 'pod log'])
-  })
-})
-
-describe('FileTail', () => {
-  it('follows a file from the top into the hub', () => {
-    const fake = fakeChild()
-    const spawnFn = vi.fn(() => fake as never)
-    const hub = new LogHub()
-    const tail = new FileTail(hub, spawnFn)
-    tail.start('/tmp/x.dev.log')
-
-    expect(spawnFn).toHaveBeenCalledWith('tail', ['-n', '+1', '-F', '/tmp/x.dev.log'])
-    fake.stdout.emit('data', Buffer.from('deploying…\ndone\n'))
-    expect(hub.recent()).toEqual(['deploying…', 'done'])
-
-    tail.stop()
-    expect(fake.kill).toHaveBeenCalled()
   })
 })

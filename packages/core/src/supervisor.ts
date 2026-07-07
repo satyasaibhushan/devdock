@@ -101,6 +101,7 @@ export class Supervisor {
     // as CRASHED (with its last output) instead of the whole session vanishing
     // and the workload silently flipping to RUNNING_EXTERNAL.
     await this.keepalive(repo)
+    await this.mouse(repo)
     if (pipeFile) await this.pipe(repo, pipeFile)
     return r
   }
@@ -116,6 +117,17 @@ export class Supervisor {
       'remain-on-exit',
       'on',
     ])
+  }
+
+  /** Turn on tmux mouse mode for the session. Attached terminals are inside
+   *  tmux's alternate screen, where a wheel would otherwise degrade into
+   *  arrow-key escapes typed at the shell (`^[[A`/`^[[B` garbage); with mouse
+   *  mode the wheel reaches tmux, which scrolls the pane's history via
+   *  copy-mode. Idempotent; backfilled on reconcile for sessions started
+   *  before this was set. Option commands reject the bare `=name` session
+   *  target (verified on 3.6b) — like pipe-pane they need the `=name:` form. */
+  mouse(repo: Repo): Promise<RunResult> {
+    return this.runner('tmux', ['set-option', '-t', exactPane(repo.session), 'mouse', 'on'])
   }
 
   /** Mirror the session's pane to a file — but only when it isn't already piped.
@@ -196,7 +208,15 @@ export class Supervisor {
    *  a future `devspace dev` is not blocked by a stale session lock. Best-effort. */
   private async releaseSessionLock(repo: Repo): Promise<void> {
     if (!repo.namespace) return
-    const getArgs = ['get', 'configmap', 'devspace-dependencies', '-o', 'json', '-n', repo.namespace]
+    const getArgs = [
+      'get',
+      'configmap',
+      'devspace-dependencies',
+      '-o',
+      'json',
+      '-n',
+      repo.namespace,
+    ]
     const r = await this.runner('kubectl', getArgs).catch(() => undefined)
     if (!r || r.code !== 0) return
     let data: Record<string, string>

@@ -20,6 +20,10 @@ function makeService(start = vi.fn()) {
       start()
       return { code: 0, stdout: '', stderr: '' }
     }
+    if (cmd === 'kubectl' && args[0] === 'config') {
+      // `config view` reads the context namespace; `set-context` switches it
+      return { code: 0, stdout: args[1] === 'view' ? 'testns' : '', stderr: '' }
+    }
     if (cmd === 'kubectl') return { code: 0, stdout: '{"items":[]}', stderr: '' }
     return { code: 0, stdout: '', stderr: '' }
   })
@@ -81,10 +85,75 @@ describe('daemon routes', () => {
     expect(res.json()).toMatchObject({ ok: true })
   })
 
+  it('GET /namespace reports the context namespace and the known list', async () => {
+    const { svc } = makeService()
+    const app = buildApp(svc)
+    const res = await app.inject({ method: 'GET', url: '/namespace' })
+    const body = res.json()
+    expect(body.current).toBe('testns')
+    // svc-a's config declares `namespace: ns`; the context one is learned too
+    expect(body.known).toEqual(expect.arrayContaining(['ns', 'testns']))
+  })
+
+  it('PUT /namespace switches the kube context', async () => {
+    const { svc } = makeService()
+    const app = buildApp(svc)
+    const res = await app.inject({
+      method: 'PUT',
+      url: '/namespace',
+      payload: { namespace: 'panels' },
+    })
+    expect(res.statusCode).toBe(200)
+    expect(res.json().known).toContain('panels')
+  })
+
+  it('PUT /namespace rejects a missing or invalid name', async () => {
+    const { svc } = makeService()
+    const app = buildApp(svc)
+    expect((await app.inject({ method: 'PUT', url: '/namespace', payload: {} })).statusCode).toBe(
+      400,
+    )
+    const bad = await app.inject({
+      method: 'PUT',
+      url: '/namespace',
+      payload: { namespace: 'Not A Namespace!' },
+    })
+    expect(bad.statusCode).toBe(400)
+  })
+
   it('GET /repos/:id/logs 404 for unknown', async () => {
     const { svc } = makeService()
     const app = buildApp(svc)
     const res = await app.inject({ method: 'GET', url: '/repos/nope/logs' })
     expect(res.statusCode).toBe(404)
+  })
+
+  it('GET /auth reports the auth snapshot (no-oidc test cluster → ok)', async () => {
+    const { svc } = makeService()
+    await svc.startLoop() // the daemon probes auth at boot; before that the phase is 'unknown'
+    svc.stopLoop()
+    const app = buildApp(svc)
+    const res = await app.inject({ method: 'GET', url: '/auth' })
+    expect(res.statusCode).toBe(200)
+    expect(res.json()).toMatchObject({ oidc: false, phase: 'ok' })
+  })
+
+  it('POST /auth/login and /auth/clear return snapshots', async () => {
+    const auth = {
+      snapshot: vi.fn(() => ({ oidc: true, phase: 'logging_in', checkedAt: 1 })),
+      login: vi.fn(async () => ({ oidc: true, phase: 'ok', checkedAt: 2 })),
+      clearCache: vi.fn(() => ({ oidc: true, phase: 'login_required', checkedAt: 3 })),
+    }
+    const svc = new Service(
+      { roots: [root], stateFile: join(root, 'state.json') },
+      { runner: vi.fn(async () => ({ code: 0, stdout: '', stderr: '' })), auth: auth as never },
+    )
+    const app = buildApp(svc)
+    const login = await app.inject({ method: 'POST', url: '/auth/login' })
+    expect(login.json().phase).toBe('logging_in') // immediate snapshot, flow continues behind
+    expect(auth.login).toHaveBeenCalled()
+    const clear = await app.inject({ method: 'POST', url: '/auth/clear' })
+    expect(clear.json().phase).toBe('login_required')
+    expect(auth.clearCache).toHaveBeenCalled()
   })
 })

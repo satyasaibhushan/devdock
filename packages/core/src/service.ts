@@ -3,14 +3,15 @@
 import { EventEmitter } from 'node:events'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
+import { AuthManager, type AuthState } from './auth.js'
 import { CrashWatch } from './crashWatch.js'
-import { type RunResult, run, spawnStream } from './exec.js'
-import { FileTail, LogHub, LogTailer, type SpawnFn } from './logTailer.js'
+import { type RunResult, run, runStream, spawnStream } from './exec.js'
+import { LogHub, LogTailer, type SpawnFn } from './logTailer.js'
 import { PtyBroker } from './ptyBroker.js'
 import { type ClusterCache, Reconciler, newClusterCache } from './reconciler.js'
 import { scanRepos } from './registry.js'
 import { StateStore } from './stateStore.js'
-import { Supervisor, type SessionState, verbLabel } from './supervisor.js'
+import { type SessionState, type StreamRunner, Supervisor, verbLabel } from './supervisor.js'
 import type { Repo, RepoState, RepoStatus, TermMode } from './types.js'
 import { assembleState, resolveWorkload, scopeRepo, workloadTypes } from './workloads.js'
 
@@ -24,7 +25,38 @@ export interface ServiceOptions {
  *  `devspace dev` opens its in-container terminal a beat after the pod is up, so
  *  the keystrokes land at the shell prompt rather than mid-deploy output. */
 const STARTUP_RUN_DELAY_MS = 2500
+/** How long the "live session but no attributed pods" condition must hold —
+ *  continuously, across reconcile passes that could actually see the cluster —
+ *  before the session is retired as stale. A single empty/failed kubectl read
+ *  must never retire a healthy session. */
 const STALE_NO_POD_SESSION_MS = 30 * 60 * 1000
+/** Auto-reconnect pacing for a dead dev session whose pod still runs: at most
+ *  one attempt per cooldown, giving up after the cap until the workload holds
+ *  RUNNING_MANAGED for RECONNECT_RESET_MS (or a manual stop/clear intervenes),
+ *  so a genuinely crash-looping `devspace dev` degrades to CRASHED instead of
+ *  thrashing forever. */
+const RECONNECT_COOLDOWN_MS = 60 * 1000
+const RECONNECT_RESET_MS = 5 * 60 * 1000
+const MAX_RECONNECT_ATTEMPTS = 3
+/** Background auth maintenance cadence. Each pass silently force-refreshes the
+ *  OIDC token when it has < 20 min left (see AuthManager.maintain), so kubectl
+ *  and devspace essentially never see a stale token — and never each spawn
+ *  their own kubelogin browser flow. */
+const AUTH_MAINTAIN_MS = 5 * 60 * 1000
+
+/** RFC 1123 label — what Kubernetes accepts as a namespace name. */
+const NAMESPACE_RE = /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/
+
+/** The global namespace view: what the kube context points at now, plus every
+ *  namespace devdock can offer in the selector. */
+export interface NamespaceInfo {
+  /** The kube context's current namespace (the thing `kn <ns>` sets). */
+  current: string
+  /** Selectable namespaces: remembered ones + repo-declared ones + current.
+   *  Listing cluster namespaces needs RBAC most users lack, so this is learned,
+   *  not queried. */
+  known: string[]
+}
 
 /** Injectable collaborators (defaults are the real implementations). */
 export interface ServiceDeps {
@@ -34,6 +66,8 @@ export interface ServiceDeps {
   runner?: (cmd: string, args: string[], opts?: { cwd?: string }) => Promise<RunResult>
   /** Spawner for streaming children (kubectl logs -f, tail -F). Tests inject a fake. */
   streamSpawner?: SpawnFn
+  /** Kubernetes OIDC login owner — injectable so tests can pin auth phases. */
+  auth?: AuthManager
 }
 
 export class Service {
@@ -47,18 +81,28 @@ export class Service {
   private readonly store: StateStore
   private readonly repos = new Map<string, Repo>()
   private readonly states = new Map<string, RepoState>()
-  /** One log stream per repo: pod logs + dev-pane output + verb activity. */
+  /** One log stream per workload: pod logs + verb activity. The `devspace dev`
+   *  pane itself is deliberately NOT fed in here — the Terminal panel already
+   *  shows that pane live; mirroring it into Logs made the two panels
+   *  near-duplicates. It is still mirrored to disk (see devLogPath). */
   private readonly hubs = new Map<string, LogHub>()
   private readonly tailers = new Map<string, LogTailer>()
-  private readonly devTails = new Map<string, FileTail>()
+  /** Workload keys whose live session already got its once-per-sighting setup
+   *  (keepalive + mouse backfill) this daemon run. */
+  private readonly piped = new Set<string>()
   private readonly watchers = new Map<string, CrashWatch>()
   /** Per-workload status override held during a multi-step verb (restart) so the
    *  reconcile loop can't surface the STOPPED/DEPLOYED states it passes through. */
   private readonly transitions = new Map<string, RepoStatus>()
-  /** Workload keys whose configured startup command is queued to run once the
-   *  dev session's pod is up. Cleared after it fires (once per start). */
-  private readonly pendingStartup = new Map<string, string>()
+  /** When a dev session was first seen with no attributed pods — the stale
+   *  timer counts the *condition's* duration, not the session's age. Reset by
+   *  any pass that sees pods or couldn't see the cluster at all. */
+  private readonly noPodsSince = new Map<string, number>()
+  /** Auto-reconnect bookkeeping for dead sessions whose pod still runs. */
+  private readonly reconnects = new Map<string, { attempts: number; lastAt: number }>()
   private timer?: NodeJS.Timeout
+  private authTimer?: NodeJS.Timeout
+  private readonly auth: AuthManager
 
   constructor(opts: ServiceOptions = {}, deps: ServiceDeps = {}) {
     this.opts = {
@@ -66,10 +110,36 @@ export class Service {
       stateFile: opts.stateFile ?? join(process.cwd(), '.devdock', 'state.json'),
       reconcileMs: opts.reconcileMs ?? 5000,
     }
-    this.supervisor = deps.supervisor ?? new Supervisor(deps.runner)
-    this.reconciler = deps.reconciler ?? new Reconciler(deps.runner)
+    const baseRunner = deps.runner ?? run
+    this.auth = deps.auth ?? new AuthManager({ runner: baseRunner })
+    // Every kubectl that talks to the API server goes through the auth gate:
+    // with a stale OIDC token, each such call would spawn its own kubelogin —
+    // all racing to bind localhost:8040 and each opening a browser tab. Gated,
+    // the call is refused (read as a transient kubectl failure by the callers,
+    // which hold last-known status) while ONE silent refresh runs instead.
+    const gatedRunner: NonNullable<ServiceDeps['runner']> = (cmd, args, o) => {
+      if (cmd === 'kubectl' && !this.auth.kubectlAllowed(args)) {
+        return Promise.resolve({
+          code: 1,
+          stdout: '',
+          stderr: 'devdock: kubectl deferred — kubernetes login required',
+        })
+      }
+      // preserve the caller's arity — injected test runners assert exact calls
+      return o === undefined ? baseRunner(cmd, args) : baseRunner(cmd, args, o)
+    }
+    // Streaming (devspace deploy/purge output) bypasses the gate — those verbs
+    // run through the login shell, not kubectl, and are gated at the verb level
+    // by ensureAuth. Injected runners keep their old double-duty behaviour.
+    const streamRunner: StreamRunner = deps.runner
+      ? (c, a, o) => baseRunner(c, a, o)
+      : (c, a, o, onLine) => runStream(c, a, o, onLine)
+    this.supervisor = deps.supervisor ?? new Supervisor(gatedRunner, streamRunner)
+    this.reconciler = deps.reconciler ?? new Reconciler(gatedRunner)
     this.broker = deps.broker ?? new PtyBroker()
-    this.runner = deps.runner ?? run
+    // The service's own kubectl uses are `kubectl config …` (local, no API
+    // server, no token) — safe ungated.
+    this.runner = baseRunner
     this.streamSpawner = deps.streamSpawner ?? spawnStream
     this.store = new StateStore(this.opts.stateFile)
   }
@@ -116,27 +186,82 @@ export class Service {
   } {
     const base = this.repoOrThrow(id)
     const type = resolveWorkload(base, workload)
-    return { base, repo: scopeRepo(base, type), type, key: workloadKey(id, type) }
+    const key = workloadKey(id, type)
+    return { base, repo: this.pinned(scopeRepo(base, type), key), type, key }
+  }
+
+  /** Apply the session-namespace pin: a repo with no config-declared namespace
+   *  acts in the namespace its dev session was started in — not whatever the
+   *  kube context points at now — so the global selector can move without
+   *  orphaning running sessions. */
+  private pinned(repo: Repo, key: string): Repo {
+    if (repo.namespace) return repo
+    const ns = this.store.getSessionNamespace(key)
+    return ns ? { ...repo, namespace: ns } : repo
   }
 
   // ---- lifecycle verbs (spec §7) ----
   // Every verb narrates into the repo's log hub — the same output you'd see
   // running the devspace command in a terminal streams to the Logs panel live.
+
+  /** Verb gate: make sure the kubernetes OIDC token is fresh before devspace
+   *  runs. All concurrent verbs share ONE silent refresh / ONE interactive
+   *  login (AuthManager single-flights them), so starting five apps while
+   *  logged out yields one browser tab and five verbs that proceed once the
+   *  sign-in completes — instead of five racing kubelogins on port 8040.
+   *  Returns null when auth is fine, or the RunResult the verb should
+   *  early-return when login can't be completed. */
+  private async ensureAuth(key: string): Promise<RunResult | null> {
+    const hub = this.hubFor(key)
+    const before = this.auth.snapshot()
+    const quiet =
+      !before.oidc ||
+      (before.tokenExpiresAt !== undefined && before.tokenExpiresAt > Date.now() + 60_000)
+    if (!quiet)
+      hub.push('! kubernetes login being verified — a Google sign-in may open in your browser')
+    const s = await this.auth.ensure(true)
+    if (s.phase === 'ok') {
+      if (!quiet) hub.push('✓ kubernetes auth ok')
+      return null
+    }
+    const detail = s.message ?? 'kubernetes login required'
+    hub.push(`✗ ${detail}`)
+    return { code: 1, stdout: '', stderr: `kubernetes auth: ${detail}` }
+  }
+
   async start(id: string, workload?: string): Promise<RunResult> {
-    const { repo, key } = this.scoped(id, workload)
+    const { repo: scopedRepo, key } = this.scoped(id, workload)
+    const denied = await this.ensureAuth(key)
+    if (denied) return denied
+    let repo = scopedRepo
+    // First start of an un-namespaced repo: run it against the kube context's
+    // current namespace explicitly, and pin the session there (below, once the
+    // start succeeds) so devspace/kubectl keep targeting it even after the
+    // global namespace selector moves elsewhere.
+    let pin: string | undefined
+    if (!repo.namespace) {
+      pin = (await this.contextNamespace()) || undefined
+      if (pin) repo = { ...repo, namespace: pin }
+    }
     const hub = this.hubFor(key)
     const pipeFile = this.devLogPath(key)
     mkdirSync(dirname(pipeFile), { recursive: true })
-    writeFileSync(pipeFile, '') // fresh run, fresh file — old output doesn't replay
+    writeFileSync(pipeFile, '') // fresh run, fresh file — old output doesn't linger
     hub.push(`$ ${verbLabel(repo, 'dev')}`)
     const r = await this.supervisor.start(repo, pipeFile)
     if (r.code === 0) {
-      this.tailDevLog(key, pipeFile)
+      if (pin) {
+        this.store.setSessionNamespace(key, pin)
+        this.store.rememberNamespace(pin)
+      }
+      this.piped.add(key) // supervisor.start piped + keepalive'd the fresh session
       // Queue the configured startup command to run in the dev session once its
       // pod is ready (handled in reconcile). Only the tmux dev session gets it;
       // `devspace enter` shells are separate PTYs, so they never receive it.
+      // Queued in the store: the ready-wait spans the whole deploy (minutes),
+      // and a daemon restart in that window must not eat the command.
       const startup = this.store.getStartup(id)
-      if (startup) this.pendingStartup.set(key, startup)
+      if (startup) this.store.setPendingStartup(key, startup)
     } else {
       for (const line of nonEmptyLines(r.stderr)) hub.push(line)
       hub.push(`✗ devspace dev failed to start (exit ${r.code})`)
@@ -147,6 +272,8 @@ export class Service {
 
   async build(id: string, workload?: string): Promise<RunResult> {
     const { repo, key } = this.scoped(id, workload)
+    const denied = await this.ensureAuth(key)
+    if (denied) return denied
     const r = await this.narrate(key, verbLabel(repo, 'deploy'), (onLine) =>
       this.supervisor.build(repo, onLine),
     )
@@ -156,13 +283,18 @@ export class Service {
 
   async stop(id: string, workload?: string): Promise<RunResult> {
     const { repo, key } = this.scoped(id, workload)
+    const denied = await this.ensureAuth(key)
+    if (denied) return denied
+    this.noPodsSince.delete(key)
+    this.reconnects.delete(key)
     this.tailers.get(key)?.stop()
     this.tailers.delete(key)
     const r = await this.narrate(key, verbLabel(repo, 'purge'), (onLine) =>
       this.supervisor.kill(repo, onLine),
     )
-    this.devTails.get(key)?.stop()
-    this.devTails.delete(key)
+    this.piped.delete(key)
+    this.store.setSessionNamespace(key, undefined) // session gone → pin released
+    this.store.setPendingStartup(key, undefined) // canceled start must not fire later
     await this.reconcileOne(id)
     return r
   }
@@ -171,13 +303,18 @@ export class Service {
    *  session lock without purge or rebuild (image/deployment stay as deployed). */
   async clear(id: string, workload?: string): Promise<RunResult> {
     const { repo, key } = this.scoped(id, workload)
+    const denied = await this.ensureAuth(key)
+    if (denied) return denied
+    this.noPodsSince.delete(key)
+    this.reconnects.delete(key)
     this.tailers.get(key)?.stop()
     this.tailers.delete(key)
     const r = await this.narrate(key, verbLabel(repo, 'reset pods'), (onLine) =>
       this.supervisor.clear(repo, onLine),
     )
-    this.devTails.get(key)?.stop()
-    this.devTails.delete(key)
+    this.piped.delete(key)
+    this.store.setSessionNamespace(key, undefined) // session gone → pin released
+    this.store.setPendingStartup(key, undefined) // canceled start must not fire later
     await this.reconcileOne(id)
     return r
   }
@@ -218,6 +355,8 @@ export class Service {
    *  of flickering as the sub-steps reconcile. */
   async adopt(id: string, workload?: string): Promise<RunResult> {
     const { repo, key } = this.scoped(id, workload)
+    const denied = await this.ensureAuth(key)
+    if (denied) return denied
     this.transitions.set(key, 'RESTARTING')
     await this.reconcileOne(id) // reflect RESTARTING immediately
     const hub = this.hubFor(key)
@@ -273,6 +412,53 @@ export class Service {
     if (state) state.startupCommand = this.store.getStartup(id)
   }
 
+  // ---- namespace (the UI face of the user's `kn` alias) ----
+  /** The kube context's current namespace ('' when unset or unreadable). */
+  private async contextNamespace(): Promise<string> {
+    const r = await this.runner('kubectl', [
+      'config',
+      'view',
+      '--minify',
+      '--output',
+      'jsonpath={..namespace}',
+    ]).catch(() => undefined)
+    return r && r.code === 0 ? r.stdout.trim() : ''
+  }
+
+  /** Current namespace + the selectable list. Learns the current one, so a
+   *  `kn` switch done in a terminal shows up as an option here too. */
+  async namespaceInfo(): Promise<NamespaceInfo> {
+    const current = await this.contextNamespace()
+    if (current) this.store.rememberNamespace(current)
+    const known = new Set(this.store.getNamespaces())
+    for (const r of this.repos.values()) {
+      if (r.namespace) known.add(r.namespace)
+    }
+    if (current) known.add(current)
+    return { current: current || 'default', known: [...known].sort() }
+  }
+
+  /** Switch the kube context's namespace — exactly what the user's `kn <ns>`
+   *  alias runs, so the UI selector and terminal `kn` stay in sync. Pinned dev
+   *  sessions keep their own namespace; everything else (queries, verbs, new
+   *  sessions) follows the context from the next reconcile pass on. */
+  async setNamespace(ns: string): Promise<NamespaceInfo> {
+    const trimmed = ns.trim()
+    if (!NAMESPACE_RE.test(trimmed)) throw new Error(`invalid namespace: ${ns}`)
+    const r = await this.runner('kubectl', [
+      'config',
+      'set-context',
+      '--current',
+      `--namespace=${trimmed}`,
+    ])
+    if (r.code !== 0) {
+      throw new Error(`kubectl set-context failed: ${r.stderr.trim() || `exit ${r.code}`}`)
+    }
+    this.store.rememberNamespace(trimmed)
+    void this.reconcileAll().catch(() => undefined) // reflect the new view promptly
+    return this.namespaceInfo()
+  }
+
   /** Run the queued startup command in the dev session after a short grace, so
    *  the keystrokes land at the in-container shell `devspace dev` opens. */
   private scheduleStartup(scoped: Repo, key: string, command: string): void {
@@ -298,8 +484,10 @@ export class Service {
 
     const workloads = []
     for (const type of workloadTypes(repo)) {
-      const scoped = scopeRepo(repo, type)
       const key = workloadKey(id, type)
+      // The pin routes this workload's kubectl queries (and any retire) to the
+      // namespace its session actually runs in, not the context's current one.
+      const scoped = this.pinned(scopeRepo(repo, type), key)
       const session = states.get(scoped.session)
       let exists = !!session
       let sessionDead = session?.dead === true
@@ -315,47 +503,78 @@ export class Service {
       // While a multi-step verb (restart) is in flight, force the transient
       // status so the loop doesn't surface the intermediate STOPPED/DEPLOYED.
       const transition = this.transitions.get(key)
-      if (!transition && this.shouldRetireNoPodSession(ws, session)) {
+
+      // Stale timer: starts when a session is first seen with no pods, resets
+      // on any pass that sees pods — or that couldn't see the cluster at all.
+      if (!session || ws.unreachable || ws.pods.length > 0) this.noPodsSince.delete(key)
+      else if (!this.noPodsSince.has(key)) this.noPodsSince.set(key, Date.now())
+
+      if (!transition && ws.unreachable && !sessionDead) {
+        // kubectl failed: pods/deployments are unknown, not gone. Hold the last
+        // known status instead of fabricating STOPPED/BUILDING for one pass.
+        const prev = this.states.get(id)?.workloads.find((w) => w.type === ws.type)
+        if (prev && prev.status !== 'RESTARTING') ws.status = prev.status
+      }
+
+      if (!transition && this.shouldRetireNoPodSession(ws, session, key)) {
         const target = ws.deployments.length > 0 ? 'DEPLOYED' : 'STOPPED'
         this.hubFor(key).push(
           `! stale dev session retired: no matching pods; reconciled to ${target.toLowerCase()}`,
         )
         await this.supervisor.retireSession(scoped)
-        this.devTails.get(key)?.stop()
-        this.devTails.delete(key)
+        this.piped.delete(key)
+        this.noPodsSince.delete(key)
+        this.reconnects.delete(key)
+        this.store.setSessionNamespace(key, undefined)
+        this.store.setPendingStartup(key, undefined) // its target session is gone
         exists = false
         sessionDead = false
         hasSession = false
         ws.hasSession = false
         ws.status = target
+      } else if (!transition && sessionDead && !ws.unreachable && ws.pods.length > 0) {
+        // `devspace dev` died but its pod is still running (laptop sleep, a
+        // dropped port-forward/sync connection). Reconnect instead of sitting
+        // in CRASHED — devspace reattaches to the existing dev pod.
+        if (this.scheduleReconnect(id, type, key)) ws.status = 'RESTARTING'
       }
       if (transition) ws.status = transition
+
+      // A workload that has run managed for a while proved the reconnect took —
+      // re-arm the attempt budget for the next disconnect.
+      if (ws.status === 'RUNNING_MANAGED') {
+        const r = this.reconnects.get(key)
+        if (r && Date.now() - r.lastAt >= RECONNECT_RESET_MS) this.reconnects.delete(key)
+      }
       workloads.push(ws)
 
       // Once the dev session's pod is up, fire any queued startup command into
       // the session (the initial dev pod) — one shot per start.
-      if (ws.status === 'RUNNING_MANAGED' && this.pendingStartup.has(key)) {
-        const command = this.pendingStartup.get(key) as string
-        this.pendingStartup.delete(key)
-        this.scheduleStartup(scoped, key, command)
+      const pending = this.store.getPendingStartup(key)
+      if (ws.status === 'RUNNING_MANAGED' && pending) {
+        this.store.setPendingStartup(key, undefined)
+        this.scheduleStartup(scoped, key, pending)
       }
       if (exists) {
         // The session is present (alive or a dead/crashed shell). Keep its pane
-        // mirrored so its output — including the last lines before it died —
-        // flows to the logs.
+        // mirrored to the on-disk dev log — a forensic record of the session
+        // (including its last lines before a crash). It is not fed into the
+        // Logs hub: the Terminal panel shows this pane live.
         const file = this.devLogPath(key)
         mkdirSync(dirname(file), { recursive: true })
         if (!sessionDead) {
           // pipe-pane -o is a no-op if already piped; re-asserting it recovers a
-          // pipe dropped by a tmux server restart. keepalive backfills sessions
-          // started before remain-on-exit was set.
+          // pipe dropped by a tmux server restart. keepalive/mouse backfill
+          // sessions started before those options were set.
           await this.supervisor.pipe(scoped, file)
-          if (!this.devTails.has(key)) await this.supervisor.keepalive(scoped)
+          if (!this.piped.has(key)) {
+            await this.supervisor.keepalive(scoped)
+            await this.supervisor.mouse(scoped)
+            this.piped.add(key)
+          }
         }
-        if (!this.devTails.has(key)) this.tailDevLog(key, file)
-      } else if (this.devTails.has(key)) {
-        this.devTails.get(key)?.stop()
-        this.devTails.delete(key)
+      } else {
+        this.piped.delete(key)
       }
     }
     const state = assembleState(repo, workloads, Date.now())
@@ -388,13 +607,63 @@ export class Service {
     }
   }
 
+  /** Retire a no-pod session only on proof, never on a blip: the cluster must
+   *  have been reachable this pass, the no-pods condition must have held
+   *  continuously for STALE_NO_POD_SESSION_MS, and the session must be old
+   *  enough that this can't be a slow first build. A dead session with
+   *  deployment objects but no pods retires immediately — its dev process
+   *  already exited and the cluster is authoritative. */
   private shouldRetireNoPodSession(
-    ws: { pods: unknown[]; deployments: unknown[] },
+    ws: { pods: unknown[]; deployments: unknown[]; unreachable?: boolean },
     session: SessionState | undefined,
+    key: string,
   ): boolean {
-    if (!session || ws.pods.length > 0) return false
+    if (!session || ws.unreachable || ws.pods.length > 0) return false
     if (session.dead && ws.deployments.length > 0) return true
-    return session.createdAt !== undefined && Date.now() - session.createdAt >= STALE_NO_POD_SESSION_MS
+    const since = this.noPodsSince.get(key)
+    if (since === undefined || Date.now() - since < STALE_NO_POD_SESSION_MS) return false
+    return (
+      session.createdAt !== undefined && Date.now() - session.createdAt >= STALE_NO_POD_SESSION_MS
+    )
+  }
+
+  /** Kick off an auto-reconnect for a dead dev session whose pod still runs.
+   *  Returns true when one was started (the caller shows RESTARTING); paced by
+   *  a cooldown and capped so a crash-looping dev settles into CRASHED. */
+  private scheduleReconnect(id: string, workload: string | undefined, key: string): boolean {
+    const now = Date.now()
+    const prior = this.reconnects.get(key) ?? { attempts: 0, lastAt: 0 }
+    if (prior.attempts >= MAX_RECONNECT_ATTEMPTS || now - prior.lastAt < RECONNECT_COOLDOWN_MS) {
+      return false
+    }
+    const attempts = prior.attempts + 1
+    this.reconnects.set(key, { attempts, lastAt: now })
+    this.transitions.set(key, 'RESTARTING')
+    this.hubFor(key).push(
+      `! dev session died but its pod is still running — reconnecting (attempt ${attempts}/${MAX_RECONNECT_ATTEMPTS})`,
+    )
+    void this.reconnect(id, workload, key)
+    return true
+  }
+
+  /** Reconnect = retire the dead tmux shell (and its stale namespace lock),
+   *  then `devspace dev` again — it reattaches to the existing dev pod, no
+   *  purge or rebuild, and the startup command re-fires once the session is
+   *  up. Held under RESTARTING like adopt/restart so the row doesn't flicker. */
+  private async reconnect(id: string, workload: string | undefined, key: string): Promise<void> {
+    const hub = this.hubFor(key)
+    try {
+      const { repo } = this.scoped(id, workload)
+      await this.supervisor.retireSession(repo)
+      this.piped.delete(key)
+      const r = await this.start(id, workload)
+      hub.push(r.code === 0 ? '✓ dev session reconnected' : `✗ reconnect failed (exit ${r.code})`)
+    } catch (err) {
+      hub.push(`✗ reconnect failed: ${err instanceof Error ? err.message : String(err)}`)
+    } finally {
+      this.transitions.delete(key)
+      await this.reconcileOne(id).catch(() => undefined)
+    }
   }
 
   private watcherFor(id: string): CrashWatch {
@@ -407,7 +676,7 @@ export class Service {
   }
 
   // ---- logs (spec §12) ----
-  /** Recent lines from a workload's hub (pod logs, dev-pane output, verb activity). */
+  /** Recent lines from a workload's hub (pod logs + verb activity). */
   logs(id: string, tail = 200, workload?: string): string[] {
     const { key } = this.scoped(id, workload)
     this.ensureTailer(id, workload)
@@ -429,24 +698,21 @@ export class Service {
     return hub
   }
 
-  /** Where `tmux pipe-pane` mirrors a workload's `devspace dev` pane. `key` is
-   *  the per-workload key (`<id>` or `<id>::<type>`); `::` is unfilesystemy so
-   *  it becomes `.`. */
+  /** Where `tmux pipe-pane` mirrors a workload's `devspace dev` pane — an
+   *  on-disk record for debugging/forensics, not shown in the Logs panel.
+   *  `key` is the per-workload key (`<id>` or `<id>::<type>`); `::` is
+   *  unfilesystemy so it becomes `.`. */
   private devLogPath(key: string): string {
     return join(dirname(this.opts.stateFile), 'logs', `${key.replace('::', '.')}.dev.log`)
-  }
-
-  /** (Re)follow the dev-pane mirror file into the workload's hub. */
-  private tailDevLog(key: string, file: string): void {
-    this.devTails.get(key)?.stop()
-    const tail = new FileTail(this.hubFor(key), this.streamSpawner)
-    tail.start(file)
-    this.devTails.set(key, tail)
   }
 
   private ensureTailer(id: string, workload?: string): void {
     const { repo, type, key } = this.scoped(id, workload)
     if (this.tailers.has(key)) return
+    // A stale token would make the streamed `kubectl logs -f` spawn its own
+    // kubelogin (browser tab included) outside the gate — wait for reconcile
+    // to retry once auth is fresh.
+    if (!this.auth.kubectlAllowed(['logs'])) return
     const state = this.states.get(id)
     const pods = type ? (state?.workloads.find((w) => w.type === type)?.pods ?? []) : state?.pods
     const pod = pods?.[0]
@@ -496,20 +762,43 @@ export class Service {
     throw new Error(`${id} has no running pod to open a shell into — start it first`)
   }
 
+  // ---- kubernetes auth (owned by AuthManager, surfaced over /auth) ----
+  authState(): AuthState {
+    return this.auth.snapshot()
+  }
+
+  /** Kick off an interactive login (the UI button) without holding the HTTP
+   *  request open for the whole browser flow — poll /auth for the outcome. */
+  authLogin(): AuthState {
+    void this.auth.login().catch(() => undefined)
+    return this.auth.snapshot()
+  }
+
+  authClearCache(): AuthState {
+    return this.auth.clearCache()
+  }
+
   // ---- reconcile loop ----
   async startLoop(): Promise<void> {
+    // Probe auth before the first reconcile so a stale token gates kubectl
+    // from tick one instead of racing kubelogins at boot.
+    await this.auth.init().catch(() => undefined)
     this.rescan()
     await this.reconcileAll()
     this.timer = setInterval(() => {
       void this.reconcileAll()
     }, this.opts.reconcileMs)
+    this.authTimer = setInterval(() => {
+      void this.auth.maintain().catch(() => undefined)
+    }, AUTH_MAINTAIN_MS)
   }
 
   stopLoop(): void {
     if (this.timer) clearInterval(this.timer)
     this.timer = undefined
+    if (this.authTimer) clearInterval(this.authTimer)
+    this.authTimer = undefined
     for (const t of this.tailers.values()) t.stop()
-    for (const t of this.devTails.values()) t.stop()
   }
 }
 
