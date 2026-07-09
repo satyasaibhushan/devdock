@@ -23,6 +23,8 @@
 
   let repos = $state<RepoState[]>([])
   let selectedId = $state<string | null>(null)
+  // Sentinel selection for the host-machine terminal view (no repo attached).
+  const HOST_ID = '@host'
   // The repo whose startup-script modal is open, or null when none.
   let customizingId = $state<string | null>(null)
   const customizing = $derived(repos.find((r) => r.repo.id === customizingId) ?? null)
@@ -135,10 +137,11 @@
   const swl = $derived(wl ?? '')
   const sstatus = $derived(vstatus)
   // What the terminal would attach to (mirrors service.openTerminal): the tmux
-  // session, a pod shell, or nothing. Keying the terminal on this — instead of
-  // the raw status — keeps it connected across status flips that don't change
-  // the attach target (BUILDING → RUNNING_MANAGED, RUNNING → CRASHED), so it
-  // stops redialing mid-session.
+  // session, a pod shell, or nothing. Passed to TerminalPanel as a live prop —
+  // NOT part of its {#key}: this value can flap during reconciles, and keying
+  // on it remounted the whole panel, redialing every viewer socket (visible as
+  // all terminals flashing). The panel re-ensures its primary terminal itself
+  // when this changes.
   const sterm = $derived(
     !view ? 'none' : view.hasSession ? 'tmux' : view.pods.length ? 'pod' : 'none',
   )
@@ -203,19 +206,45 @@
 
 <main>
   <aside>
-    <RepoList
-      {repos}
-      {selectedId}
-      busyId={busy?.id ?? null}
-      busyVerb={busy?.verb ?? null}
-      onselect={(id) => (selectedId = id)}
-      onaction={(id, verb) => act(verb, id)}
-      oncustomize={(id) => (customizingId = id)}
-    />
+    <div class="repos">
+      <RepoList
+        {repos}
+        {selectedId}
+        busyId={busy?.id ?? null}
+        busyVerb={busy?.verb ?? null}
+        onselect={(id) => (selectedId = id)}
+        onaction={(id, verb) => act(verb, id)}
+        oncustomize={(id) => (customizingId = id)}
+      />
+    </div>
+    <button
+      class="hostbtn"
+      class:selected={selectedId === HOST_ID}
+      title="shells on this machine — shared with agents"
+      onclick={() => (selectedId = HOST_ID)}
+    >
+      <span class="hicon">❯_</span> host terminals
+    </button>
   </aside>
 
   <section class="detail">
-    {#if selected}
+    {#if selectedId === HOST_ID}
+      <div class="head">
+        <div class="title">
+          <h2>host</h2>
+          <span class="pill">local machine</span>
+        </div>
+      </div>
+      <div class="meta">
+        <span>login shells on this machine — the same host:t1/t2/… terminals agents use</span>
+      </div>
+      <div class="streams solo">
+        <div class="block">
+          <div class="bhead"><h3>Terminal</h3></div>
+          <TerminalPanel />
+        </div>
+      </div>
+    {:else if selected}
       <div class="head">
         <div class="title">
           <span class="dot {vstatus}"></span>
@@ -272,8 +301,8 @@
 
         <div class="block">
           <div class="bhead"><h3>Terminal</h3></div>
-          {#key sid + swl + sterm}
-            <TerminalPanel id={sid} workload={wl} attach={sterm} />
+          {#key sid + swl}
+            <TerminalPanel repo={sid} workload={wl} attach={sterm} />
           {/key}
         </div>
       </div>
@@ -362,6 +391,46 @@
   }
   aside {
     min-height: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  aside .repos {
+    flex: 1;
+    min-height: 0;
+  }
+  .hostbtn {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 9px 12px;
+    border: 1px dashed var(--line);
+    border-radius: 10px;
+    background: none;
+    color: var(--muted);
+    font-size: 12px;
+    cursor: pointer;
+    text-align: left;
+  }
+  .hostbtn:hover {
+    border-color: var(--accent);
+    color: var(--ink);
+  }
+  .hostbtn.selected {
+    border-style: solid;
+    border-color: var(--accent);
+    color: var(--ink);
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+  }
+  .hicon {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--accent);
+  }
+  /* Host view: the terminal block gets the whole column (no logs pane). */
+  .streams.solo {
+    grid-template-rows: 1fr;
   }
 
   .detail {

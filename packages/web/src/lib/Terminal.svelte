@@ -1,17 +1,35 @@
 <script lang="ts">
   import { FitAddon } from '@xterm/addon-fit'
   import { WebglAddon } from '@xterm/addon-webgl'
-  import { Terminal } from '@xterm/xterm'
-  import { openTerminal, sendResize } from './api'
+  import { Terminal, type IDisposable } from '@xterm/xterm'
+  import { onMount } from 'svelte'
+  import { attachTerminal, sendResize } from './api'
 
+  // A live viewer on a registered terminal: attaches by id, replays the
+  // scrollback, then streams. Closing this component only detaches the
+  // viewer — the terminal keeps running for other clients.
   let {
-    id,
+    tid,
     mode,
-    workload,
-    kind = 'auto',
-  }: { id: string; mode: 'ro' | 'rw'; workload?: string; kind?: 'auto' | 'shell' } = $props()
+    onclosed,
+  }: { tid: string; mode: 'ro' | 'rw'; onclosed?: () => void } = $props()
   let host: HTMLDivElement
   let error = $state<string | null>(null)
+  let ready = $state(false)
+  let term: Terminal | null = null
+  let fit: FitAddon | null = null
+  let ws: WebSocket | null = null
+  let cols = 0
+  let rows = 0
+  let needsReplay = true
+
+  // The connect effect below must key on the VALUES of tid/mode, not the raw
+  // prop reads: the panel rebuilds its TermInfo objects on every 4s poll, and
+  // a raw prop read tracks that parent object — re-running the effect (socket
+  // teardown + redial, a visible flash) even though the id never changed.
+  // $derived memoizes by value, so equal strings don't re-trigger.
+  const tidVal = $derived(tid)
+  const modeVal = $derived(mode)
 
   // xterm measures glyphs on a canvas, where CSS variables never resolve —
   // an unresolved var() breaks cell metrics (and the WebGL renderer). Resolve
@@ -20,19 +38,18 @@
     getComputedStyle(document.documentElement).getPropertyValue('--mono').trim() ||
     'ui-monospace, Menlo, Consolas, monospace'
 
-  $effect(() => {
-    error = null
+  onMount(() => {
     // NOTE: no `disableStdin` for read-only — it would also swallow the mouse
     // reports that make wheel-scrolling work (tmux mouse mode). Read-only is
     // enforced by only forwarding wheel reports (below), and again daemon-side.
-    const term = new Terminal({
+    term = new Terminal({
       fontFamily: monoStack(),
       fontSize: 12,
-      cursorBlink: mode === 'rw',
+      cursorBlink: modeVal === 'rw',
       scrollback: 5000,
       theme: { background: '#0b0f14', foreground: '#c9d6e2' },
     })
-    const fit = new FitAddon()
+    fit = new FitAddon()
     term.loadAddon(fit)
     term.open(host)
     // GPU renderer — the DOM renderer relayouts on every write and is the
@@ -47,10 +64,51 @@
     }
     fit.fit()
 
+    // Refit when the panel itself resizes (not just the window) and keep the
+    // daemon-side PTY in sync so tmux redraws at the real size.
+    cols = term.cols
+    rows = term.rows
+    const refit = () => {
+      fit?.fit()
+      if (!term) return
+      if (term.cols !== cols || term.rows !== rows) {
+        cols = term.cols
+        rows = term.rows
+        if (ws && ws.readyState === WebSocket.OPEN) sendResize(ws, cols, rows)
+      }
+    }
+    const ro = new ResizeObserver(refit)
+    ro.observe(host)
+    ready = true
+
+    return () => {
+      ready = false
+      ro.disconnect()
+      if (ws) {
+        ws.onclose = null // deliberate detach — not an exit the panel should react to
+        ws.close()
+      }
+      term?.dispose()
+      ws = null
+      term = null
+      fit = null
+    }
+  })
+
+  $effect(() => {
+    if (!ready || !term) return
+    error = null
+    term.options.cursorBlink = modeVal === 'rw'
+    fit?.fit()
+    cols = term.cols
+    rows = term.rows
+
     // Dial in at the fitted size so the PTY (and tmux) renders full-pane from
-    // the first frame instead of an 80x24 postage stamp.
-    const ws = openTerminal(id, mode, term.cols, term.rows, workload, kind)
-    ws.onmessage = (ev) => {
+    // the first frame instead of a 200x50 headless canvas.
+    const socket = attachTerminal(tidVal, modeVal, term.cols, term.rows, needsReplay)
+    needsReplay = false
+    ws = socket
+    socket.onmessage = (ev) => {
       const data = String(ev.data)
       // The daemon sends a JSON envelope when it can't attach a PTY.
       if (data.startsWith('{') && data.includes('"type":"error"')) {
@@ -64,39 +122,28 @@
           /* not an envelope — fall through and render */
         }
       }
-      term.write(data)
+      term?.write(data)
     }
-    ws.onerror = () => {
+    socket.onerror = () => {
       error = 'connection to daemon lost'
     }
+    // Daemon closed the stream: the PTY exited (or the terminal was closed by
+    // another client). Tell the panel so it can refresh its tab list.
+    socket.onclose = () => onclosed?.()
     // rw forwards everything; ro forwards only SGR mouse-wheel reports so the
     // attached tmux session can scroll its history — keystrokes never leave the
     // browser (and the daemon's broker drops anything but wheel reports anyway).
     const WHEEL_REPORT = /^(?:\x1b\[<6[45];\d+;\d+[Mm])+$/
-    term.onData((d) => {
-      if (mode === 'ro' && !WHEEL_REPORT.test(d)) return
-      if (ws.readyState === ws.OPEN) ws.send(d)
+    const dataListener: IDisposable = term.onData((d) => {
+      if (modeVal === 'ro' && !WHEEL_REPORT.test(d)) return
+      if (socket.readyState === WebSocket.OPEN) socket.send(d)
     })
 
-    // Refit when the panel itself resizes (not just the window) and keep the
-    // daemon-side PTY in sync so tmux redraws at the real size.
-    let cols = term.cols
-    let rows = term.rows
-    const refit = () => {
-      fit.fit()
-      if (term.cols !== cols || term.rows !== rows) {
-        cols = term.cols
-        rows = term.rows
-        if (ws.readyState === ws.OPEN) sendResize(ws, cols, rows)
-      }
-    }
-    const ro = new ResizeObserver(refit)
-    ro.observe(host)
-
     return () => {
-      ro.disconnect()
-      ws.close()
-      term.dispose()
+      dataListener.dispose()
+      socket.onclose = null // deliberate detach — not an exit the panel should react to
+      socket.close()
+      if (ws === socket) ws = null
     }
   })
 </script>
@@ -108,8 +155,8 @@
       <p class="title">Terminal unavailable</p>
       <p class="msg">{error}</p>
       <p class="hint">
-        Attaches the dev session — or a pod shell if the deployment was started outside devdock.
-        Nothing running? Start it first.
+        Terminals are shared daemon sessions — this one may have exited or been closed by
+        another client. Nothing running? Start it first.
       </p>
     </div>
   {/if}

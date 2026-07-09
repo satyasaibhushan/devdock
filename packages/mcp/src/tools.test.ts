@@ -46,25 +46,37 @@ function fakeClient(over: Partial<DaemonClient> = {}): DaemonClient {
     auth: async () => ({ oidc: true, phase: 'ok', checkedAt: 1 }),
     authLogin: async () => ({ oidc: true, phase: 'logging_in', checkedAt: 2 }),
     termList: async () => [
-      { id: 't1', kind: 'local', createdAt: 0, lastUsedAt: 0, alive: true },
       {
-        id: 't2',
+        id: 'host:t1',
+        kind: 'local',
+        attach: 'host',
+        createdAt: 0,
+        lastUsedAt: 0,
+        alive: true,
+        attached: 0,
+      },
+      {
+        id: 'svc-a.cron:t1',
         kind: 'shell',
         repo: 'svc-a',
         workload: 'cron',
+        attach: 'pod',
         createdAt: 0,
         lastUsedAt: 0,
         alive: false,
+        attached: 0,
       },
     ],
     termOpen: async (o) => ({
-      id: 't3',
+      id: o.repo ? `${o.repo}:t1` : 'host:t1',
       kind: o.kind ?? (o.repo ? 'auto' : 'local'),
       repo: o.repo,
       workload: o.workload,
+      attach: o.repo ? 'tmux' : 'host',
       createdAt: 0,
       lastUsedAt: 0,
       alive: true,
+      attached: 0,
     }),
     termRun: async () => ({ output: 'ran', timedOut: false }),
     termRead: async () => 'scrollback',
@@ -180,25 +192,27 @@ describe('tool handlers', () => {
   })
 
   it('term_open defaults to a local shell and reports the id', async () => {
-    expect(await tool('devdock_term_open').handler({})).toBe('opened t3 (local)')
+    expect(await tool('devdock_term_open').handler({})).toBe('opened host:t1 (local)')
     expect(await tool('devdock_term_open').handler({ repo: 'svc-a', kind: 'shell' })).toBe(
-      'opened t3 (shell on svc-a)',
+      'opened svc-a:t1 (shell on svc-a)',
     )
   })
 
   it('term_run returns output, flagging a timeout', async () => {
-    expect(await tool('devdock_term_run').handler({ terminal: 't1', command: 'ls' })).toBe('ran')
+    expect(await tool('devdock_term_run').handler({ terminal: 'host:t1', command: 'ls' })).toBe(
+      'ran',
+    )
     const slow = allTools(
       fakeClient({ termRun: async () => ({ output: 'partial', timedOut: true }) }),
     ).find((x) => x.name === 'devdock_term_run')
-    expect(await slow?.handler({ terminal: 't1', command: 'sleep 99' })).toContain(
+    expect(await slow?.handler({ terminal: 'host:t1', command: 'sleep 99' })).toContain(
       'still running after timeout',
     )
   })
 
   it('term_list renders one line per terminal', async () => {
     expect(await tool('devdock_term_list', 'ro').handler({})).toBe(
-      't1\tlocal\talive\nt2\tshell\tsvc-a/cron\texited',
+      'host:t1\tlocal\talive\nsvc-a.cron:t1\tshell\tsvc-a/cron\texited',
     )
   })
 

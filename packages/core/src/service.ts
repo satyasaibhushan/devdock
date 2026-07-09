@@ -4,6 +4,7 @@ import { EventEmitter } from 'node:events'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { AuthManager, type AuthState } from './auth.js'
+import { type AwsCredential, AwsCreds } from './awsCreds.js'
 import { CrashWatch } from './crashWatch.js'
 import { type RunResult, run, runStream, spawnStream } from './exec.js'
 import { LogHub, LogTailer, type SpawnFn } from './logTailer.js'
@@ -69,6 +70,8 @@ export interface ServiceDeps {
   streamSpawner?: SpawnFn
   /** Kubernetes OIDC login owner — injectable so tests can pin auth phases. */
   auth?: AuthManager
+  /** AWS/ECR credential warmer — injectable so tests can pin warm outcomes. */
+  awsCreds?: AwsCreds
 }
 
 export class Service {
@@ -104,8 +107,13 @@ export class Service {
   private timer?: NodeJS.Timeout
   private authTimer?: NodeJS.Timeout
   private readonly auth: AuthManager
-  /** Agent-opened terminals (MCP): id → live PTY session + scrollback. */
+  private readonly awsCreds: AwsCreds
+  /** All terminals: id → live PTY session + scrollback (spec §8). */
   private readonly terms = new TermRegistry()
+  /** In-flight `auto` terminal opens by workload key — concurrent requests
+   *  (two browser tabs, an agent and the UI) share one open instead of racing
+   *  the tmux write-lock. */
+  private readonly pendingTermOpens = new Map<string, Promise<TermInfo>>()
 
   constructor(opts: ServiceOptions = {}, deps: ServiceDeps = {}) {
     this.opts = {
@@ -115,6 +123,10 @@ export class Service {
     }
     const baseRunner = deps.runner ?? run
     this.auth = deps.auth ?? new AuthManager({ runner: baseRunner })
+    // With an injected (test) runner, default to a disabled warmer — unit tests
+    // must never read the machine's ~/.aws-cli-oidc config or mint credentials.
+    this.awsCreds =
+      deps.awsCreds ?? (deps.runner ? new AwsCreds({ oidcConfigPath: null }) : new AwsCreds())
     // Every kubectl that talks to the API server goes through the auth gate:
     // with a stale OIDC token, each such call would spawn its own kubelogin —
     // all racing to bind localhost:8040 and each opening a browser tab. Gated,
@@ -232,9 +244,28 @@ export class Service {
     return { code: 1, stdout: '', stderr: `kubernetes auth: ${detail}` }
   }
 
+  /** Verb gate #2, for the verbs that spawn devspace deploys: repos' devspace
+   *  config shells out to `aws ecr get-login-password`, whose profile reads
+   *  the daemon-minted credential (via the devdock-aws-cred shim). The daemon
+   *  refreshes it silently through the OIDC refresh token — a browser sign-in
+   *  happens only when that token is gone/expired, and single-flight even then. */
+  private async ensureAwsCreds(key: string): Promise<RunResult | null> {
+    const quiet = !this.awsCreds.configured() || this.awsCreds.fresh()
+    const hub = this.hubFor(key)
+    if (!quiet) hub.push('! AWS credential being refreshed')
+    const r = await this.awsCreds.warm()
+    if (r.ok) {
+      if (!quiet) hub.push('✓ aws auth ok')
+      return null
+    }
+    const detail = r.message ?? 'aws login required'
+    hub.push(`✗ ${detail}`)
+    return { code: 1, stdout: '', stderr: `aws auth: ${detail}` }
+  }
+
   async start(id: string, workload?: string): Promise<RunResult> {
     const { repo: scopedRepo, key } = this.scoped(id, workload)
-    const denied = await this.ensureAuth(key)
+    const denied = (await this.ensureAuth(key)) ?? (await this.ensureAwsCreds(key))
     if (denied) return denied
     let repo = scopedRepo
     // First start of an un-namespaced repo: run it against the kube context's
@@ -275,7 +306,7 @@ export class Service {
 
   async build(id: string, workload?: string): Promise<RunResult> {
     const { repo, key } = this.scoped(id, workload)
-    const denied = await this.ensureAuth(key)
+    const denied = (await this.ensureAuth(key)) ?? (await this.ensureAwsCreds(key))
     if (denied) return denied
     const r = await this.narrate(key, verbLabel(repo, 'deploy'), (onLine) =>
       this.supervisor.build(repo, onLine),
@@ -767,12 +798,16 @@ export class Service {
     throw new Error(`${id} has no running pod to open a shell into — start it first`)
   }
 
-  // ---- registered terminals (spec §8 — the MCP's terminal surface) ----
-  // Headless terminals: opened wide (no attached viewer to fit to), tracked by
-  // id in the registry so request/response clients can run/read/close them.
+  // ---- registered terminals (spec §8 — the ONLY terminal surface) ----
+  // Every terminal lives in the registry under an id: agents drive them
+  // request/response (run/read), the web UI attaches to the same sessions
+  // live. Opened wide (200x50) — an attaching viewer resizes to fit.
 
   /** Open a terminal and register it. `local` spawns a login shell on the
-   *  devdock host; `auto`/`shell` open the workload's dev session / pod shell. */
+   *  devdock host; `auto`/`shell` open the workload's dev session / pod shell.
+   *  `auto` is the workload's ONE primary terminal: concurrent and repeated
+   *  opens return the existing terminal instead of racing a second attach
+   *  into the same tmux session (whose write-lock the first one holds). */
   async openRegisteredTerminal(opts: {
     repo?: string
     workload?: string
@@ -782,11 +817,48 @@ export class Service {
     const kind = opts.kind ?? (opts.repo ? 'auto' : 'local')
     if (kind === 'local') {
       const session = await this.broker.openLocal('rw', 200, 50, opts.cwd)
-      return this.terms.add({ kind }, session)
+      return this.terms.add({ kind, attach: 'host' }, session)
     }
-    if (!opts.repo) throw new Error(`repo required for a ${kind} terminal`)
-    const session = await this.openTerminal(opts.repo, 'rw', 200, 50, opts.workload, kind)
-    return this.terms.add({ kind, repo: opts.repo, workload: opts.workload }, session)
+    const repoId = opts.repo
+    if (!repoId) throw new Error(`repo required for a ${kind} terminal`)
+    // Store the RESOLVED workload type so every client (UI picking 'api',
+    // an agent omitting the default) lands on the same terminal identity.
+    const { type, key } = this.scoped(repoId, opts.workload)
+    if (kind !== 'auto') {
+      return this.terms.add(
+        { kind, repo: repoId, workload: type, attach: 'pod' },
+        await this.openTerminal(repoId, 'rw', 200, 50, type, kind),
+      )
+    }
+    const pending = this.pendingTermOpens.get(key)
+    if (pending) return pending
+    const p = this.openAutoTerminal(repoId, type, key).finally(() => {
+      this.pendingTermOpens.delete(key)
+    })
+    this.pendingTermOpens.set(key, p)
+    return p
+  }
+
+  /** The reuse-or-create path for a workload's primary terminal. A live auto
+   *  terminal is reused only while it still points at the right target — a
+   *  pod-shell fallback goes stale once a managed tmux session appears (and
+   *  vice versa), in which case it's closed and replaced. */
+  private async openAutoTerminal(repoId: string, type: string | undefined, key: string) {
+    const { repo } = this.scoped(repoId, type)
+    const attach = (await this.supervisor.hasSession(repo)) ? ('tmux' as const) : ('pod' as const)
+    const existing = this.terms.findLive('auto', repoId, type)
+    if (existing) {
+      if (existing.attach === attach) return existing
+      this.terms.close(existing.id)
+    }
+    const session = await this.openTerminal(repoId, 'rw', 200, 50, type, 'auto')
+    return this.terms.add({ kind: 'auto', repo: repoId, workload: type, attach }, session)
+  }
+
+  /** Attach a live viewer (a web terminal socket) to a registered terminal:
+   *  scrollback replay + live stream; per-viewer ro/rw. */
+  attachTerminal(id: string, mode: TermMode, watcher: Parameters<TermRegistry['attach']>[2]) {
+    return this.terms.attach(id, mode, watcher)
   }
 
   listTerminals(): TermInfo[] {
@@ -819,6 +891,14 @@ export class Service {
 
   authClearCache(): AuthState {
     return this.auth.clearCache()
+  }
+
+  // ---- AWS credential (owned by AwsCreds, surfaced over /aws/credential) ----
+  /** Mint/serve the credential_process payload. Blocks through one silent
+   *  refresh — or one shared browser sign-in — because the caller is an
+   *  `aws` process that cannot proceed without it. */
+  awsCredential(): Promise<{ ok: true; cred: AwsCredential } | { ok: false; message: string }> {
+    return this.awsCreds.credential()
   }
 
   // ---- reconcile loop ----

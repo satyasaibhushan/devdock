@@ -150,7 +150,7 @@ describe('daemon routes', () => {
     const opened = await app.inject({ method: 'POST', url: '/terminals', payload: {} })
     expect(opened.statusCode).toBe(200)
     const tid = opened.json().id
-    expect(tid).toBe('t1')
+    expect(tid).toBe('host:t1')
     expect(opened.json()).toMatchObject({ kind: 'local', alive: true })
 
     const list = await app.inject({ method: 'GET', url: '/terminals' })
@@ -228,5 +228,40 @@ describe('daemon routes', () => {
     const clear = await app.inject({ method: 'POST', url: '/auth/clear' })
     expect(clear.json().phase).toBe('login_required')
     expect(auth.clearCache).toHaveBeenCalled()
+  })
+
+  it('GET /aws/credential serves the minted credential_process payload', async () => {
+    const cred = {
+      Version: 1,
+      AccessKeyId: 'AKIA',
+      SecretAccessKey: 's',
+      SessionToken: 't',
+      Expiration: new Date(Date.now() + 3600_000).toISOString(),
+    }
+    const awsCreds = {
+      credential: vi.fn(async () => ({ ok: true, cred })),
+    }
+    const svc = new Service(
+      { roots: [root], stateFile: join(root, 'state.json') },
+      { runner: vi.fn(async () => ({ code: 0, stdout: '', stderr: '' })), awsCreds: awsCreds as never },
+    )
+    const app = buildApp(svc)
+    const res = await app.inject({ method: 'GET', url: '/aws/credential' })
+    expect(res.statusCode).toBe(200)
+    expect(res.json()).toEqual(cred)
+  })
+
+  it('GET /aws/credential maps a failed mint to 503 + the reason', async () => {
+    const awsCreds = {
+      credential: vi.fn(async () => ({ ok: false, message: 'sign-in did not complete' })),
+    }
+    const svc = new Service(
+      { roots: [root], stateFile: join(root, 'state.json') },
+      { runner: vi.fn(async () => ({ code: 0, stdout: '', stderr: '' })), awsCreds: awsCreds as never },
+    )
+    const app = buildApp(svc)
+    const res = await app.inject({ method: 'GET', url: '/aws/credential' })
+    expect(res.statusCode).toBe(503)
+    expect(res.json().error).toContain('sign-in')
   })
 })

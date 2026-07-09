@@ -71,6 +71,8 @@ export {
   RUN_MAX_TIMEOUT_MS,
   type TermInfo,
   type TermKind,
+  type TermAttachTarget,
+  type TermAttachment,
   type RunOutcome,
 } from './termRegistry.js'
 export {
@@ -82,5 +84,11 @@ export {
   type AuthRunner,
   type AuthManagerOptions,
 } from './auth.js'
+export {
+  AwsCreds,
+  type AwsCredential,
+  type AwsCredsOptions,
+  type WarmResult,
+} from './awsCreds.js'
 
 export const version = '0.0.0'

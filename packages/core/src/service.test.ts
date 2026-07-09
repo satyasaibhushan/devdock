@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { AuthManager } from './auth.js'
+import type { AwsCreds } from './awsCreds.js'
 import { type RunResult, loginShell } from './exec.js'
 import type { SpawnFn } from './logTailer.js'
 import { PtyBroker } from './ptyBroker.js'
@@ -388,6 +389,104 @@ describe('Service', () => {
     expect(spawns[1]?.args).toEqual(['enter', '--pod', 'svc-a-devspace-1', '--wait', '-n', 'ns'])
   })
 
+  it('reuses the one auto terminal across concurrent and repeated opens', async () => {
+    const podsJson = JSON.stringify({
+      items: [
+        {
+          metadata: { name: 'svc-a-devspace-1' },
+          status: { phase: 'Running', containerStatuses: [{ ready: true, restartCount: 0 }] },
+        },
+      ],
+    })
+    const spawns: string[] = []
+    const broker = new PtyBroker((file) => {
+      spawns.push(file)
+      return {
+        onData: () => {},
+        onExit: () => {},
+        write: () => {},
+        resize: () => {},
+        kill: () => {},
+      }
+    })
+    const svc = new Service(
+      { roots: [root], stateFile },
+      { runner: cannedRunner(podsJson, true), broker },
+    )
+    svc.rescan()
+    await svc.reconcileAll()
+
+    // Concurrent opens (UI tab + agent racing) single-flight into one terminal…
+    const [a, b] = await Promise.all([
+      svc.openRegisteredTerminal({ repo: 'svc-a', kind: 'auto' }),
+      svc.openRegisteredTerminal({ repo: 'svc-a', kind: 'auto' }),
+    ])
+    expect(a.id).toBe(b.id)
+    expect(a.attach).toBe('tmux')
+    // …and a later open finds the live one instead of spawning again.
+    const c = await svc.openRegisteredTerminal({ repo: 'svc-a', kind: 'auto' })
+    expect(c.id).toBe(a.id)
+    expect(spawns).toEqual(['tmux'])
+  })
+
+  it('replaces a stale pod-shell auto terminal once a managed session appears', async () => {
+    const podsJson = JSON.stringify({
+      items: [
+        {
+          metadata: { name: 'svc-a-devspace-1' },
+          status: { phase: 'Running', containerStatuses: [{ ready: true, restartCount: 0 }] },
+        },
+      ],
+    })
+    let sessionExists = false
+    const runner = vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
+      if (cmd === 'tmux' && args[0] === 'has-session')
+        return { code: sessionExists ? 0 : 1, stdout: '', stderr: '' }
+      if (cmd === 'tmux' && args[0] === 'list-panes')
+        return { code: 0, stdout: sessionExists ? 'devdock-svc-a 0\n' : '', stderr: '' }
+      if (cmd === 'kubectl' && args[0] === 'get')
+        return {
+          code: 0,
+          stdout: args[1] === 'deployments' ? '{"items":[]}' : podsJson,
+          stderr: '',
+        }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+    const spawns: string[] = []
+    const broker = new PtyBroker((file) => {
+      spawns.push(file)
+      return {
+        onData: () => {},
+        onExit: () => {},
+        write: () => {},
+        resize: () => {},
+        kill: () => {},
+      }
+    })
+    const svc = new Service({ roots: [root], stateFile }, { runner, broker })
+    svc.rescan()
+    await svc.reconcileAll()
+
+    // No managed session yet → the primary falls back to a pod shell.
+    const first = await svc.openRegisteredTerminal({ repo: 'svc-a', kind: 'auto' })
+    expect(first.attach).toBe('pod')
+    expect(spawns).toEqual(['devspace'])
+
+    // A dev session appears (workload started): the pod-shell primary is stale —
+    // the next open closes it and attaches the tmux session instead.
+    sessionExists = true
+    const second = await svc.openRegisteredTerminal({ repo: 'svc-a', kind: 'auto' })
+    expect(second.id).not.toBe(first.id)
+    expect(second.attach).toBe('tmux')
+    expect(spawns).toEqual(['devspace', 'tmux'])
+    expect(
+      svc
+        .listTerminals()
+        .filter((t) => t.alive)
+        .map((t) => t.id),
+    ).toEqual([second.id])
+  })
+
   it('narrates verb activity into the repo logs, even with no pods', async () => {
     const svc = new Service(
       { roots: [root], stateFile },
@@ -650,6 +749,43 @@ describe('Service', () => {
     expect(runner.mock.calls.some((c) => c[0] === 'tmux' && c[1][0] === 'new-session')).toBe(false)
     // …and the failure is narrated into the workload's log hub
     expect(svc.logs('svc-a').some((l) => l.includes('office network'))).toBe(true)
+  })
+
+  it('refuses start/build while the AWS credential cannot be warmed', async () => {
+    const runner = cannedRunner('{"items":[]}', false)
+    const awsCreds = {
+      configured: () => true,
+      fresh: () => false,
+      warm: async () => ({ ok: false, message: 'AWS sign-in did not complete in time' }),
+    } as unknown as AwsCreds
+    const svc = new Service({ roots: [root], stateFile }, { runner, awsCreds })
+    svc.rescan()
+    for (const r of [await svc.start('svc-a'), await svc.build('svc-a')]) {
+      expect(r.code).toBe(1)
+      expect(r.stderr).toContain('aws auth')
+    }
+    // the verb never reached tmux/devspace — no racing aws-cli-oidc logins
+    expect(runner.mock.calls.some((c) => c[0] === 'tmux' && c[1][0] === 'new-session')).toBe(false)
+    expect(svc.logs('svc-a').some((l) => l.includes('did not complete in time'))).toBe(true)
+  })
+
+  it('starts normally once the AWS credential warms', async () => {
+    const runner = cannedRunner('{"items":[]}', false)
+    const warm = vi.fn(async () => ({ ok: true }))
+    const awsCreds = {
+      configured: () => true,
+      fresh: () => false,
+      warm,
+    } as unknown as AwsCreds
+    const svc = new Service(
+      { roots: [root], stateFile },
+      { runner, awsCreds, streamSpawner: fakeStreamSpawner().spawner },
+    )
+    svc.rescan()
+    const r = await svc.start('svc-a')
+    expect(r.code).toBe(0)
+    expect(warm).toHaveBeenCalledTimes(1)
+    expect(runner.mock.calls.some((c) => c[0] === 'tmux' && c[1][0] === 'new-session')).toBe(true)
   })
 
   it('gates reconcile kubectl calls through the auth manager', async () => {

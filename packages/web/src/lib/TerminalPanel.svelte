@@ -1,69 +1,121 @@
 <script lang="ts">
+  import { createTerminal, deleteTerminal, fetchTerminals, type TermInfo } from './api'
   import Terminal from './Terminal.svelte'
 
+  // Tabs mirror the daemon's terminal registry — the same scope-qualified
+  // sessions (`repo:t1`, `repo.workload:t1`, `host:t1`) agents open over MCP
+  // show up here, and terminals opened here are visible to agents. The panel
+  // only decides which ones belong to it:
+  //  - repo mode (repo set): this workload's terminals (the auto primary +
+  //    any pod shells), ensured to have a primary while something runs.
+  //  - host mode (repo unset): `local` login shells on the devdock machine.
+  //
   // `attach` mirrors the daemon's attach target for the active workload:
   //  'tmux' → a managed dev session exists, 'pod' → only a pod shell, 'none' →
-  //  nothing to attach. The panel is keyed on it in App, so a change in target
-  //  remounts the panel and resets tabs.
+  //  nothing to attach. It's a live prop (the panel is NOT keyed on it — that
+  //  remounted every viewer socket on each flap, flashing all terminals);
+  //  instead ensurePrimary reacts to changes and re-ensures the primary
+  //  against the new target while every other tab keeps streaming.
   let {
-    id,
+    repo,
     workload,
-    attach,
-  }: { id: string; workload?: string; attach: 'tmux' | 'pod' | 'none' } = $props()
+    attach = 'none',
+  }: { repo?: string; workload?: string; attach?: 'tmux' | 'pod' | 'none' } = $props()
 
-  type Tab = { uid: number; kind: 'auto' | 'shell'; mode: 'ro' | 'rw' }
-
-  let seq = 0
-  const makeTab = (kind: 'auto' | 'shell', mode: 'ro' | 'rw'): Tab => ({ uid: seq++, kind, mode })
-
-  let tabs = $state<Tab[]>([])
-  let activeUid = $state<number>(-1)
+  let terms = $state<TermInfo[]>([])
+  let activeTid = $state<string | null>(null)
   let full = $state(false)
+  let createError = $state<string | null>(null)
+  // Per-viewer ro/rw, by terminal id. THIS browser's choice only — another
+  // window (or an agent) can be writing to the same terminal regardless.
+  let viewer = $state<Record<string, 'ro' | 'rw'>>({})
 
-  // Seed the primary terminal once on mount (auto attach — dev session or pod
-  // shell — read-only, the pre-tabs behavior). One-shot: the panel is remounted
-  // when the attach target changes (App keys on it), and not re-seeding lets the
-  // empty state stick if the user closes every tab.
-  let seeded = false
-  $effect(() => {
-    if (seeded || attach === 'none') return
-    seeded = true
-    const t = makeTab('auto', 'ro')
-    tabs = [t]
-    activeUid = t.uid
-  })
+  const mine = (t: TermInfo): boolean =>
+    repo
+      ? t.repo === repo && (t.workload ?? '') === (workload ?? '')
+      : t.kind === 'local'
 
-  const active = $derived(tabs.find((t) => t.uid === activeUid) ?? null)
-  // Independent pod shells need a running pod; the primary tmux session doesn't.
-  const canAddShell = $derived(attach !== 'none')
-
-  function add() {
-    if (!canAddShell) return
-    // Every extra terminal is an independent `devspace enter` shell into the pod,
-    // opened read-write — that's the point of a second terminal.
-    const t = makeTab('shell', 'rw')
-    tabs = [...tabs, t]
-    activeUid = t.uid
+  async function refresh() {
+    try {
+      const all = await fetchTerminals()
+      terms = all
+        .filter((t) => t.alive && mine(t))
+        .sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id))
+      if (!terms.some((t) => t.id === activeTid)) activeTid = terms.at(-1)?.id ?? null
+    } catch {
+      /* daemon offline — keep showing what we had */
+    }
   }
 
-  function close(uid: number) {
-    const i = tabs.findIndex((t) => t.uid === uid)
-    if (i === -1) return
-    tabs = tabs.filter((t) => t.uid !== uid)
-    if (activeUid === uid) activeUid = tabs[Math.max(0, i - 1)]?.uid ?? -1
+  // Ensure the workload's primary terminal exists and matches the attach
+  // target (the daemon dedupes `auto` opens and swaps a stale pod shell for
+  // the dev session itself — we just ask again when the target moves).
+  // `lastEnsure` remembers the exact situation we last acted on, so if the
+  // daemon disagrees with our `attach` prop we don't re-POST every poll.
+  let lastEnsure = ''
+  async function ensurePrimary() {
+    if (!repo || attach === 'none') return
+    const cur = terms.find((t) => t.kind === 'auto')
+    if (cur && cur.attach === attach) return
+    const key = cur ? `${cur.id}:${cur.attach}->${attach}` : `none->${attach}`
+    if (key === lastEnsure) return
+    lastEnsure = key
+    try {
+      await createTerminal({ repo, workload, kind: 'auto' })
+      await refresh()
+    } catch (e) {
+      createError = e instanceof Error ? e.message : String(e)
+    }
+  }
+
+  $effect(() => {
+    void attach // re-ensure immediately when the attach target changes
+    refresh().then(ensurePrimary)
+    const poll = setInterval(() => refresh().then(ensurePrimary), 4000)
+    return () => clearInterval(poll)
+  })
+
+  const active = $derived(terms.find((t) => t.id === activeTid) ?? null)
+  const canAdd = $derived(!repo || attach !== 'none')
+
+  // A fresh terminal opens read-only for the shared dev session (look, don't
+  // touch) and read-write for shells you explicitly opened to type into.
+  const modeOf = (t: TermInfo): 'ro' | 'rw' => viewer[t.id] ?? (t.kind === 'auto' ? 'ro' : 'rw')
+
+  async function add() {
+    if (!canAdd) return
+    createError = null
+    try {
+      const t = await createTerminal(repo ? { repo, workload, kind: 'shell' } : { kind: 'local' })
+      await refresh()
+      activeTid = t.id
+    } catch (e) {
+      createError = e instanceof Error ? e.message : String(e)
+    }
+  }
+
+  // Close for everyone — the daemon kills the PTY, agents lose it too.
+  async function close(tid: string) {
+    try {
+      await deleteTerminal(tid)
+    } catch {
+      /* already gone */
+    }
+    await refresh()
   }
 
   function setMode(mode: 'ro' | 'rw') {
-    if (active) active.mode = mode
+    if (active) viewer = { ...viewer, [active.id]: mode }
   }
 
-  // A tab's label: the primary session (the `devspace dev` output, or a pod
-  // shell when the deployment runs outside devdock) vs numbered `devspace enter`
-  // shells.
-  function label(t: Tab): string {
-    if (t.kind === 'auto') return attach === 'tmux' ? 'devspace dev' : 'pod shell'
-    return `enter ${tabs.filter((x) => x.kind === 'shell').indexOf(t) + 1}`
+  function label(t: TermInfo): string {
+    if (t.kind === 'auto') return t.attach === 'tmux' ? 'devspace dev' : 'pod shell'
+    return t.kind === 'shell' ? 'enter' : 'shell'
   }
+
+  // Badge shows just the per-scope number — the panel already names the scope.
+  // The tooltip keeps the full id agents use.
+  const shortId = (t: TermInfo): string => t.id.slice(t.id.lastIndexOf(':t') + 2)
 
   function onkey(e: KeyboardEvent) {
     if (e.key === 'Escape' && full) full = false
@@ -75,17 +127,15 @@
 <div class="panel" class:full>
   <div class="tabs">
     <div class="strip">
-      {#each tabs as t (t.uid)}
-        <div class="tab" class:active={t.uid === activeUid} class:primary={t.kind === 'auto'}>
-          <button class="tablabel" onclick={() => (activeUid = t.uid)} title={label(t)}>
-            <span class="tdot {t.mode}"></span>
+      {#each terms as t (t.id)}
+        <div class="tab" class:active={t.id === activeTid} class:primary={t.kind === 'auto'}>
+          <button class="tablabel" onclick={() => (activeTid = t.id)} title="{label(t)} — terminal {t.id}, shared with agents">
+            <span class="tdot {modeOf(t)}"></span>
             <span class="name">{label(t)}</span>
-            <span class="badge {t.kind === 'auto' ? 'primary' : 'enter'}">
-              {t.kind === 'auto' ? 'primary' : 'enter'}
-            </span>
+            <span class="badge {t.kind === 'auto' ? 'primary' : 'enter'}">{shortId(t)}</span>
           </button>
           {#if t.kind !== 'auto'}
-            <button class="x" title="close" aria-label="close terminal" onclick={() => close(t.uid)}
+            <button class="x" title="close for all clients" aria-label="close terminal" onclick={() => close(t.id)}
               >×</button
             >
           {/if}
@@ -93,8 +143,8 @@
       {/each}
       <button
         class="add"
-        title="new devspace enter shell into this pod"
-        disabled={!canAddShell}
+        title={repo ? 'new devspace enter shell into this pod' : 'new shell on this machine'}
+        disabled={!canAdd}
         onclick={add}>+</button
       >
     </div>
@@ -102,8 +152,8 @@
     <div class="tools">
       {#if active}
         <div class="modes">
-          <button class:active={active.mode === 'ro'} onclick={() => setMode('ro')}>read-only</button>
-          <button class:active={active.mode === 'rw'} onclick={() => setMode('rw')}>read-write</button>
+          <button class:active={modeOf(active) === 'ro'} onclick={() => setMode('ro')}>read-only</button>
+          <button class:active={modeOf(active) === 'rw'} onclick={() => setMode('rw')}>read-write</button>
         </div>
       {/if}
       <button class="full-btn" title={full ? 'restore' : 'expand to full screen'} onclick={() => (full = !full)}>
@@ -113,21 +163,23 @@
   </div>
 
   <div class="screens">
-    {#if tabs.length === 0}
+    {#if terms.length === 0}
       <div class="empty">
-        <p>No terminal open.</p>
-        {#if canAddShell}
+        {#if createError}
+          <p class="err">{createError}</p>
+        {:else}
+          <p>No terminal open.</p>
+        {/if}
+        {#if canAdd}
           <button onclick={add}>+ open a shell</button>
         {:else}
           <p class="hint">Nothing running — start the workload first.</p>
         {/if}
       </div>
     {:else}
-      {#each tabs as t (t.uid)}
-        <div class="screen" class:shown={t.uid === activeUid}>
-          {#key t.uid + t.mode + t.kind}
-            <Terminal {id} mode={t.mode} {workload} kind={t.kind} />
-          {/key}
+      {#each terms as t (t.id)}
+        <div class="screen" class:shown={t.id === activeTid}>
+          <Terminal tid={t.id} mode={modeOf(t)} onclosed={refresh} />
         </div>
       {/each}
     {/if}
@@ -199,9 +251,11 @@
   .tab.active .tablabel {
     color: var(--ink);
   }
+  /* The terminal's per-scope number (1, 2, …); the tooltip carries the full
+     scope-qualified id agents see. */
   .badge {
+    font-family: var(--mono);
     font-size: 9px;
-    text-transform: uppercase;
     letter-spacing: 0.04em;
     line-height: 1;
     padding: 2px 5px;
@@ -209,7 +263,6 @@
     border: 1px solid var(--line);
     color: var(--muted);
   }
-  /* primary = the can't-close devspace dev tab; enter = a devspace enter shell. */
   .badge.primary {
     color: var(--accent);
     border-color: color-mix(in srgb, var(--accent) 40%, transparent);
@@ -289,8 +342,8 @@
   .screen {
     position: absolute;
     inset: 0;
-    /* Kept mounted but hidden when inactive so its session (and scrollback)
-       survives a tab switch — and stays sized so xterm's fit stays correct. */
+    /* Kept mounted but hidden when inactive so its viewer socket survives a
+       tab switch — and stays sized so xterm's fit stays correct. */
     visibility: hidden;
     pointer-events: none;
   }
@@ -312,5 +365,13 @@
   .empty .hint {
     font-size: 12px;
     margin: 0;
+  }
+  .empty .err {
+    font-size: 12px;
+    margin: 0;
+    color: var(--danger);
+    font-family: var(--mono);
+    max-width: 80%;
+    text-align: center;
   }
 </style>

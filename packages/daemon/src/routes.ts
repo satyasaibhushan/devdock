@@ -49,6 +49,17 @@ export function buildApp(service: Service): FastifyInstance {
   app.post('/auth/login', async () => service.authLogin())
   app.post('/auth/clear', async () => service.authClearCache())
 
+  // AWS credential, owned by the daemon: minted silently via the OIDC refresh
+  // token when possible, ONE shared browser sign-in when not. Serves the
+  // credential_process JSON that the devdock-aws-cred shim (wired into
+  // ~/.aws/config) relays to aws/devspace/docker. Deliberately blocking — the
+  // caller is an `aws` process that cannot proceed without it.
+  app.get('/aws/credential', async (_req, reply) => {
+    const r = await service.awsCredential()
+    if (!r.ok) return reply.code(503).send({ error: r.message })
+    return r.cred
+  })
+
   app.get('/repos', async () => service.list())
 
   app.get<{ Params: { id: string } }>('/repos/:id', async (req, reply) => {

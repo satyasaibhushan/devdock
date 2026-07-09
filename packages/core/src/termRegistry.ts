@@ -1,8 +1,11 @@
-// termRegistry — daemon-owned terminal sessions with ids and scrollback, so
-// request/response clients (the MCP) can open a terminal, send commands, and
-// read what happened. The registry never spawns PTYs itself; callers hand it
-// TermSessions from the PtyBroker.
-import type { TermSession } from './ptyBroker.js'
+// termRegistry — daemon-owned terminal sessions with ids and scrollback. This
+// is the ONLY kind of terminal devdock has: the MCP drives them
+// request/response (run/read), and interactive viewers (the web UI) attach to
+// the same sessions live via subscribe/write — so every terminal is visible
+// to every client, none is private to one browser tab. The registry never
+// spawns PTYs itself; callers hand it TermSessions from the PtyBroker.
+import { type TermSession, isWheelReport } from './ptyBroker.js'
+import type { TermMode } from './types.js'
 
 /** How long a terminal may sit unused (no run/read) before the sweep reaps
  *  it — agent-opened terminals must not pile up forever. */
@@ -21,6 +24,9 @@ const RUN_DEFAULT_TIMEOUT_MS = 20_000
 export const RUN_MAX_TIMEOUT_MS = 120_000
 
 export type TermKind = 'auto' | 'shell' | 'local'
+/** What the terminal's PTY is actually connected to: the repo's tmux dev
+ *  session, a `devspace enter` pod shell, or a login shell on the host. */
+export type TermAttachTarget = 'tmux' | 'pod' | 'host'
 
 export interface TermInfo {
   id: string
@@ -28,10 +34,24 @@ export interface TermInfo {
   repo?: string
   workload?: string
   kind: TermKind
+  attach: TermAttachTarget
   createdAt: number
   lastUsedAt: number
   /** False once the underlying PTY exited; scrollback stays readable until reaped. */
   alive: boolean
+  /** Live viewers currently attached (web terminals streaming this session). */
+  attached: number
+}
+
+/** A live viewer's handle on a terminal (what a web terminal socket holds). */
+export interface TermAttachment {
+  /** Raw scrollback at attach time — write it to the viewer before live data. */
+  replay: string
+  /** Forward viewer input. `ro` attachments let mouse-wheel reports through
+   *  (scrolling) and drop everything else — same rule the broker applies. */
+  write(data: string): void
+  resize(cols: number, rows: number): void
+  detach(): void
 }
 
 export interface RunOutcome {
@@ -62,41 +82,102 @@ export function renderPtyText(raw: string): string {
     .join('\n')
 }
 
+interface Watcher {
+  onData: (data: string) => void
+  onExit?: () => void
+}
+
 interface Entry {
   info: TermInfo
   session: TermSession
   buffer: string
   /** True while a `run` is collecting output — one at a time per terminal. */
   running: boolean
+  /** Live viewers streaming this session (web terminal sockets). */
+  watchers: Set<Watcher>
 }
 
 export class TermRegistry {
   private readonly entries = new Map<string, Entry>()
-  private seq = 0
+  /** Per-scope counters: each repo/workload (and the host) numbers its own
+   *  terminals t1, t2, … so ids read naturally inside one workload's panel. */
+  private readonly seq = new Map<string, number>()
 
-  /** Track a freshly opened session under a new id. The registry owns the
-   *  onData subscription; scrollback and run-capture both feed off the buffer. */
-  add(meta: { repo?: string; workload?: string; kind: TermKind }, session: TermSession): TermInfo {
-    const id = `t${++this.seq}`
+  /** Track a freshly opened session under a new id. Ids are scope-qualified
+   *  (`jobs-ui:t1`, `repo.workload:t1`, `host:t1`) — globally unique for
+   *  agents, while the short `tN` tail numbers within the workload. The
+   *  registry owns the onData subscription; scrollback, run-capture and
+   *  attached viewers all feed off that one stream. */
+  add(
+    meta: { repo?: string; workload?: string; kind: TermKind; attach: TermAttachTarget },
+    session: TermSession,
+  ): TermInfo {
+    const scope = meta.repo ? (meta.workload ? `${meta.repo}.${meta.workload}` : meta.repo) : 'host'
+    const n = (this.seq.get(scope) ?? 0) + 1
+    this.seq.set(scope, n)
+    const id = `${scope}:t${n}`
     const now = Date.now()
     const entry: Entry = {
-      info: { id, ...meta, createdAt: now, lastUsedAt: now, alive: true },
+      info: { id, ...meta, createdAt: now, lastUsedAt: now, alive: true, attached: 0 },
       session,
       buffer: '',
       running: false,
+      watchers: new Set(),
     }
     session.onData((data) => {
       entry.buffer = (entry.buffer + data).slice(-SCROLLBACK_BYTES)
+      for (const w of entry.watchers) w.onData(data)
     })
     session.onExit?.(() => {
       entry.info.alive = false
+      for (const w of entry.watchers) w.onExit?.()
     })
     this.entries.set(id, entry)
-    return { ...entry.info }
+    return this.snapshot(entry)
   }
 
   list(): TermInfo[] {
-    return [...this.entries.values()].map((e) => ({ ...e.info }))
+    return [...this.entries.values()].map((e) => this.snapshot(e))
+  }
+
+  /** The first live terminal matching (kind, repo, workload) — how `auto`
+   *  terminals are deduped so the UI and agents share one dev-session view. */
+  findLive(kind: TermKind, repo?: string, workload?: string): TermInfo | undefined {
+    for (const e of this.entries.values()) {
+      if (!e.info.alive) continue
+      if (e.info.kind === kind && e.info.repo === repo && e.info.workload === workload) {
+        return this.snapshot(e)
+      }
+    }
+    return undefined
+  }
+
+  /**
+   * Attach a live viewer: replay the scrollback, then stream every subsequent
+   * byte to `onData`. Attaching doesn't lock anything — any number of viewers
+   * (ro or rw) can watch one terminal; detaching never kills the session.
+   */
+  attach(id: string, mode: TermMode, watcher: Watcher): TermAttachment {
+    const e = this.entryOrThrow(id)
+    if (!e.info.alive) throw new Error(`terminal ${id} has exited`)
+    e.watchers.add(watcher)
+    e.info.lastUsedAt = Date.now()
+    return {
+      replay: e.buffer,
+      write: (data) => {
+        if (mode === 'rw' || isWheelReport(data)) {
+          e.session.write(data)
+          e.info.lastUsedAt = Date.now()
+        }
+      },
+      resize: (cols, rows) => e.session.resize(cols, rows),
+      detach: () => {
+        e.watchers.delete(watcher)
+        // idle clock restarts at detach, so the sweep counts from the moment
+        // the last viewer left, not from the last keystroke hours ago
+        e.info.lastUsedAt = Date.now()
+      },
+    }
   }
 
   /** The last `tail` lines of cleaned scrollback. */
@@ -163,16 +244,21 @@ export class TermRegistry {
     this.entries.clear()
   }
 
-  /** Reap terminals idle past `idleMs`, and dead ones past a short grace. */
+  /** Reap terminals idle past `idleMs`, and dead ones past a short grace.
+   *  A terminal with live viewers attached is in use — never reaped. */
   sweep(idleMs = IDLE_REAP_MS, now = Date.now()): void {
     for (const [id, e] of this.entries) {
-      if (e.running) continue
+      if (e.running || (e.watchers.size > 0 && e.info.alive)) continue
       const idle = now - e.info.lastUsedAt
       if (idle >= idleMs || (!e.info.alive && idle >= DEAD_REAP_MS)) {
         e.session.close()
         this.entries.delete(id)
       }
     }
+  }
+
+  private snapshot(e: Entry): TermInfo {
+    return { ...e.info, attached: e.watchers.size }
   }
 
   private entryOrThrow(id: string): Entry {

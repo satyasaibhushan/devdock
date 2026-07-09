@@ -12,6 +12,9 @@ export default defineConfig({
       '/repos': { target: DAEMON, ws: true, changeOrigin: true },
       '/health': { target: DAEMON, changeOrigin: true },
       '/events': { target: DAEMON, ws: true, changeOrigin: true },
+      '/terminals': { target: DAEMON, ws: true, changeOrigin: true },
+      '/namespace': { target: DAEMON, changeOrigin: true },
+      '/auth': { target: DAEMON, changeOrigin: true },
     },
   },
 })

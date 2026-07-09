@@ -182,19 +182,67 @@ export function openLogs(id: string, workload?: string): WebSocket {
   return new WebSocket(wsUrl(`/repos/${encodeURIComponent(id)}/logs${q}`))
 }
 
-export function openTerminal(
-  id: string,
+// ---- terminals ----
+// Terminals are daemon-owned, registered sessions (t1, t2, …) shared by every
+// client — the UI, other browser windows, agents over MCP. The UI lists them,
+// opens new ones over HTTP, and attaches to them as a live viewer over WS.
+
+export interface TermInfo {
+  id: string
+  repo?: string
+  workload?: string
+  kind: 'auto' | 'shell' | 'local'
+  /** What the PTY is connected to: tmux dev session, pod shell, host shell. */
+  attach: 'tmux' | 'pod' | 'host'
+  createdAt: number
+  lastUsedAt: number
+  alive: boolean
+  /** Live viewers currently attached. */
+  attached: number
+}
+
+export async function fetchTerminals(): Promise<TermInfo[]> {
+  const res = await fetch('/terminals')
+  if (!res.ok) throw new Error(`GET /terminals → ${res.status}`)
+  return res.json()
+}
+
+/** Open (or, for kind 'auto', reuse) a registered terminal. */
+export async function createTerminal(opts: {
+  repo?: string
+  workload?: string
+  kind?: 'auto' | 'shell' | 'local'
+}): Promise<TermInfo> {
+  const res = await fetch('/terminals', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(opts),
+  })
+  if (!res.ok) {
+    const body = (await res.json().catch(() => null)) as { error?: string } | null
+    throw new Error(body?.error ?? `POST /terminals → ${res.status}`)
+  }
+  return res.json()
+}
+
+/** Close a terminal for ALL clients (the PTY dies, scrollback is dropped). */
+export async function deleteTerminal(tid: string): Promise<void> {
+  const res = await fetch(`/terminals/${encodeURIComponent(tid)}`, { method: 'DELETE' })
+  if (!res.ok) throw new Error(`DELETE /terminals/${tid} → ${res.status}`)
+}
+
+/** Attach as a live viewer: scrollback replays first, then bytes stream. */
+export function attachTerminal(
+  tid: string,
   mode: 'ro' | 'rw',
   cols?: number,
   rows?: number,
-  workload?: string,
-  kind: 'auto' | 'shell' = 'auto',
+  replay = true,
 ): WebSocket {
   const size = cols && rows ? `&cols=${cols}&rows=${rows}` : ''
-  const wl = workload ? `&workload=${encodeURIComponent(workload)}` : ''
-  const k = kind === 'shell' ? '&kind=shell' : ''
+  const replayParam = replay ? '' : '&replay=0'
   return new WebSocket(
-    wsUrl(`/repos/${encodeURIComponent(id)}/terminal?mode=${mode}${size}${wl}${k}`),
+    wsUrl(`/terminals/${encodeURIComponent(tid)}/attach?mode=${mode}${size}${replayParam}`),
   )
 }
 

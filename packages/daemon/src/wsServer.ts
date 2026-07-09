@@ -1,4 +1,4 @@
-// WebSocket streams (spec §13): /events, /repos/:id/logs, /repos/:id/terminal.
+// WebSocket streams (spec §13): /events, /repos/:id/logs, /terminals/:tid/attach.
 import type { Server } from 'node:http'
 import type { CrashEvent, RepoState, Service, TermMode } from '@devdock/core'
 import { WebSocket, WebSocketServer } from 'ws'
@@ -22,21 +22,21 @@ export function attachWs(server: Server, service: Service): WebSocketServer {
   return wss
 }
 
-type Route = { kind: 'events' } | { kind: 'logs'; id: string } | { kind: 'terminal'; id: string }
+type Route = { kind: 'events' } | { kind: 'logs'; id: string } | { kind: 'attach'; tid: string }
 
 function matchRoute(pathname: string): Route | undefined {
   if (pathname === '/events') return { kind: 'events' }
   const logs = pathname.match(/^\/repos\/([^/]+)\/logs$/)
   if (logs?.[1]) return { kind: 'logs', id: decodeURIComponent(logs[1]) }
-  const term = pathname.match(/^\/repos\/([^/]+)\/terminal$/)
-  if (term?.[1]) return { kind: 'terminal', id: decodeURIComponent(term[1]) }
+  const att = pathname.match(/^\/terminals\/([^/]+)\/attach$/)
+  if (att?.[1]) return { kind: 'attach', tid: decodeURIComponent(att[1]) }
   return undefined
 }
 
 function handle(ws: WebSocket, route: Route, url: URL, service: Service): void {
   if (route.kind === 'events') handleEvents(ws, service)
   else if (route.kind === 'logs') handleLogs(ws, service, route.id, url)
-  else handleTerminal(ws, service, route.id, url)
+  else handleAttach(ws, service, route.tid, url)
 }
 
 function send(ws: WebSocket, obj: unknown): void {
@@ -74,58 +74,51 @@ function dim(url: URL, key: string): number | undefined {
   return Number.isInteger(n) && n > 0 && n <= 1000 ? n : undefined
 }
 
-function handleTerminal(ws: WebSocket, service: Service, id: string, url: URL): void {
+/** Attach a live viewer to a registered terminal. The socket never owns the
+ *  PTY: closing the tab detaches the viewer, the terminal keeps running for
+ *  everyone else (other browser windows, agents driving it over HTTP). */
+function handleAttach(ws: WebSocket, service: Service, tid: string, url: URL): void {
   const mode: TermMode = url.searchParams.get('mode') === 'rw' ? 'rw' : 'ro'
-  // Open at the client's fitted size so tmux renders the full pane immediately
-  // instead of starting at the 80x24 default and redrawing.
+  let att: ReturnType<Service['attachTerminal']>
+  try {
+    att = service.attachTerminal(tid, mode, {
+      onData: (data) => {
+        if (ws.readyState === WebSocket.OPEN) ws.send(data)
+      },
+      // PTY exited (shell exit, pod gone) — end the stream; the UI refreshes
+      // its tab list off the close.
+      onExit: () => ws.close(),
+    })
+  } catch (err) {
+    send(ws, { type: 'error', error: err instanceof Error ? err.message : String(err) })
+    ws.close()
+    return
+  }
+  // Size the PTY to the viewer's fitted grid before replay so tmux redraws
+  // full-pane immediately (registered terminals open headless at 200x50).
   const cols = dim(url, 'cols')
   const rows = dim(url, 'rows')
-  const workload = url.searchParams.get('workload') ?? undefined
-  // `kind=shell` forces an independent pod shell (a fresh `devspace enter` exec)
-  // even when a managed tmux session exists — the UI uses it for extra terminals
-  // into the same pod. Anything else is the default tmux-or-shell attach.
-  const kind = url.searchParams.get('kind') === 'shell' ? 'shell' : 'auto'
-  // The socket can close (or error) before openTerminal() resolves. Track that so
-  // the PTY spawned by the pending promise is torn down immediately rather than
-  // orphaned — orphaned attaches leak /dev/ptmx slots until the pool is exhausted.
-  let socketClosed = false
-  ws.on('close', () => {
-    socketClosed = true
+  if (cols && rows) att.resize(cols, rows)
+  if (url.searchParams.get('replay') !== '0' && att.replay.length > 0) ws.send(att.replay)
+  ws.on('message', (raw) => {
+    const text = raw.toString()
+    if (text.startsWith(TERM_CTL)) {
+      // Resize applies in any mode — a read-only viewer still needs the
+      // PTY sized to its grid for tmux to redraw correctly.
+      try {
+        const msg = JSON.parse(text.slice(1))
+        if (msg.type === 'resize') {
+          const c = Number(msg.cols)
+          const r = Number(msg.rows)
+          if (Number.isInteger(c) && Number.isInteger(r) && c > 0 && r > 0) att.resize(c, r)
+        }
+      } catch {
+        /* malformed control frame — drop it */
+      }
+      return
+    }
+    att.write(text)
   })
   ws.on('error', () => ws.close())
-  service
-    .openTerminal(id, mode, cols, rows, workload, kind)
-    .then((term) => {
-      if (socketClosed) {
-        term.close()
-        return
-      }
-      term.onData((data) => {
-        if (ws.readyState === WebSocket.OPEN) ws.send(data)
-      })
-      ws.on('message', (raw) => {
-        const text = raw.toString()
-        if (text.startsWith(TERM_CTL)) {
-          // Resize applies in any mode — a read-only viewer still needs the
-          // PTY sized to its grid for tmux to redraw correctly.
-          try {
-            const msg = JSON.parse(text.slice(1))
-            if (msg.type === 'resize') {
-              const c = Number(msg.cols)
-              const r = Number(msg.rows)
-              if (Number.isInteger(c) && Number.isInteger(r) && c > 0 && r > 0) term.resize(c, r)
-            }
-          } catch {
-            /* malformed control frame — drop it */
-          }
-          return
-        }
-        term.write(text)
-      })
-      ws.on('close', () => term.close())
-    })
-    .catch((err: unknown) => {
-      send(ws, { type: 'error', error: err instanceof Error ? err.message : String(err) })
-      ws.close()
-    })
+  ws.on('close', () => att.detach())
 }

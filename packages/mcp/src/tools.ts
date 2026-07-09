@@ -214,7 +214,7 @@ export function allTools(client: DaemonClient): ToolDef[] {
     {
       name: 'devdock_term_open',
       description:
-        'Open a registered terminal and return its id. kind=local: a login shell on the host (default when no repo given). kind=auto: the workload’s dev session, falling back to a pod shell. kind=shell: always a fresh pod shell.',
+        'Open a registered terminal and return its id (scope-qualified, e.g. my-repo:t1 or host:t1). kind=local: a login shell on the host (default when no repo given). kind=auto: the workload’s ONE primary terminal (dev session, falling back to a pod shell) — reused if already open, shared live with the web UI. kind=shell: always a fresh pod shell.',
       scope: 'rw',
       inputSchema: {
         repo: z.string().optional().describe('repo id; omit for a local host shell'),
