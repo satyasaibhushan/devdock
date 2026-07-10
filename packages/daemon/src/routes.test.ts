@@ -243,7 +243,10 @@ describe('daemon routes', () => {
     }
     const svc = new Service(
       { roots: [root], stateFile: join(root, 'state.json') },
-      { runner: vi.fn(async () => ({ code: 0, stdout: '', stderr: '' })), awsCreds: awsCreds as never },
+      {
+        runner: vi.fn(async () => ({ code: 0, stdout: '', stderr: '' })),
+        awsCreds: awsCreds as never,
+      },
     )
     const app = buildApp(svc)
     const res = await app.inject({ method: 'GET', url: '/aws/credential' })
@@ -257,11 +260,31 @@ describe('daemon routes', () => {
     }
     const svc = new Service(
       { roots: [root], stateFile: join(root, 'state.json') },
-      { runner: vi.fn(async () => ({ code: 0, stdout: '', stderr: '' })), awsCreds: awsCreds as never },
+      {
+        runner: vi.fn(async () => ({ code: 0, stdout: '', stderr: '' })),
+        awsCreds: awsCreds as never,
+      },
     )
     const app = buildApp(svc)
     const res = await app.inject({ method: 'GET', url: '/aws/credential' })
     expect(res.statusCode).toBe(503)
     expect(res.json().error).toContain('sign-in')
+  })
+
+  it('POST /aws/login explicitly starts interactive AWS login', async () => {
+    const login = vi.fn(async () => ({ ok: true }))
+    const awsCreds = { login }
+    const svc = new Service(
+      { roots: [root], stateFile: join(root, 'state.json') },
+      {
+        runner: vi.fn(async () => ({ code: 0, stdout: '', stderr: '' })),
+        awsCreds: awsCreds as never,
+      },
+    )
+    const app = buildApp(svc)
+    const res = await app.inject({ method: 'POST', url: '/aws/login' })
+    expect(res.statusCode).toBe(200)
+    expect(res.json()).toEqual({ ok: true })
+    expect(login).toHaveBeenCalledTimes(1)
   })
 })

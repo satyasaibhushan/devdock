@@ -14,8 +14,8 @@ const host = process.env.DEVDOCK_HOST ?? '127.0.0.1'
 const url = `http://${host}:${port}/aws/credential`
 
 try {
-  // Generous timeout: the daemon may be holding this open through a browser
-  // sign-in it just triggered (its own interactive flow gives up at ~190s).
+  // Generous timeout for OIDC discovery, refresh, and STS. This endpoint never
+  // starts an interactive browser login; that requires an explicit request.
   const res = await fetch(url, { signal: AbortSignal.timeout(200_000) })
   const body = (await res.json()) as { error?: string }
   if (!res.ok) {

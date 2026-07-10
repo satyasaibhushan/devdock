@@ -145,7 +145,7 @@ describe('AwsCreds', () => {
     expect(creds.fresh()).toBe(false) // near expiry → next warm re-mints
   })
 
-  it('falls back to ONE interactive PKCE login when there is no refresh token', async () => {
+  it('requires an explicit login before opening the browser when there is no refresh token', async () => {
     const { fetchFn, grants } = fakeFetch({
       token: (form) =>
         form.get('grant_type') === 'authorization_code'
@@ -155,7 +155,12 @@ describe('AwsCreds', () => {
     const runner = fakeBrowser()
     const creds = make(fetchFn, runner)
 
-    expect(await creds.warm()).toEqual({ ok: true })
+    const warm = await creds.warm()
+    expect(warm.ok).toBe(false)
+    expect(warm.message).toContain('interactive AWS login required')
+    expect(runner).not.toHaveBeenCalled()
+
+    expect(await creds.login()).toEqual({ ok: true })
     expect(runner).toHaveBeenCalledTimes(1)
     const grant = grants.find((g) => g.get('grant_type') === 'authorization_code')
     expect(grant?.get('code')).toBe('auth-code')
@@ -164,7 +169,7 @@ describe('AwsCreds', () => {
     expect(JSON.parse(readFileSync(tokenFile, 'utf8')).refreshToken).toBe('rt-new')
   })
 
-  it('burns a dead refresh token (invalid_grant) and goes interactive', async () => {
+  it('invalidates a dead refresh token without opening the browser automatically', async () => {
     writeFileSync(tokenFile, JSON.stringify({ refreshToken: 'rt-dead' }))
     const { fetchFn, grants } = fakeFetch({
       token: (form) =>
@@ -175,11 +180,15 @@ describe('AwsCreds', () => {
     const runner = fakeBrowser()
     const creds = make(fetchFn, runner)
 
-    expect(await creds.warm()).toEqual({ ok: true })
-    expect(grants.map((g) => g.get('grant_type'))).toEqual([
-      'refresh_token',
-      'authorization_code',
-    ])
+    const warm = await creds.warm()
+    expect(warm.ok).toBe(false)
+    expect(warm.message).toContain('interactive AWS login required')
+    expect(runner).not.toHaveBeenCalled()
+    expect(grants.map((g) => g.get('grant_type'))).toEqual(['refresh_token'])
+    expect(() => readFileSync(tokenFile, 'utf8')).toThrow()
+
+    expect(await creds.login()).toEqual({ ok: true })
+    expect(runner).toHaveBeenCalledTimes(1)
     expect(JSON.parse(readFileSync(tokenFile, 'utf8')).refreshToken).toBe('rt-live')
   })
 
@@ -195,6 +204,21 @@ describe('AwsCreds', () => {
     const r = await creds.warm()
     expect(r.ok).toBe(false)
     expect(r.message).toContain('network is down')
+    expect(runner).not.toHaveBeenCalled()
+    expect(JSON.parse(readFileSync(tokenFile, 'utf8')).refreshToken).toBe('rt-1')
+  })
+
+  it('keeps the refresh token on a temporary token-endpoint failure', async () => {
+    writeFileSync(tokenFile, JSON.stringify({ refreshToken: 'rt-1' }))
+    const { fetchFn } = fakeFetch({
+      token: () => json({ error: 'temporarily_unavailable' }, 503),
+    })
+    const runner = vi.fn(async () => ok())
+    const creds = make(fetchFn, runner, { failCooldownMs: 0 })
+
+    const r = await creds.warm()
+    expect(r.ok).toBe(false)
+    expect(r.message).toContain('temporarily_unavailable')
     expect(runner).not.toHaveBeenCalled()
     expect(JSON.parse(readFileSync(tokenFile, 'utf8')).refreshToken).toBe('rt-1')
   })
@@ -227,7 +251,11 @@ describe('AwsCreds', () => {
       token: () => json({ id_token: 'id-1' }),
     })
     writeFileSync(tokenFile, JSON.stringify({ refreshToken: 'rt-1' }))
-    const creds = make(fetchFn, vi.fn(async () => ok()), { failCooldownMs: 60_000 })
+    const creds = make(
+      fetchFn,
+      vi.fn(async () => ok()),
+      { failCooldownMs: 60_000 },
+    )
 
     const r = await creds.warm()
     expect(r.ok).toBe(false)
@@ -250,7 +278,11 @@ describe('AwsCreds', () => {
           ? new Response('<Error><Message>nope</Message></Error>', { status: 403 })
           : new Response(stsXml(3600_000), { status: 200 }),
     })
-    const creds = make(fetchFn, vi.fn(async () => ok()), { failCooldownMs: 0 })
+    const creds = make(
+      fetchFn,
+      vi.fn(async () => ok()),
+      { failCooldownMs: 0 },
+    )
     expect((await creds.warm()).ok).toBe(false)
     expect((await creds.warm()).ok).toBe(true)
   })

@@ -4,7 +4,7 @@ import { EventEmitter } from 'node:events'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { AuthManager, type AuthState } from './auth.js'
-import { type AwsCredential, AwsCreds } from './awsCreds.js'
+import { type AwsCredential, AwsCreds, type WarmResult } from './awsCreds.js'
 import { CrashWatch } from './crashWatch.js'
 import { type RunResult, run, runStream, spawnStream } from './exec.js'
 import { LogHub, LogTailer, type SpawnFn } from './logTailer.js'
@@ -70,7 +70,7 @@ export interface ServiceDeps {
   streamSpawner?: SpawnFn
   /** Kubernetes OIDC login owner — injectable so tests can pin auth phases. */
   auth?: AuthManager
-  /** AWS/ECR credential warmer — injectable so tests can pin warm outcomes. */
+  /** AWS/ECR credential owner — injectable so tests can pin auth outcomes. */
   awsCreds?: AwsCreds
 }
 
@@ -247,8 +247,8 @@ export class Service {
   /** Verb gate #2, for the verbs that spawn devspace deploys: repos' devspace
    *  config shells out to `aws ecr get-login-password`, whose profile reads
    *  the daemon-minted credential (via the devdock-aws-cred shim). The daemon
-   *  refreshes it silently through the OIDC refresh token — a browser sign-in
-   *  happens only when that token is gone/expired, and single-flight even then. */
+   *  refreshes it silently through the OIDC refresh token. Missing or expired
+   *  tokens fail closed; automatic verbs and reconnects never open a browser. */
   private async ensureAwsCreds(key: string): Promise<RunResult | null> {
     const quiet = !this.awsCreds.configured() || this.awsCreds.fresh()
     const hub = this.hubFor(key)
@@ -894,11 +894,15 @@ export class Service {
   }
 
   // ---- AWS credential (owned by AwsCreds, surfaced over /aws/credential) ----
-  /** Mint/serve the credential_process payload. Blocks through one silent
-   *  refresh — or one shared browser sign-in — because the caller is an
-   *  `aws` process that cannot proceed without it. */
+  /** Mint/serve the credential_process payload. Automatic callers get only a
+   *  silent refresh; interactive login is a separate explicit action. */
   awsCredential(): Promise<{ ok: true; cred: AwsCredential } | { ok: false; message: string }> {
     return this.awsCreds.credential()
+  }
+
+  /** Explicit user action: permit one shared interactive AWS browser login. */
+  awsLogin(): Promise<WarmResult> {
+    return this.awsCreds.login()
   }
 
   // ---- reconcile loop ----

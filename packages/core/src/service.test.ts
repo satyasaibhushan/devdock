@@ -753,10 +753,12 @@ describe('Service', () => {
 
   it('refuses start/build while the AWS credential cannot be warmed', async () => {
     const runner = cannedRunner('{"items":[]}', false)
+    const login = vi.fn(async () => ({ ok: true }))
     const awsCreds = {
       configured: () => true,
       fresh: () => false,
       warm: async () => ({ ok: false, message: 'AWS sign-in did not complete in time' }),
+      login,
     } as unknown as AwsCreds
     const svc = new Service({ roots: [root], stateFile }, { runner, awsCreds })
     svc.rescan()
@@ -766,6 +768,7 @@ describe('Service', () => {
     }
     // the verb never reached tmux/devspace — no racing aws-cli-oidc logins
     expect(runner.mock.calls.some((c) => c[0] === 'tmux' && c[1][0] === 'new-session')).toBe(false)
+    expect(login).not.toHaveBeenCalled()
     expect(svc.logs('svc-a').some((l) => l.includes('did not complete in time'))).toBe(true)
   })
 

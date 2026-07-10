@@ -9,10 +9,10 @@
 //
 //  - silent path: Cognito refresh_token grant → sts:AssumeRoleWithWebIdentity
 //    (an UNSIGNED STS call, so no prior credential is needed) — no browser,
-//    works from any network;
-//  - interactive path (first login, or the refresh token expired): ONE
-//    single-flight PKCE authorization-code flow on the registered localhost
-//    port, same cure AuthManager applies to kubelogin/8040;
+//    wherever the provider endpoints are reachable;
+//  - interactive path (first login, or the refresh token expired): an explicit
+//    login request starts ONE single-flight PKCE authorization-code flow on the
+//    registered localhost port. Automatic refreshes never open a browser;
 //  - the aws profile's credential_process points at the devdock-aws-cred shim,
 //    which asks the daemon over HTTP — every aws/devspace/docker process reads
 //    the daemon-minted credential and can never trigger its own login.
@@ -64,15 +64,17 @@ const EXPIRY_MARGIN_MS = 10 * 60_000
 /** A minted credential whose Expiration didn't parse is trusted this long. */
 const FALLBACK_FRESH_MS = 10 * 60_000
 /** The interactive flow (browser + Cognito) needs human time; give up after
- *  this so a verb can't hang forever on a sign-in nobody completes. */
+ *  this so an explicit login request can't hang forever. */
 const LOGIN_TIMEOUT_MS = 190_000
-/** After a failed mint, don't re-run (and re-open a browser tab) for this
- *  long — reconcile-driven reconnect attempts would otherwise storm it. */
+/** After a failed mint, don't re-run it for this long — reconcile-driven
+ *  reconnect attempts would otherwise storm the provider. */
 const FAIL_COOLDOWN_MS = 60_000
 /** Every non-interactive HTTP hop (metadata, token grant, STS). */
 const HTTP_TIMEOUT_MS = 30_000
 /** Global endpoint — role credentials are region-agnostic. */
 const STS_URL = 'https://sts.amazonaws.com/'
+const LOGIN_REQUIRED_MESSAGE =
+  'interactive AWS login required — connect to the office network, then POST /aws/login'
 
 interface ProviderConfig {
   name: string
@@ -90,9 +92,9 @@ interface TokenResponse {
   refresh_token?: string
 }
 
-/** An OAuth error response from the token endpoint (bad/expired grant) — as
- *  opposed to transport trouble, which must NOT burn the refresh token. */
-class TokenEndpointError extends Error {}
+/** The refresh token is genuinely bad/expired. Other token-endpoint failures
+ *  must NOT burn it: they may just mean the laptop is off the office network. */
+class InvalidGrantError extends Error {}
 
 export class AwsCreds {
   private readonly runner: AuthRunner
@@ -135,12 +137,27 @@ export class AwsCreds {
     return this.expiresAt - EXPIRY_MARGIN_MS > Date.now()
   }
 
-  /** Make the AWS credential good before devspace runs. Single-flight: every
-   *  concurrent caller awaits the same mint, so at most ONE refresh runs and
-   *  at most ONE browser tab ever opens. */
+  /** Make the AWS credential good before devspace runs. Strictly silent:
+   *  missing/expired refresh tokens return a login-required failure instead of
+   *  opening a browser as a side effect of a verb or background reconnect. */
   warm(): Promise<WarmResult> {
+    return this.runWarm(false)
+  }
+
+  /** Explicitly permit an interactive browser login. A user request bypasses
+   *  the automatic failure cooldown, but still joins any active mint first. */
+  async login(): Promise<WarmResult> {
+    const active = this.inflight
+    if (active) {
+      const result = await active
+      if (result.ok) return result
+    }
+    return this.runWarm(true)
+  }
+
+  private runWarm(interactive: boolean): Promise<WarmResult> {
     if (this.inflight) return this.inflight
-    const p = this.doWarm().finally(() => {
+    const p = this.doWarm(interactive).finally(() => {
       this.inflight = null
     })
     this.inflight = p
@@ -148,8 +165,8 @@ export class AwsCreds {
   }
 
   /** The credential_process payload for `/aws/credential` (and thus the
-   *  devdock-aws-cred shim in ~/.aws/config). Warms first, so answering may
-   *  take one silent refresh — or one shared browser sign-in. */
+   *  devdock-aws-cred shim in ~/.aws/config). Answering may take one silent
+   *  refresh, but never starts an interactive login. */
   async credential(): Promise<{ ok: true; cred: AwsCredential } | { ok: false; message: string }> {
     if (!this.configured()) {
       return { ok: false, message: `no OIDC provider found in ${this.oidcConfigPath}` }
@@ -171,15 +188,15 @@ export class AwsCreds {
 
   // ---- internals ----
 
-  private async doWarm(): Promise<WarmResult> {
+  private async doWarm(interactive: boolean): Promise<WarmResult> {
     const cfg = this.config()
     if (!cfg) return { ok: true } // no aws-cli-oidc setup — nothing to warm
     if (this.fresh()) return { ok: true }
-    if (Date.now() - this.lastFailAt < this.failCooldownMs) {
+    if (!interactive && Date.now() - this.lastFailAt < this.failCooldownMs) {
       return { ok: false, message: this.lastFailMessage ?? 'a credential refresh just failed' }
     }
     try {
-      const cred = await this.mint(cfg)
+      const cred = await this.mint(cfg, interactive)
       const exp = Date.parse(cred.Expiration)
       this.cred = cred
       this.expiresAt = Number.isNaN(exp) ? Date.now() + FALLBACK_FRESH_MS : exp
@@ -193,10 +210,11 @@ export class AwsCreds {
     }
   }
 
-  private async mint(cfg: ProviderConfig): Promise<AwsCredential> {
-    const ep = await this.discover(cfg)
+  private async mint(cfg: ProviderConfig, interactive: boolean): Promise<AwsCredential> {
     let idToken: string | undefined
     const refreshToken = this.loadRefreshToken()
+    if (!refreshToken && !interactive) throw new Error(LOGIN_REQUIRED_MESSAGE)
+    const ep = await this.discover(cfg)
     if (refreshToken) {
       try {
         const t = await this.tokenGrant(ep.token, {
@@ -207,12 +225,16 @@ export class AwsCreds {
         if (t.refresh_token) this.saveRefreshToken(t.refresh_token) // rotation, if enabled
         idToken = t.id_token
       } catch (err) {
-        if (!(err instanceof TokenEndpointError)) throw err
-        // The grant is dead (expired/revoked) — only then fall to the browser.
+        if (!(err instanceof InvalidGrantError)) throw err
+        // The grant is dead (expired/revoked). Forget it, but let only an
+        // explicit login request proceed to the browser.
         rmSync(this.tokenFile, { force: true })
       }
     }
-    if (!idToken) idToken = await this.interactiveLogin(cfg, ep)
+    if (!idToken) {
+      if (!interactive) throw new Error(LOGIN_REQUIRED_MESSAGE)
+      idToken = await this.interactiveLogin(cfg, ep)
+    }
     return this.assumeRole(cfg, idToken)
   }
 
@@ -315,7 +337,9 @@ export class AwsCreds {
     })
     const xml = await res.text()
     if (!res.ok) {
-      throw new Error(xmlValue(xml, 'Message') ?? `STS AssumeRoleWithWebIdentity failed (${res.status})`)
+      throw new Error(
+        xmlValue(xml, 'Message') ?? `STS AssumeRoleWithWebIdentity failed (${res.status})`,
+      )
     }
     return {
       Version: 1,
@@ -338,9 +362,9 @@ export class AwsCreds {
       error_description?: string
     }
     if (!res.ok) {
-      throw new TokenEndpointError(
-        `OIDC token grant failed: ${body.error_description ?? body.error ?? `status ${res.status}`}`,
-      )
+      const message = `OIDC token grant failed: ${body.error_description ?? body.error ?? `status ${res.status}`}`
+      if (body.error === 'invalid_grant') throw new InvalidGrantError(message)
+      throw new Error(message)
     }
     return body
   }
@@ -348,10 +372,18 @@ export class AwsCreds {
   /** authorize/token endpoints from the provider's metadata URL, fetched once. */
   private async discover(cfg: ProviderConfig): Promise<{ authorize: string; token: string }> {
     if (this.endpointsCache) return this.endpointsCache
-    const res = await this.fetchFn(cfg.metadataUrl, { signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) })
+    const res = await this.fetchFn(cfg.metadataUrl, {
+      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+    })
     if (!res.ok) throw new Error(`OIDC metadata fetch failed (${res.status})`)
-    const meta = (await res.json()) as { authorization_endpoint?: unknown; token_endpoint?: unknown }
-    if (typeof meta.authorization_endpoint !== 'string' || typeof meta.token_endpoint !== 'string') {
+    const meta = (await res.json()) as {
+      authorization_endpoint?: unknown
+      token_endpoint?: unknown
+    }
+    if (
+      typeof meta.authorization_endpoint !== 'string' ||
+      typeof meta.token_endpoint !== 'string'
+    ) {
       throw new Error('OIDC metadata is missing its endpoints')
     }
     this.endpointsCache = { authorize: meta.authorization_endpoint, token: meta.token_endpoint }
@@ -361,7 +393,9 @@ export class AwsCreds {
   private loadRefreshToken(): string | undefined {
     try {
       const data = JSON.parse(readFileSync(this.tokenFile, 'utf8')) as { refreshToken?: unknown }
-      return typeof data.refreshToken === 'string' && data.refreshToken ? data.refreshToken : undefined
+      return typeof data.refreshToken === 'string' && data.refreshToken
+        ? data.refreshToken
+        : undefined
     } catch {
       return undefined
     }
