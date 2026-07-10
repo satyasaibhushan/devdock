@@ -78,9 +78,9 @@
   const active = $derived(terms.find((t) => t.id === activeTid) ?? null)
   const canAdd = $derived(!repo || attach !== 'none')
 
-  // A fresh terminal opens read-only for the shared dev session (look, don't
-  // touch) and read-write for shells you explicitly opened to type into.
-  const modeOf = (t: TermInfo): 'ro' | 'rw' => viewer[t.id] ?? (t.kind === 'auto' ? 'ro' : 'rw')
+  // A terminal behaves like a normal interactive PTY by default.
+  // Read-only remains an explicit per-viewer choice for passive monitoring.
+  const modeOf = (t: TermInfo): 'ro' | 'rw' => viewer[t.id] ?? 'rw'
 
   async function add() {
     if (!canAdd) return

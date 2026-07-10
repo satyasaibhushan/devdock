@@ -1,4 +1,4 @@
-// ptyBroker — node-pty ↔ `tmux attach`, with a single write-lock per repo (spec §8).
+// ptyBroker — node-pty ↔ terminal processes, with a single write-lock per repo (spec §8).
 // Read-only is the default; read-write is a held lock (spec design rule §5).
 import { chmodSync, existsSync, statSync } from 'node:fs'
 import { createRequire } from 'node:module'
@@ -136,7 +136,7 @@ export class WriteLock {
   }
 }
 
-/** A live terminal session bound to a tmux attach via node-pty. */
+/** A live terminal session bound to a child process via node-pty. */
 export interface TermSession {
   readonly mode: TermMode
   onData(cb: (data: string) => void): void
@@ -239,11 +239,10 @@ export class PtyBroker {
 
     let closed = false
     const teardown = () => {
-      // Two-step teardown. kill() SIGHUPs the child (the `tmux attach` client) so
-      // it detaches and exits — node-pty's destroy() alone defers that SIGHUP to a
-      // socket 'close' event that never fires when the read stream was never
-      // consumed, stranding the attach client. destroy() then releases the master
-      // /dev/ptmx fd regardless of stream flow state.
+      // Two-step teardown. kill() SIGHUPs the child so it exits — node-pty's
+      // destroy() alone defers that SIGHUP to a socket 'close' event that never
+      // fires when the read stream was never consumed. destroy() then releases
+      // the master /dev/ptmx fd regardless of stream flow state.
       try {
         pty.kill()
       } catch {

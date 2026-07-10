@@ -40,8 +40,9 @@
 
   onMount(() => {
     // NOTE: no `disableStdin` for read-only — it would also swallow the mouse
-    // reports that make wheel-scrolling work (tmux mouse mode). Read-only is
-    // enforced by only forwarding wheel reports (below), and again daemon-side.
+    // reports used by managed tmux sessions and full-screen applications.
+    // Read-only is enforced by forwarding only wheel reports (below), and
+    // again daemon-side. Ordinary shell history scrolls locally in xterm.
     term = new Terminal({
       fontFamily: monoStack(),
       fontSize: 12,
@@ -65,7 +66,7 @@
     fit.fit()
 
     // Refit when the panel itself resizes (not just the window) and keep the
-    // daemon-side PTY in sync so tmux redraws at the real size.
+    // daemon-side PTY in sync so the foreground process redraws at the real size.
     cols = term.cols
     rows = term.rows
     const refit = () => {
@@ -103,8 +104,8 @@
     cols = term.cols
     rows = term.rows
 
-    // Dial in at the fitted size so the PTY (and tmux) renders full-pane from
-    // the first frame instead of a 200x50 headless canvas.
+    // Dial in at the fitted size so the PTY renders full-pane from the first
+    // frame instead of a 200x50 headless canvas.
     const socket = attachTerminal(tidVal, modeVal, term.cols, term.rows, needsReplay)
     needsReplay = false
     ws = socket
@@ -130,9 +131,9 @@
     // Daemon closed the stream: the PTY exited (or the terminal was closed by
     // another client). Tell the panel so it can refresh its tab list.
     socket.onclose = () => onclosed?.()
-    // rw forwards everything; ro forwards only SGR mouse-wheel reports so the
-    // attached tmux session can scroll its history — keystrokes never leave the
-    // browser (and the daemon's broker drops anything but wheel reports anyway).
+    // rw forwards everything; ro forwards only SGR mouse-wheel reports for a
+    // foreground process that enabled mouse tracking — keystrokes never leave
+    // the browser (and the daemon drops anything but wheel reports anyway).
     const WHEEL_REPORT = /^(?:\x1b\[<6[45];\d+;\d+[Mm])+$/
     const dataListener: IDisposable = term.onData((d) => {
       if (modeVal === 'ro' && !WHEEL_REPORT.test(d)) return
