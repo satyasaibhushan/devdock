@@ -201,6 +201,22 @@ describe('AuthManager', () => {
     expect(logins).toBe(2)
   })
 
+  it('reports an interactive login immediately and retains its failure reason', async () => {
+    const exec = vi.fn((_cmd: string, args: string[]) => {
+      if (args.includes('--skip-open-browser')) return { code: -1, stdout: '', stderr: '' }
+      return { code: 1, stdout: '', stderr: 'could not open the default browser' }
+    })
+    const auth = new AuthManager({ runner: fakeRunner(OIDC_CONFIG, exec), cacheDir })
+    await auth.init()
+
+    const login = auth.login()
+    expect(auth.snapshot()).toMatchObject({ oidc: true, phase: 'logging_in' })
+
+    const result = await login
+    expect(result.phase).toBe('login_required')
+    expect(result.message).toContain('could not open the default browser')
+  })
+
   it('clearCache removes the kubelogin cache dir and flips to login_required', async () => {
     writeCachedToken(60 * 60_000)
     const auth = new AuthManager({ runner: fakeRunner(OIDC_CONFIG), cacheDir })

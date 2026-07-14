@@ -193,6 +193,10 @@ export class AuthManager {
    *  Login button) always run; ensure() applies a cooldown after failures. */
   login(): Promise<AuthState> {
     if (this.logging) return this.logging
+    // Set this before queueing behind a probe. The HTTP handler returns a
+    // snapshot immediately, and the UI must show that the click was accepted
+    // even when another auth check owns the kubelogin lock for a moment.
+    this.settle('logging_in', 'complete the Google sign-in in your browser')
     const p = this.exclusive(() => this.doLogin()).finally(() => {
       this.logging = null
     })
@@ -243,7 +247,6 @@ export class AuthManager {
     // A refresh that landed while we queued behind the lock makes this a no-op.
     if (this.tokenFresh(TOKEN_MARGIN_MS)) return this.settle('ok', undefined)
 
-    this.settle('logging_in', 'complete the Google sign-in in your browser')
     const r = await this.runner(args[0] as string, args.slice(1), {
       timeoutMs: this.loginTimeoutMs,
     })
@@ -253,7 +256,9 @@ export class AuthManager {
       return this.settle('ok', undefined)
     }
     this.lastLoginFailAt = Date.now()
-    return this.settle('login_required', `login did not complete — ${OFF_NETWORK_HINT}`)
+    const detail = lastLine(r.stderr)
+    const message = detail ? `login did not complete: ${detail}` : 'login did not complete'
+    return this.settle('login_required', `${message} — ${OFF_NETWORK_HINT}`)
   }
 
   /** [command, ...args] of the kubeconfig's oidc-login exec plugin, or null
