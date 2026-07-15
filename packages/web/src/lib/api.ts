@@ -148,6 +148,8 @@ export async function runVerb(id: string, verb: Verb, workload?: string): Promis
   const q = workload ? `?workload=${encodeURIComponent(workload)}` : ''
   const res = await fetch(`/repos/${encodeURIComponent(id)}/${verb}${q}`, { method: 'POST' })
   if (!res.ok) throw new Error(`${verb} ${id} → ${res.status}`)
+  const body = (await res.json()) as { ok?: boolean; stderr?: string }
+  if (!body.ok) throw new Error(body.stderr ?? `${verb} failed`)
 }
 
 /** Adopt an externally-managed workload: purge it, then start a managed

@@ -219,28 +219,29 @@ export class Service {
   // Every verb narrates into the repo's log hub — the same output you'd see
   // running the devspace command in a terminal streams to the Logs panel live.
 
-  /** Verb gate: make sure the kubernetes OIDC token is fresh before devspace
-   *  runs. All concurrent verbs share ONE silent refresh / ONE interactive
-   *  login (AuthManager single-flights them), so starting five apps while
-   *  logged out yields one browser tab and five verbs that proceed once the
-   *  sign-in completes — instead of five racing kubelogins on port 8040.
-   *  Returns null when auth is fine, or the RunResult the verb should
-   *  early-return when login can't be completed. */
-  private async ensureAuth(key: string): Promise<RunResult | null> {
+  /** Verb gate: start one shared Kubernetes auth attempt when needed, but do
+   *  not hold a lifecycle HTTP request open for a browser callback. The UI
+   *  clears its button state promptly; after sign-in, the user can retry the
+   *  verb. */
+  private ensureAuth(key: string): RunResult | null {
     const hub = this.hubFor(key)
     const before = this.auth.snapshot()
     const quiet =
       !before.oidc ||
       (before.tokenExpiresAt !== undefined && before.tokenExpiresAt > Date.now() + 60_000)
-    if (!quiet)
-      hub.push('! kubernetes login being verified — a Google sign-in may open in your browser')
-    const s = await this.auth.ensure(true)
-    if (s.phase === 'ok') {
-      if (!quiet) hub.push('✓ kubernetes auth ok')
-      return null
-    }
-    const detail = s.message ?? 'kubernetes login required'
-    hub.push(`✗ ${detail}`)
+    if (quiet) return null
+
+    hub.push('! kubernetes login being verified — a Google sign-in may open in your browser')
+    void this.auth
+      .ensure(true)
+      .then((s) => {
+        if (s.phase === 'ok') hub.push('✓ kubernetes auth ok — retry the requested action')
+        else hub.push(`✗ ${s.message ?? 'kubernetes login required'}`)
+      })
+      .catch(() => hub.push('✗ kubernetes login check failed'))
+
+    const detail =
+      before.message ?? 'Kubernetes login is in progress — complete the sign-in, then retry'
     return { code: 1, stdout: '', stderr: `kubernetes auth: ${detail}` }
   }
 

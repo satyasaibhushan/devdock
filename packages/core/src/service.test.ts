@@ -751,6 +751,34 @@ describe('Service', () => {
     expect(svc.logs('svc-a').some((l) => l.includes('office network'))).toBe(true)
   })
 
+  it('returns start promptly while Kubernetes login is still in progress', async () => {
+    const runner = cannedRunner('{"items":[]}', false)
+    const auth = {
+      snapshot: () => ({
+        oidc: true,
+        phase: 'login_required' as const,
+        message: 'Kubernetes login required',
+        checkedAt: Date.now(),
+      }),
+      ensure: vi.fn(() => new Promise(() => undefined)),
+      kubectlAllowed: () => true,
+      init: async () => ({ oidc: true, phase: 'login_required', checkedAt: Date.now() }),
+    } as unknown as AuthManager
+    const svc = new Service({ roots: [root], stateFile }, { runner, auth })
+    svc.rescan()
+
+    const result = await Promise.race([
+      svc.start('svc-a'),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('start hung on login')), 50),
+      ),
+    ])
+
+    expect(result.code).toBe(1)
+    expect(result.stderr).toContain('Kubernetes login required')
+    expect(runner.mock.calls.some((c) => c[0] === 'tmux' && c[1][0] === 'new-session')).toBe(false)
+  })
+
   it('refuses start/build while the AWS credential cannot be warmed', async () => {
     const runner = cannedRunner('{"items":[]}', false)
     const awsCreds = {

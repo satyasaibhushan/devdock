@@ -217,6 +217,26 @@ describe('AuthManager', () => {
     expect(result.message).toContain('could not open the default browser')
   })
 
+  it('does not hide an in-flight login when clearing the cache', async () => {
+    let finishLogin: (() => void) | undefined
+    const exec = vi.fn(async (_cmd: string, args: string[]) => {
+      if (args.includes('--skip-open-browser')) return { code: -1, stdout: '', stderr: '' }
+      await new Promise<void>((resolve) => {
+        finishLogin = resolve
+      })
+      return { code: -1, stdout: '', stderr: '' }
+    })
+    const auth = new AuthManager({ runner: fakeRunner(OIDC_CONFIG, exec), cacheDir })
+    await auth.init()
+
+    const login = auth.login()
+    expect(auth.clearCache()).toMatchObject({ oidc: true, phase: 'logging_in' })
+
+    await vi.waitFor(() => expect(finishLogin).toBeTypeOf('function'))
+    finishLogin?.()
+    await login
+  })
+
   it('clearCache removes the kubelogin cache dir and flips to login_required', async () => {
     writeCachedToken(60 * 60_000)
     const auth = new AuthManager({ runner: fakeRunner(OIDC_CONFIG), cacheDir })

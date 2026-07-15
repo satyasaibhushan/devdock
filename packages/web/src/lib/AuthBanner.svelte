@@ -49,7 +49,7 @@
   >
     {#if auth.phase === 'logging_in'}
       <span class="spin" aria-hidden="true"></span>
-      <span class="msg">complete the Google sign-in in your browser…</span>
+      <span class="msg">{auth.message ?? 'complete the Google sign-in in your browser…'}</span>
     {:else}
       <span class="dot" aria-hidden="true"></span>
       <span class="msg">

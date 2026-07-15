@@ -153,6 +153,12 @@ export class AuthManager {
     if (this.oidc === undefined) await this.execArgs()
     if (this.oidc !== true) return this.settle('ok', undefined)
     if (this.tokenFresh(TOKEN_MARGIN_MS)) return this.settle('ok', undefined)
+    if (interactive) {
+      this.settle(
+        'logging_in',
+        'checking Kubernetes credentials — a Google sign-in may open in your browser',
+      )
+    }
     const probed = await this.probe()
     if (probed.phase !== 'login_required' || !interactive) return probed
     if (Date.now() - this.lastLoginFailAt < this.loginCooldownMs) {
@@ -206,6 +212,10 @@ export class AuthManager {
 
   /** `rm -r ~/.kube/cache/oidc-login` as a button. */
   clearCache(): AuthState {
+    // A login/probe owns kubelogin's fixed callback port. Do not hide that
+    // operation by replacing its visible state with `login_required`: a later
+    // Login click would only join the hidden operation and appear inert.
+    if (this.logging || this.probing) return this.snapshot()
     rmSync(this.cacheDir, { recursive: true, force: true })
     this.expiryCache = undefined
     if (this.oidc === true) {
