@@ -1,6 +1,16 @@
 // The MCP server is a thin client of the one brain — the daemon's HTTP API
 // (spec §19.1). It never spins its own Service, so it can never diverge.
-import type { AuthState, NamespaceInfo, RepoState, RunOutcome, TermInfo } from '@devdock/core'
+import type {
+  AuthState,
+  LogQueryResult,
+  LogSource,
+  NamespaceInfo,
+  RepoState,
+  RunOutcome,
+  TermInfo,
+  WaitResult,
+  WorkloadRunResult,
+} from '@devdock/core'
 
 export interface VerbResult {
   ok: boolean
@@ -24,14 +34,39 @@ export interface TermOpenOpts {
   cwd?: string
 }
 
+export interface LogQueryOpts {
+  workload?: string
+  source?: LogSource
+  cursor?: string
+  tail?: number
+  contains?: string
+}
+
+export interface WaitOpts {
+  workload?: string
+  contains?: string
+  source?: LogSource
+  cursor?: string
+  status?: string
+  ready?: boolean
+  timeoutMs?: number
+}
+
 /** The subset of the daemon HTTP contract the MCP tools call. */
 export interface DaemonClient {
   list(): Promise<RepoState[]>
   status(id: string): Promise<RepoState>
   verb(verb: RepoVerb, id: string, workload?: string): Promise<VerbResult>
   logs(id: string, tail?: number, workload?: string): Promise<string[]>
+  queryLogs(id: string, opts?: LogQueryOpts): Promise<LogQueryResult>
+  runIn(
+    id: string,
+    command: string,
+    opts?: { workload?: string; timeoutMs?: number },
+  ): Promise<WorkloadRunResult>
+  wait(id: string, opts: WaitOpts): Promise<WaitResult>
   exec(id: string, command: string, workload?: string): Promise<ExecResult>
-  setStartup(id: string, command: string): Promise<void>
+  setStartup(id: string, command: string, workload?: string): Promise<void>
   namespace(): Promise<NamespaceInfo>
   setNamespace(ns: string): Promise<NamespaceInfo>
   auth(): Promise<AuthState>
@@ -78,15 +113,26 @@ export function httpClient(baseUrl: string): DaemonClient {
       request<string[]>(
         `/repos/${id(i)}/logs?tail=${tail ?? 200}${workload ? `&workload=${id(workload)}` : ''}`,
       ),
+    queryLogs: (i, opts = {}) => {
+      const qs = new URLSearchParams()
+      for (const [k, v] of Object.entries(opts)) {
+        if (v !== undefined) qs.set(k, String(v))
+      }
+      const q = qs.toString()
+      return request<LogQueryResult>(`/repos/${id(i)}/logs/query${q ? `?${q}` : ''}`)
+    },
+    runIn: (i, command, opts = {}) =>
+      post<WorkloadRunResult>(`/repos/${id(i)}/run`, { command, ...opts }),
+    wait: (i, opts) => post<WaitResult>(`/repos/${id(i)}/wait`, opts),
     exec: async (i, command, workload) => {
       const r = await post<Partial<ExecResult>>(`/repos/${id(i)}/exec${wl(workload)}`, { command })
       return { ...asVerb(r), stdout: r.stdout ?? '' }
     },
-    setStartup: async (i, command) => {
+    setStartup: async (i, command, workload) => {
       await request(`/repos/${id(i)}/startup`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ command }),
+        body: JSON.stringify({ command, workload }),
       })
     },
     namespace: () => request<NamespaceInfo>('/namespace'),

@@ -7,7 +7,8 @@ import { AuthManager, type AuthState } from './auth.js'
 import { type AwsCredential, AwsCreds } from './awsCreds.js'
 import { CrashWatch } from './crashWatch.js'
 import { type RunResult, run, runStream, spawnStream } from './exec.js'
-import { LogHub, LogTailer, type SpawnFn } from './logTailer.js'
+import { decodeCursor, encodeCursor, readFileSlice } from './logQuery.js'
+import { LogHub, LogTailer, type SpawnFn, cleanLine } from './logTailer.js'
 import { PtyBroker } from './ptyBroker.js'
 import { type ClusterCache, Reconciler, newClusterCache } from './reconciler.js'
 import { scanRepos } from './registry.js'
@@ -15,7 +16,14 @@ import { StateStore } from './stateStore.js'
 import { type SessionState, type StreamRunner, Supervisor, verbLabel } from './supervisor.js'
 import { type RunOutcome, type TermInfo, type TermKind, TermRegistry } from './termRegistry.js'
 import type { Repo, RepoState, RepoStatus, TermMode } from './types.js'
-import { assembleState, resolveWorkload, scopeRepo, workloadTypes } from './workloads.js'
+import {
+  assembleState,
+  resolveWorkload,
+  scopeRepo,
+  startupPodType,
+  startupPodTypes,
+  workloadTypes,
+} from './workloads.js'
 
 export interface ServiceOptions {
   roots?: string[]
@@ -49,6 +57,90 @@ const AUTH_MAINTAIN_MS = 5 * 60 * 1000
 /** RFC 1123 label — what Kubernetes accepts as a namespace name. */
 const NAMESPACE_RE = /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/
 
+/** Where devdock_logs reads from. `application` = the tmux pipe-pane mirror of
+ *  the `devspace dev` pane (the app's real stdout). `container` = kubectl logs.
+ *  `devdock` = the verb-activity hub. `auto` picks application when a dev
+ *  session's pipe file exists, else container, else devdock. */
+export type LogSource = 'auto' | 'application' | 'container' | 'devdock'
+
+export interface LogQueryOptions {
+  workload?: string
+  source?: LogSource
+  /** Opaque cursor from a previous query — returns only what happened since. */
+  cursor?: string
+  /** Lines to return on a fresh (cursorless) read. */
+  tail?: number
+  /** Only lines containing this substring. */
+  contains?: string
+}
+
+export interface LogQueryResult {
+  source: Exclude<LogSource, 'auto'>
+  pod?: string
+  lines: string[]
+  /** Pass back as `cursor` to resume exactly here. */
+  cursor: string
+  /** The given cursor was stale/invalid — this read restarted from the tail. */
+  resync?: boolean
+  /** Lines between the cursor and this read were lost (buffer/size limits). */
+  dropped?: boolean
+}
+
+export interface WorkloadRunResult {
+  /** True iff the command ran to completion in the pod and exited 0. */
+  ok: boolean
+  exitCode: number
+  stdout: string
+  stderr: string
+  pod?: string
+  timedOut: boolean
+  truncated: boolean
+  /** Set when the failure was devdock/cluster plumbing (no pod, auth, kubectl
+   *  connectivity) rather than the command itself. */
+  infraError?: string
+}
+
+export interface WaitOptions {
+  workload?: string
+  /** Match: a log line containing this substring appears. */
+  contains?: string
+  /** Which logs `contains` watches (default auto). */
+  source?: LogSource
+  /** Resume watching from a prior cursor; without one, watching starts NOW —
+   *  pre-existing lines never match. */
+  cursor?: string
+  /** Match: the workload reaches this status (e.g. RUNNING_MANAGED). */
+  status?: string
+  /** Match: at least one pod is ready. */
+  ready?: boolean
+  timeoutMs?: number
+  /** Internal poll cadence — exposed for tests. */
+  pollMs?: number
+}
+
+export interface WaitResult {
+  matched: boolean
+  reason: 'contains' | 'status' | 'ready' | 'timeout'
+  /** The log line that matched (reason=contains). */
+  line?: string
+  /** The workload's status at resolution time. */
+  status?: RepoStatus
+  elapsedMs: number
+  /** Where log-watching stopped — pass to the next wait/logs call. */
+  cursor?: string
+}
+
+const WAIT_TIMEOUT_DEFAULT_MS = 30_000
+const WAIT_TIMEOUT_MAX_MS = 300_000
+const WAIT_POLL_MS = 250
+const RUN_TIMEOUT_DEFAULT_MS = 120_000
+const RUN_TIMEOUT_MAX_MS = 600_000
+const RUN_MAX_OUTPUT_BYTES = 1024 * 1024
+/** kubectl-side failure signatures — distinguish "the cluster/exec plumbing
+ *  broke" from "the command ran and failed". */
+const KUBECTL_INFRA_RE =
+  /error from server|unable to upgrade connection|error dialing backend|connection refused|error: unknown command|kubernetes login required/i
+
 /** The global namespace view: what the kube context points at now, plus every
  *  namespace devdock can offer in the selector. */
 export interface NamespaceInfo {
@@ -65,7 +157,11 @@ export interface ServiceDeps {
   supervisor?: Supervisor
   reconciler?: Reconciler
   broker?: PtyBroker
-  runner?: (cmd: string, args: string[], opts?: { cwd?: string }) => Promise<RunResult>
+  runner?: (
+    cmd: string,
+    args: string[],
+    opts?: { cwd?: string; timeoutMs?: number; maxOutputBytes?: number },
+  ) => Promise<RunResult>
   /** Spawner for streaming children (kubectl logs -f, tail -F). Tests inject a fake. */
   streamSpawner?: SpawnFn
   /** Kubernetes OIDC login owner — injectable so tests can pin auth phases. */
@@ -91,6 +187,10 @@ export class Service {
    *  near-duplicates. It is still mirrored to disk (see devLogPath). */
   private readonly hubs = new Map<string, LogHub>()
   private readonly tailers = new Map<string, LogTailer>()
+  /** Pipe-file generation per workload key, bumped each time start() truncates
+   *  the file — an `f:` cursor from before the truncation is detected by its
+   *  stale gen and resyncs instead of reading garbage offsets. */
+  private readonly logGens = new Map<string, number>()
   /** Workload keys whose live session already got its once-per-sighting setup
    *  (keepalive + mouse backfill) this daemon run. */
   private readonly piped = new Set<string>()
@@ -265,7 +365,7 @@ export class Service {
   }
 
   async start(id: string, workload?: string): Promise<RunResult> {
-    const { repo: scopedRepo, key } = this.scoped(id, workload)
+    const { base, repo: scopedRepo, type, key } = this.scoped(id, workload)
     const denied = (await this.ensureAuth(key)) ?? (await this.ensureAwsCreds(key))
     if (denied) return denied
     let repo = scopedRepo
@@ -282,6 +382,7 @@ export class Service {
     const pipeFile = this.devLogPath(key)
     mkdirSync(dirname(pipeFile), { recursive: true })
     writeFileSync(pipeFile, '') // fresh run, fresh file — old output doesn't linger
+    this.logGens.set(key, (this.logGens.get(key) ?? 0) + 1) // invalidate old f: cursors
     hub.push(`$ ${verbLabel(repo, 'dev')}`)
     const r = await this.supervisor.start(repo, pipeFile)
     if (r.code === 0) {
@@ -295,7 +396,7 @@ export class Service {
       // `devspace enter` shells are separate PTYs, so they never receive it.
       // Queued in the store: the ready-wait spans the whole deploy (minutes),
       // and a daemon restart in that window must not eat the command.
-      const startup = this.store.getStartup(id)
+      const startup = this.store.getStartup(id, startupPodType(base, type))
       if (startup) this.store.setPendingStartup(key, startup)
     } else {
       for (const line of nonEmptyLines(r.stderr)) hub.push(line)
@@ -434,19 +535,35 @@ export class Service {
     return this.supervisor.exec(this.scoped(id, workload).repo, command)
   }
 
-  /** The configured startup command for a repo, if any. */
-  getStartupCommand(id: string): string | undefined {
-    this.repoOrThrow(id)
-    return this.store.getStartup(id)
+  /** The configured startup command for a repo's selected/default pod type. */
+  getStartupCommand(id: string, workload?: string): string | undefined {
+    const repo = this.repoOrThrow(id)
+    return this.store.getStartup(id, startupPodType(repo, workload))
   }
 
-  /** Persist (or, for an empty command, clear) the repo's startup command. The
-   *  cached state is updated so `/repos` reflects it before the next reconcile. */
-  setStartupCommand(id: string, command: string): void {
-    this.repoOrThrow(id)
-    this.store.setStartup(id, command)
+  /** All startup commands keyed by the pod types offered by the repo. */
+  getStartupCommands(id: string): Record<string, string> {
+    const repo = this.repoOrThrow(id)
+    return this.store.getStartupCommands(id, startupPodTypes(repo))
+  }
+
+  /** Persist (or, for an empty command, clear) one pod type's startup command.
+   *  The cached state is updated so `/repos` reflects it immediately. */
+  setStartupCommand(id: string, command: string, workload?: string): void {
+    const repo = this.repoOrThrow(id)
+    const podTypes = startupPodTypes(repo)
+    this.store.setStartup(id, startupPodType(repo, workload), command, podTypes)
     const state = this.states.get(id)
-    if (state) state.startupCommand = this.store.getStartup(id)
+    if (state) this.applyStartupCommands(state)
+  }
+
+  private applyStartupCommands(state: RepoState): void {
+    const types = startupPodTypes(state.repo)
+    state.startupCommands = this.store.getStartupCommands(state.repo.id, types)
+    state.startupCommand = this.store.getStartup(
+      state.repo.id,
+      startupPodType(state.repo, state.repo.defaultWorkload),
+    )
   }
 
   // ---- namespace (the UI face of the user's `kn` alias) ----
@@ -615,7 +732,7 @@ export class Service {
       }
     }
     const state = assembleState(repo, workloads, Date.now())
-    state.startupCommand = this.store.getStartup(id)
+    this.applyStartupCommands(state)
     this.applyState(state)
     return state
   }
@@ -741,6 +858,239 @@ export class Service {
    *  unfilesystemy so it becomes `.`. */
   private devLogPath(key: string): string {
     return join(dirname(this.opts.stateFile), 'logs', `${key.replace('::', '.')}.dev.log`)
+  }
+
+  // ---- agent loop primitives: run / query / wait ----
+
+  /** The pod to exec into / read container logs from: prefer a ready dev pod
+   *  (the `-devspace` replacement `devspace dev` creates), then any ready pod,
+   *  then whatever exists. */
+  private pickPod(id: string, type?: string): { name: string } | undefined {
+    const state = this.states.get(id)
+    const pods = (type ? state?.workloads.find((w) => w.type === type)?.pods : state?.pods) ?? []
+    return (
+      pods.find((p) => p.ready && p.name.includes('-devspace')) ??
+      pods.find((p) => p.ready) ??
+      pods[0]
+    )
+  }
+
+  /** Run a one-shot command inside the workload's pod and return its REAL exit
+   *  code and output (kubectl exec propagates the remote exit status) — unlike
+   *  exec(), which types into the dev session and captures nothing. Infra
+   *  failures (no pod, auth, connectivity) are reported via infraError so an
+   *  agent never mistakes a broken cluster for a failing test. */
+  async runInWorkload(
+    id: string,
+    command: string,
+    opts: { workload?: string; timeoutMs?: number } = {},
+  ): Promise<WorkloadRunResult> {
+    const { repo, type, key } = this.scoped(id, opts.workload)
+    const fail = (infraError: string, pod?: string): WorkloadRunResult => ({
+      ok: false,
+      exitCode: -1,
+      stdout: '',
+      stderr: '',
+      pod,
+      timedOut: false,
+      truncated: false,
+      infraError,
+    })
+    if (!this.auth.kubectlAllowed(['exec'])) {
+      return fail('kubernetes login required — run devdock_auth_login and retry')
+    }
+    const pod = this.pickPod(id, type)
+    if (!pod) return fail(`no running pod for ${key} — start it first`)
+    const ns = repo.namespace ? ['-n', repo.namespace] : []
+    const timeoutMs = Math.min(opts.timeoutMs ?? RUN_TIMEOUT_DEFAULT_MS, RUN_TIMEOUT_MAX_MS)
+    const r = await this.runner('kubectl', ['exec', pod.name, ...ns, '--', 'sh', '-c', command], {
+      timeoutMs,
+      maxOutputBytes: RUN_MAX_OUTPUT_BYTES,
+    })
+    const timedOut = r.timedOut === true
+    const infra = r.code !== 0 && !timedOut && KUBECTL_INFRA_RE.test(r.stderr)
+    return {
+      ok: r.code === 0 && !timedOut,
+      exitCode: r.code,
+      stdout: r.stdout,
+      stderr: r.stderr,
+      pod: pod.name,
+      timedOut,
+      truncated: r.truncated === true,
+      ...(infra ? { infraError: `kubectl exec failed: ${r.stderr.trim().slice(0, 500)}` } : {}),
+    }
+  }
+
+  /** Read a workload's logs by source with cursor-based resume. A stale or
+   *  unparseable cursor resyncs from the tail (flagged via `resync`) instead
+   *  of erroring — mirrors the Kubernetes watch 410 Gone pattern. */
+  async queryLogs(id: string, opts: LogQueryOptions = {}): Promise<LogQueryResult> {
+    const { type, key } = this.scoped(id, opts.workload)
+    const tail = Math.min(Math.max(opts.tail ?? 200, 0), 2000)
+    const cursor = decodeCursor(opts.cursor)
+    const badCursor = opts.cursor !== undefined && cursor === undefined
+
+    let source = opts.source ?? 'auto'
+    if (source === 'auto') {
+      if (readFileSlice(this.devLogPath(key), 0, 1)) source = 'application'
+      else if (this.pickPod(id, type)) source = 'container'
+      else source = 'devdock'
+    }
+
+    const filter = (lines: string[]) =>
+      opts.contains ? lines.filter((l) => l.includes(opts.contains as string)) : lines
+
+    if (source === 'application') {
+      const gen = this.logGens.get(key) ?? 0
+      const live = cursor?.kind === 'file' && cursor.gen === gen ? cursor : undefined
+      const stale = !live
+      const slice = readFileSlice(this.devLogPath(key), live?.offset ?? 0)
+      if (!slice) {
+        // No pipe file (never started / logs dir gone) — empty read, cursor at 0.
+        return {
+          source,
+          lines: [],
+          cursor: encodeCursor({ kind: 'file', gen, offset: 0 }),
+          resync: badCursor || (cursor !== undefined && stale),
+        }
+      }
+      let lines = filter(slice.lines.map(cleanLine).filter((l) => l.trim() !== ''))
+      if (stale) lines = tail > 0 ? lines.slice(-tail) : []
+      return {
+        source,
+        lines,
+        cursor: encodeCursor({ kind: 'file', gen, offset: slice.nextOffset }),
+        resync: badCursor || (cursor !== undefined && stale),
+        dropped: slice.truncated,
+      }
+    }
+
+    if (source === 'container') {
+      if (!this.auth.kubectlAllowed(['logs'])) {
+        throw new Error('kubernetes login required — run devdock_auth_login and retry')
+      }
+      const { repo } = this.scoped(id, opts.workload)
+      const pod = this.pickPod(id, type)
+      if (!pod) throw new Error(`no running pod for ${key} — start it first`)
+      const ns = repo.namespace ? ['-n', repo.namespace] : []
+      // Mint the next cursor BEFORE reading so lines landing mid-read are
+      // caught by the next call rather than skipped.
+      const now = new Date().toISOString()
+      const args = ['logs', pod.name, ...ns]
+      if (cursor?.kind === 'container') args.push(`--since-time=${cursor.sinceTime}`)
+      else args.push('--tail', String(tail))
+      const r = await this.runner('kubectl', args, { timeoutMs: 30_000 })
+      if (r.code !== 0) throw new Error(`kubectl logs failed: ${r.stderr.trim() || r.code}`)
+      return {
+        source,
+        pod: pod.name,
+        lines: filter(nonEmptyLines(r.stdout)),
+        cursor: encodeCursor({ kind: 'container', sinceTime: now }),
+        resync: badCursor || (opts.cursor !== undefined && cursor?.kind !== 'container'),
+      }
+    }
+
+    // devdock: the verb-activity/pod-log hub
+    this.ensureTailer(id, opts.workload)
+    const hub = this.hubFor(key)
+    if (cursor?.kind === 'hub') {
+      const r = hub.since(cursor.seq)
+      return {
+        source,
+        lines: filter(r.lines),
+        cursor: encodeCursor({ kind: 'hub', seq: r.nextSeq }),
+        dropped: r.dropped,
+      }
+    }
+    return {
+      source,
+      lines: filter(tail > 0 ? hub.recent(tail) : []),
+      cursor: encodeCursor({ kind: 'hub', seq: hub.currentSeq }),
+      resync: opts.cursor !== undefined,
+    }
+  }
+
+  /** Block until a condition holds or the timeout passes — the daemon does the
+   *  polling internally so callers (agents) make ONE call instead of a poll
+   *  loop. Conditions are OR'd: `contains` (a new log line with the substring),
+   *  `status` (workload reaches it), `ready` (a pod is ready). Without a
+   *  cursor, `contains` watches from NOW — old lines never match. */
+  async wait(id: string, opts: WaitOptions): Promise<WaitResult> {
+    if (!opts.contains && !opts.status && !opts.ready) {
+      throw new Error('wait needs at least one condition: contains, status, or ready')
+    }
+    const started = Date.now()
+    const timeoutMs = Math.min(opts.timeoutMs ?? WAIT_TIMEOUT_DEFAULT_MS, WAIT_TIMEOUT_MAX_MS)
+    const pollMs = opts.pollMs ?? WAIT_POLL_MS
+    const { type } = this.scoped(id, opts.workload)
+    const wantStatus = opts.status?.toUpperCase()
+
+    let cursor = opts.cursor
+    if (opts.contains && !cursor) {
+      // Capture the current end of the log first — matching starts from now.
+      cursor = (await this.queryLogs(id, { workload: opts.workload, source: opts.source, tail: 0 }))
+        .cursor
+    }
+
+    const currentStatus = (): RepoStatus | undefined => {
+      const state = this.states.get(id)
+      if (!state) return undefined
+      return (type ? state.workloads.find((w) => w.type === type)?.status : state.status) as
+        | RepoStatus
+        | undefined
+    }
+
+    for (;;) {
+      const state = this.states.get(id)
+      const ws = type ? state?.workloads.find((w) => w.type === type) : state
+      if (wantStatus && ws?.status === wantStatus) {
+        return {
+          matched: true,
+          reason: 'status',
+          status: ws.status as RepoStatus,
+          elapsedMs: Date.now() - started,
+          cursor,
+        }
+      }
+      if (opts.ready && ws?.pods.some((p) => p.ready)) {
+        return {
+          matched: true,
+          reason: 'ready',
+          status: ws.status as RepoStatus,
+          elapsedMs: Date.now() - started,
+          cursor,
+        }
+      }
+      if (opts.contains) {
+        const q = await this.queryLogs(id, {
+          workload: opts.workload,
+          source: opts.source,
+          cursor,
+        })
+        cursor = q.cursor
+        const hit = q.lines.find((l) => l.includes(opts.contains as string))
+        if (hit) {
+          return {
+            matched: true,
+            reason: 'contains',
+            line: hit,
+            status: currentStatus(),
+            elapsedMs: Date.now() - started,
+            cursor,
+          }
+        }
+      }
+      if (Date.now() - started >= timeoutMs) {
+        return {
+          matched: false,
+          reason: 'timeout',
+          status: currentStatus(),
+          elapsedMs: Date.now() - started,
+          cursor,
+        }
+      }
+      await new Promise((r) => setTimeout(r, pollMs))
+    }
   }
 
   private ensureTailer(id: string, workload?: string): void {

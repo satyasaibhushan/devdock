@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -46,6 +46,27 @@ describe('StateStore', () => {
     expect(new StateStore(file).getPendingStartup('repo-a::api')).toBe('pnpm run dev')
     s.setPendingStartup('repo-a::api', undefined)
     expect(new StateStore(file).getPendingStartup('repo-a::api')).toBeUndefined()
+  })
+
+  it('stores distinct startup commands by pod type', () => {
+    const s = new StateStore(file)
+    const types = ['api', 'worker']
+    s.setStartup('repo-a', 'api', 'pnpm api', types)
+    s.setStartup('repo-a', 'worker', 'pnpm worker', types)
+    expect(new StateStore(file).getStartupCommands('repo-a', types)).toEqual({
+      api: 'pnpm api',
+      worker: 'pnpm worker',
+    })
+  })
+
+  it('expands a legacy repo command before a type-specific edit', () => {
+    writeFileSync(file, JSON.stringify({ startup: { 'repo-a': 'pnpm legacy' } }))
+    const s = new StateStore(file)
+    s.setStartup('repo-a', 'worker', 'pnpm worker', ['api', 'worker'])
+    expect(new StateStore(file).getStartupCommands('repo-a', ['api', 'worker'])).toEqual({
+      api: 'pnpm legacy',
+      worker: 'pnpm worker',
+    })
   })
 
   it('round-trips session-namespace pins and clears them with undefined', () => {

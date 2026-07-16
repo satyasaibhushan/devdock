@@ -315,7 +315,9 @@ export class AwsCreds {
     })
     const xml = await res.text()
     if (!res.ok) {
-      throw new Error(xmlValue(xml, 'Message') ?? `STS AssumeRoleWithWebIdentity failed (${res.status})`)
+      throw new Error(
+        xmlValue(xml, 'Message') ?? `STS AssumeRoleWithWebIdentity failed (${res.status})`,
+      )
     }
     return {
       Version: 1,
@@ -348,10 +350,18 @@ export class AwsCreds {
   /** authorize/token endpoints from the provider's metadata URL, fetched once. */
   private async discover(cfg: ProviderConfig): Promise<{ authorize: string; token: string }> {
     if (this.endpointsCache) return this.endpointsCache
-    const res = await this.fetchFn(cfg.metadataUrl, { signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) })
+    const res = await this.fetchFn(cfg.metadataUrl, {
+      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+    })
     if (!res.ok) throw new Error(`OIDC metadata fetch failed (${res.status})`)
-    const meta = (await res.json()) as { authorization_endpoint?: unknown; token_endpoint?: unknown }
-    if (typeof meta.authorization_endpoint !== 'string' || typeof meta.token_endpoint !== 'string') {
+    const meta = (await res.json()) as {
+      authorization_endpoint?: unknown
+      token_endpoint?: unknown
+    }
+    if (
+      typeof meta.authorization_endpoint !== 'string' ||
+      typeof meta.token_endpoint !== 'string'
+    ) {
       throw new Error('OIDC metadata is missing its endpoints')
     }
     this.endpointsCache = { authorize: meta.authorization_endpoint, token: meta.token_endpoint }
@@ -361,7 +371,9 @@ export class AwsCreds {
   private loadRefreshToken(): string | undefined {
     try {
       const data = JSON.parse(readFileSync(this.tokenFile, 'utf8')) as { refreshToken?: unknown }
-      return typeof data.refreshToken === 'string' && data.refreshToken ? data.refreshToken : undefined
+      return typeof data.refreshToken === 'string' && data.refreshToken
+        ? data.refreshToken
+        : undefined
     } catch {
       return undefined
     }

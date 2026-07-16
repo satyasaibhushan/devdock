@@ -83,6 +83,101 @@ export function buildApp(service: Service): FastifyInstance {
     },
   )
 
+  // One-shot command in the workload's pod with a REAL exit code (kubectl
+  // exec) — the agent-loop counterpart to /exec's fire-and-forget send-keys.
+  app.post<{
+    Params: { id: string }
+    Body: { command?: string; workload?: string; timeoutMs?: number }
+  }>('/repos/:id/run', async (req, reply) => {
+    const command = req.body?.command
+    if (typeof command !== 'string' || !command.trim()) {
+      return reply.code(400).send({ error: 'command required' })
+    }
+    try {
+      return await service.runInWorkload(req.params.id, command, {
+        workload: req.body?.workload,
+        timeoutMs: req.body?.timeoutMs,
+      })
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      return reply.code(message.includes('unknown repo') ? 404 : 500).send({ error: message })
+    }
+  })
+
+  // Cursor-based log reads by source (application pipe file / container /
+  // devdock hub). The old GET /repos/:id/logs stays as-is for the web UI.
+  app.get<{
+    Params: { id: string }
+    Querystring: {
+      source?: string
+      cursor?: string
+      tail?: string
+      contains?: string
+      workload?: string
+    }
+  }>('/repos/:id/logs/query', async (req, reply) => {
+    const { source, cursor, contains, workload } = req.query
+    if (source && !['auto', 'application', 'container', 'devdock'].includes(source)) {
+      return reply.code(400).send({ error: `invalid source: ${source}` })
+    }
+    const tail = Number(req.query.tail ?? 200)
+    try {
+      return await service.queryLogs(req.params.id, {
+        source: source as 'auto' | 'application' | 'container' | 'devdock' | undefined,
+        cursor,
+        contains,
+        workload,
+        tail: Number.isFinite(tail) ? tail : 200,
+      })
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      const code = message.includes('unknown repo')
+        ? 404
+        : message.includes('no running pod') || message.includes('login required')
+          ? 409
+          : 500
+      return reply.code(code).send({ error: message })
+    }
+  })
+
+  // Blocking wait — the daemon polls internally so the caller makes ONE call.
+  app.post<{
+    Params: { id: string }
+    Body: {
+      contains?: string
+      status?: string
+      ready?: boolean
+      source?: string
+      cursor?: string
+      timeoutMs?: number
+      workload?: string
+    }
+  }>('/repos/:id/wait', async (req, reply) => {
+    const b = req.body ?? {}
+    if (b.source && !['auto', 'application', 'container', 'devdock'].includes(b.source)) {
+      return reply.code(400).send({ error: `invalid source: ${b.source}` })
+    }
+    try {
+      return await service.wait(req.params.id, {
+        contains: b.contains,
+        status: b.status,
+        ready: b.ready,
+        source: b.source as 'auto' | 'application' | 'container' | 'devdock' | undefined,
+        cursor: b.cursor,
+        timeoutMs: b.timeoutMs,
+        workload: b.workload,
+      })
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      const code = message.includes('unknown repo')
+        ? 404
+        : message.includes('at least one condition')
+          ? 400
+          : 500
+      return reply.code(code).send({ error: message })
+    }
+  })
+
   app.post<{
     Params: { id: string }
     Querystring: { workload?: string }
@@ -179,7 +274,7 @@ export function buildApp(service: Service): FastifyInstance {
     }
   })
 
-  app.put<{ Params: { id: string }; Body: { command?: string } }>(
+  app.put<{ Params: { id: string }; Body: { command?: string; workload?: string } }>(
     '/repos/:id/startup',
     async (req, reply) => {
       const command = req.body?.command
@@ -187,8 +282,13 @@ export function buildApp(service: Service): FastifyInstance {
         return reply.code(400).send({ error: 'command must be a string' })
       }
       try {
-        service.setStartupCommand(req.params.id, command)
-        return { ok: true, startupCommand: service.getStartupCommand(req.params.id) ?? null }
+        const workload = typeof req.body.workload === 'string' ? req.body.workload : undefined
+        service.setStartupCommand(req.params.id, command, workload)
+        return {
+          ok: true,
+          startupCommand: service.getStartupCommand(req.params.id, workload) ?? null,
+          startupCommands: service.getStartupCommands(req.params.id),
+        }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
         return reply.code(message.includes('unknown repo') ? 404 : 500).send({ error: message })

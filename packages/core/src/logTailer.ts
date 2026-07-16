@@ -38,6 +38,9 @@ export function cleanLine(line: string): string {
 export class LogHub {
   private readonly ring: RingBuffer<string>
   private readonly subs = new Set<LogSubscriber>()
+  /** Total lines ever pushed — the ring holds seqs [seq - size, seq). Lets a
+   *  caller resume exactly where it left off via since(). */
+  private seq = 0
   constructor(capacity = 1000) {
     this.ring = new RingBuffer<string>(capacity)
   }
@@ -45,7 +48,27 @@ export class LogHub {
   push(line: string): void {
     const clean = cleanLine(line)
     this.ring.push(clean)
+    this.seq++
     for (const sub of this.subs) sub(clean)
+  }
+
+  /** Lines pushed at or after seq `from` (exclusive of already-seen ones).
+   *  `dropped` is true when lines between `from` and the ring's oldest entry
+   *  have already been evicted — the caller missed some output. */
+  since(from: number): { lines: string[]; nextSeq: number; dropped: boolean } {
+    const all = this.ring.toArray()
+    const oldest = this.seq - all.length
+    const start = Math.max(from, oldest)
+    return {
+      lines: all.slice(start - oldest),
+      nextSeq: this.seq,
+      dropped: from < oldest,
+    }
+  }
+
+  /** Cursor for "everything from now on" — pass to since() later. */
+  get currentSeq(): number {
+    return this.seq
   }
 
   /** Subscribe; immediately replays the backlog, then streams live. Returns unsubscribe.

@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -592,6 +592,35 @@ describe('Service', () => {
     }
   })
 
+  it('queues the startup command configured for the selected pod type', async () => {
+    mkdirSync(join(root, 'svc-multi'), { recursive: true })
+    writeFileSync(
+      join(root, 'svc-multi', 'devspace.yaml'),
+      [
+        'name: svc-multi',
+        'vars:',
+        '  WORKLOAD_TYPE:',
+        '    question: pod type',
+        '    default: api',
+        '    options: [api, worker]',
+      ].join('\n'),
+    )
+    const svc = new Service(
+      { roots: [root], stateFile },
+      { runner: cannedRunner('{"items":[]}', false), streamSpawner: fakeStreamSpawner().spawner },
+    )
+    svc.rescan()
+    svc.setStartupCommand('svc-multi', 'pnpm api', 'api')
+    svc.setStartupCommand('svc-multi', 'pnpm worker', 'worker')
+
+    expect(svc.getStartupCommands('svc-multi')).toEqual({
+      api: 'pnpm api',
+      worker: 'pnpm worker',
+    })
+    await svc.start('svc-multi', 'worker')
+    expect(new StateStore(stateFile).getPendingStartup('svc-multi::worker')).toBe('pnpm worker')
+  })
+
   it('stop clears a still-queued startup command — a canceled start must not fire later', async () => {
     const svc = new Service(
       { roots: [root], stateFile },
@@ -828,5 +857,232 @@ describe('Service', () => {
     await svc.reconcileAll()
     // no kubectl API call leaked past the gate (each would spawn a kubelogin)
     expect(runner.mock.calls.some((c) => c[0] === 'kubectl' && c[1][0] !== 'config')).toBe(false)
+  })
+})
+
+const READY_PODS = JSON.stringify({
+  items: [
+    {
+      metadata: { name: 'svc-a-app-devspace-1' },
+      status: { phase: 'Running', containerStatuses: [{ ready: true, restartCount: 0 }] },
+    },
+  ],
+})
+
+/** cannedRunner plus a hook for kubectl exec / kubectl logs calls. */
+function execRunner(
+  onExec: (args: string[]) => RunResult,
+  podsJson = READY_PODS,
+  onLogs?: (args: string[]) => RunResult,
+) {
+  const base = cannedRunner(podsJson, true)
+  return vi.fn(async (cmd: string, args: string[], opts?: object): Promise<RunResult> => {
+    if (cmd === 'kubectl' && args[0] === 'exec') return onExec(args)
+    if (cmd === 'kubectl' && args[0] === 'logs' && onLogs) return onLogs(args)
+    return base(cmd, args, opts as never)
+  })
+}
+
+async function reconciledService(runner: ReturnType<typeof execRunner>) {
+  const svc = new Service(
+    { roots: [root], stateFile },
+    { runner, streamSpawner: fakeStreamSpawner().spawner },
+  )
+  svc.rescan()
+  await svc.reconcileAll()
+  return svc
+}
+
+describe('Service.runInWorkload', () => {
+  it('execs into the ready dev pod and reports the real exit code', async () => {
+    const runner = execRunner(() => ({ code: 0, stdout: '3 passed\n', stderr: '' }))
+    const svc = await reconciledService(runner)
+    const r = await svc.runInWorkload('svc-a', 'pytest -q')
+    expect(r.ok).toBe(true)
+    expect(r.exitCode).toBe(0)
+    expect(r.stdout).toBe('3 passed\n')
+    expect(r.pod).toBe('svc-a-app-devspace-1')
+    expect(r.infraError).toBeUndefined()
+    expect(runner).toHaveBeenCalledWith(
+      'kubectl',
+      ['exec', 'svc-a-app-devspace-1', '-n', 'ns', '--', 'sh', '-c', 'pytest -q'],
+      { timeoutMs: 120_000, maxOutputBytes: 1024 * 1024 },
+    )
+  })
+
+  it('a failing command is NOT an infra error', async () => {
+    const runner = execRunner(() => ({ code: 2, stdout: '', stderr: '1 test failed' }))
+    const svc = await reconciledService(runner)
+    const r = await svc.runInWorkload('svc-a', 'pytest -q')
+    expect(r.ok).toBe(false)
+    expect(r.exitCode).toBe(2)
+    expect(r.infraError).toBeUndefined()
+  })
+
+  it('kubectl-side failures are flagged as infra errors', async () => {
+    const runner = execRunner(() => ({
+      code: 1,
+      stdout: '',
+      stderr: 'Error from server: error dialing backend: connect: connection refused',
+    }))
+    const svc = await reconciledService(runner)
+    const r = await svc.runInWorkload('svc-a', 'pytest -q')
+    expect(r.ok).toBe(false)
+    expect(r.infraError).toContain('kubectl exec failed')
+  })
+
+  it('no running pod is an infra error, not a command failure', async () => {
+    const runner = execRunner(() => ({ code: 0, stdout: '', stderr: '' }), '{"items":[]}')
+    const svc = await reconciledService(runner)
+    const r = await svc.runInWorkload('svc-a', 'pytest -q')
+    expect(r.ok).toBe(false)
+    expect(r.infraError).toContain('no running pod')
+  })
+
+  it('propagates timedOut and truncated from the runner', async () => {
+    const runner = execRunner(() => ({
+      code: -1,
+      stdout: 'partial',
+      stderr: '',
+      timedOut: true,
+      truncated: true,
+    }))
+    const svc = await reconciledService(runner)
+    const r = await svc.runInWorkload('svc-a', 'sleep 999', { timeoutMs: 50 })
+    expect(r.ok).toBe(false)
+    expect(r.timedOut).toBe(true)
+    expect(r.truncated).toBe(true)
+  })
+})
+
+describe('Service.queryLogs', () => {
+  const pipeFile = () => join(root, 'logs', 'svc-a.dev.log')
+  const writePipe = (content: string) => {
+    mkdirSync(join(root, 'logs'), { recursive: true })
+    writeFileSync(pipeFile(), content)
+  }
+
+  it('application source reads the pipe file and resumes via cursor', async () => {
+    const runner = execRunner(() => ({ code: 0, stdout: '', stderr: '' }))
+    const svc = await reconciledService(runner)
+    writePipe('boot ok\nlistening on :8000\n')
+    const first = await svc.queryLogs('svc-a', { source: 'application' })
+    expect(first.source).toBe('application')
+    expect(first.lines).toEqual(['boot ok', 'listening on :8000'])
+    expect(first.cursor).toMatch(/^f:\d+:\d+$/)
+
+    appendFileSync(pipeFile(), 'request handled\n')
+    const second = await svc.queryLogs('svc-a', { source: 'application', cursor: first.cursor })
+    expect(second.lines).toEqual(['request handled'])
+    expect(second.resync).toBeFalsy()
+  })
+
+  it('a stale-generation cursor resyncs from the tail instead of erroring', async () => {
+    const runner = execRunner(() => ({ code: 0, stdout: '', stderr: '' }))
+    const svc = await reconciledService(runner)
+    writePipe('a\nb\nc\n')
+    const r = await svc.queryLogs('svc-a', { source: 'application', cursor: 'f:99:4', tail: 2 })
+    expect(r.resync).toBe(true)
+    expect(r.lines).toEqual(['b', 'c'])
+  })
+
+  it('auto picks application when the pipe file exists, devdock when nothing runs', async () => {
+    const runner = execRunner(() => ({ code: 0, stdout: '', stderr: '' }), '{"items":[]}')
+    const svc = await reconciledService(runner)
+    expect((await svc.queryLogs('svc-a')).source).toBe('devdock')
+    writePipe('hello\n')
+    expect((await svc.queryLogs('svc-a')).source).toBe('application')
+  })
+
+  it('devdock source resumes from a hub cursor', async () => {
+    const runner = execRunner(() => ({ code: 0, stdout: '', stderr: '' }))
+    const svc = await reconciledService(runner)
+    await svc.stop('svc-a') // narrates into the hub
+    const first = await svc.queryLogs('svc-a', { source: 'devdock' })
+    expect(first.lines.length).toBeGreaterThan(0)
+    expect(first.cursor).toMatch(/^h:\d+$/)
+    const second = await svc.queryLogs('svc-a', { source: 'devdock', cursor: first.cursor })
+    expect(second.lines).toEqual([])
+  })
+
+  it('container source uses kubectl logs with --since-time on a cursor', async () => {
+    const logsCalls: string[][] = []
+    const runner = execRunner(
+      () => ({ code: 0, stdout: '', stderr: '' }),
+      READY_PODS,
+      (args) => {
+        logsCalls.push(args)
+        return { code: 0, stdout: 'line1\nline2\n', stderr: '' }
+      },
+    )
+    const svc = await reconciledService(runner)
+    const first = await svc.queryLogs('svc-a', { source: 'container', tail: 50 })
+    expect(first.lines).toEqual(['line1', 'line2'])
+    expect(first.pod).toBe('svc-a-app-devspace-1')
+    expect(first.cursor).toMatch(/^c:/)
+    expect(logsCalls[0]).toContain('--tail')
+
+    await svc.queryLogs('svc-a', { source: 'container', cursor: first.cursor })
+    expect(logsCalls[1]?.some((a) => a.startsWith('--since-time='))).toBe(true)
+  })
+
+  it('contains filters the returned lines', async () => {
+    const runner = execRunner(() => ({ code: 0, stdout: '', stderr: '' }))
+    const svc = await reconciledService(runner)
+    writePipe('ok start\nERROR boom\nok end\n')
+    const r = await svc.queryLogs('svc-a', { source: 'application', contains: 'ERROR' })
+    expect(r.lines).toEqual(['ERROR boom'])
+  })
+})
+
+describe('Service.wait', () => {
+  const writePipe = (content: string, append = false) => {
+    mkdirSync(join(root, 'logs'), { recursive: true })
+    const f = join(root, 'logs', 'svc-a.dev.log')
+    append ? appendFileSync(f, content) : writeFileSync(f, content)
+  }
+
+  it('matches a log line that appears AFTER the wait started', async () => {
+    const runner = execRunner(() => ({ code: 0, stdout: '', stderr: '' }))
+    const svc = await reconciledService(runner)
+    writePipe('old Uvicorn running line must not match\n')
+    setTimeout(() => writePipe('INFO: Uvicorn running on :8000\n', true), 60)
+    const r = await svc.wait('svc-a', {
+      contains: 'Uvicorn running',
+      timeoutMs: 3000,
+      pollMs: 20,
+    })
+    expect(r.matched).toBe(true)
+    expect(r.reason).toBe('contains')
+    expect(r.line).toContain('Uvicorn running on :8000')
+    expect(r.cursor).toBeTruthy()
+  })
+
+  it('pre-existing lines never match without a cursor — times out instead', async () => {
+    const runner = execRunner(() => ({ code: 0, stdout: '', stderr: '' }))
+    const svc = await reconciledService(runner)
+    writePipe('INFO: Uvicorn running on :8000\n')
+    const r = await svc.wait('svc-a', { contains: 'Uvicorn running', timeoutMs: 100, pollMs: 20 })
+    expect(r.matched).toBe(false)
+    expect(r.reason).toBe('timeout')
+  })
+
+  it('matches on status and ready from the reconciled state', async () => {
+    const runner = execRunner(() => ({ code: 0, stdout: '', stderr: '' }))
+    const svc = await reconciledService(runner)
+    const byStatus = await svc.wait('svc-a', { status: 'running_managed', timeoutMs: 1000 })
+    expect(byStatus.matched).toBe(true)
+    expect(byStatus.reason).toBe('status')
+    expect(byStatus.status).toBe('RUNNING_MANAGED')
+
+    const byReady = await svc.wait('svc-a', { ready: true, timeoutMs: 1000 })
+    expect(byReady.matched).toBe(true)
+    expect(byReady.reason).toBe('ready')
+  })
+
+  it('rejects a wait with no condition', async () => {
+    const runner = execRunner(() => ({ code: 0, stdout: '', stderr: '' }))
+    const svc = await reconciledService(runner)
+    await expect(svc.wait('svc-a', {})).rejects.toThrow('at least one condition')
   })
 })

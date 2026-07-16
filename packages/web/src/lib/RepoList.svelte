@@ -213,7 +213,9 @@
             {/each}
             <button
               class="act kebab"
-              class:set={!!r.startupCommand}
+              class:set={
+                !!r.startupCommand || Object.values(r.startupCommands ?? {}).some(Boolean)
+              }
               title="startup script for {r.repo.id}"
               aria-label="customize {r.repo.id}"
               onclick={(e) => {

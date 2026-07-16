@@ -49,6 +49,19 @@ export function resolveWorkload(repo: Repo, requested?: string): string | undefi
   return repo.workloads[0]
 }
 
+/** Pod types that can have distinct startup commands. Multi-workload repos use
+ * their discovered types; a single config uses its declared WORKLOAD_TYPE, or
+ * the conventional ui/api label for frontend/backend repos. */
+export function startupPodTypes(repo: Repo): string[] {
+  if (repo.workloads?.length) return [...repo.workloads]
+  return [repo.workloadType ?? (repo.codeArea === 'frontend' ? 'ui' : 'api')]
+}
+
+/** Resolve a lifecycle workload selection to its startup-command pod type. */
+export function startupPodType(repo: Repo, workload?: string): string {
+  return resolveWorkload(repo, workload) ?? startupPodTypes(repo)[0] ?? 'api'
+}
+
 /** Clone a repo scoped to one workload: deployment/pods named `<name>-<type>`,
  *  its own tmux session, and `WORKLOAD_TYPE` pre-answered so devspace deploys
  *  exactly that workload. Returns the repo unchanged when `type` is undefined

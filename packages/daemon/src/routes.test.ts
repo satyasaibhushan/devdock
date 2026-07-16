@@ -85,6 +85,34 @@ describe('daemon routes', () => {
     expect(res.json()).toMatchObject({ ok: true })
   })
 
+  it('PUT /repos/:id/startup saves commands by pod type', async () => {
+    const { svc } = makeService()
+    await svc.reconcileAll()
+    const app = buildApp(svc)
+    const saved = await app.inject({
+      method: 'PUT',
+      url: '/repos/svc-a/startup',
+      payload: { workload: 'api', command: 'pnpm api' },
+    })
+    expect(saved.statusCode).toBe(200)
+    expect(saved.json()).toMatchObject({
+      startupCommand: 'pnpm api',
+      startupCommands: { api: 'pnpm api' },
+    })
+    expect(svc.get('svc-a')?.startupCommands).toEqual({ api: 'pnpm api' })
+  })
+
+  it('PUT /repos/:id/startup validates the command', async () => {
+    const { svc } = makeService()
+    const app = buildApp(svc)
+    const res = await app.inject({
+      method: 'PUT',
+      url: '/repos/svc-a/startup',
+      payload: { workload: 'api' },
+    })
+    expect(res.statusCode).toBe(400)
+  })
+
   it('GET /namespace reports the context namespace and the known list', async () => {
     const { svc } = makeService()
     const app = buildApp(svc)
@@ -243,7 +271,10 @@ describe('daemon routes', () => {
     }
     const svc = new Service(
       { roots: [root], stateFile: join(root, 'state.json') },
-      { runner: vi.fn(async () => ({ code: 0, stdout: '', stderr: '' })), awsCreds: awsCreds as never },
+      {
+        runner: vi.fn(async () => ({ code: 0, stdout: '', stderr: '' })),
+        awsCreds: awsCreds as never,
+      },
     )
     const app = buildApp(svc)
     const res = await app.inject({ method: 'GET', url: '/aws/credential' })
@@ -257,11 +288,123 @@ describe('daemon routes', () => {
     }
     const svc = new Service(
       { roots: [root], stateFile: join(root, 'state.json') },
-      { runner: vi.fn(async () => ({ code: 0, stdout: '', stderr: '' })), awsCreds: awsCreds as never },
+      {
+        runner: vi.fn(async () => ({ code: 0, stdout: '', stderr: '' })),
+        awsCreds: awsCreds as never,
+      },
     )
     const app = buildApp(svc)
     const res = await app.inject({ method: 'GET', url: '/aws/credential' })
     expect(res.statusCode).toBe(503)
     expect(res.json().error).toContain('sign-in')
+  })
+
+  // ---- agent-loop endpoints: /run, /logs/query, /wait ----
+
+  function makeRunService() {
+    const podsJson = JSON.stringify({
+      items: [
+        {
+          metadata: { name: 'svc-a-app-devspace-1' },
+          status: { phase: 'Running', containerStatuses: [{ ready: true, restartCount: 0 }] },
+        },
+      ],
+    })
+    const runner = vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
+      if (cmd === 'kubectl' && args[0] === 'exec') {
+        return { code: 3, stdout: 'ran it', stderr: 'boom' }
+      }
+      if (cmd === 'tmux' && args[0] === 'list-panes')
+        return { code: 0, stdout: 'devdock-svc-a 0\n', stderr: '' }
+      if (cmd === 'kubectl' && args[0] === 'get') {
+        return {
+          code: 0,
+          stdout: args[1] === 'deployments' ? '{"items":[]}' : podsJson,
+          stderr: '',
+        }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+    const svc = new Service({ roots: [root], stateFile: join(root, 'state.json') }, { runner })
+    svc.rescan()
+    return svc
+  }
+
+  it('POST /repos/:id/run returns the real exit code and output', async () => {
+    const svc = makeRunService()
+    await svc.reconcileAll()
+    const app = buildApp(svc)
+    const res = await app.inject({
+      method: 'POST',
+      url: '/repos/svc-a/run',
+      payload: { command: 'pytest -q' },
+    })
+    expect(res.statusCode).toBe(200)
+    expect(res.json()).toMatchObject({
+      ok: false,
+      exitCode: 3,
+      stdout: 'ran it',
+      stderr: 'boom',
+      pod: 'svc-a-app-devspace-1',
+    })
+  })
+
+  it('POST /repos/:id/run 400 without a command, 404 for unknown repo', async () => {
+    const svc = makeRunService()
+    await svc.reconcileAll()
+    const app = buildApp(svc)
+    const noCmd = await app.inject({ method: 'POST', url: '/repos/svc-a/run', payload: {} })
+    expect(noCmd.statusCode).toBe(400)
+    const noRepo = await app.inject({
+      method: 'POST',
+      url: '/repos/nope/run',
+      payload: { command: 'true' },
+    })
+    expect(noRepo.statusCode).toBe(404)
+  })
+
+  it('GET /repos/:id/logs/query reads the application pipe file with a cursor', async () => {
+    const svc = makeRunService()
+    await svc.reconcileAll()
+    mkdirSync(join(root, 'logs'), { recursive: true })
+    writeFileSync(join(root, 'logs', 'svc-a.dev.log'), 'boot ok\n')
+    const app = buildApp(svc)
+    const first = await app.inject({
+      method: 'GET',
+      url: '/repos/svc-a/logs/query?source=application',
+    })
+    expect(first.statusCode).toBe(200)
+    expect(first.json()).toMatchObject({ source: 'application', lines: ['boot ok'] })
+
+    writeFileSync(join(root, 'logs', 'svc-a.dev.log'), 'boot ok\nready\n')
+    const second = await app.inject({
+      method: 'GET',
+      url: `/repos/svc-a/logs/query?source=application&cursor=${encodeURIComponent(first.json().cursor)}`,
+    })
+    expect(second.json().lines).toEqual(['ready'])
+  })
+
+  it('GET /repos/:id/logs/query 400 on a bad source', async () => {
+    const svc = makeRunService()
+    await svc.reconcileAll()
+    const app = buildApp(svc)
+    const res = await app.inject({ method: 'GET', url: '/repos/svc-a/logs/query?source=nope' })
+    expect(res.statusCode).toBe(400)
+  })
+
+  it('POST /repos/:id/wait resolves on status and 400s with no condition', async () => {
+    const svc = makeRunService()
+    await svc.reconcileAll()
+    const app = buildApp(svc)
+    const ok = await app.inject({
+      method: 'POST',
+      url: '/repos/svc-a/wait',
+      payload: { status: 'RUNNING_MANAGED', timeoutMs: 1000 },
+    })
+    expect(ok.statusCode).toBe(200)
+    expect(ok.json()).toMatchObject({ matched: true, reason: 'status', status: 'RUNNING_MANAGED' })
+
+    const bad = await app.inject({ method: 'POST', url: '/repos/svc-a/wait', payload: {} })
+    expect(bad.statusCode).toBe(400)
   })
 })

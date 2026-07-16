@@ -176,10 +176,7 @@ describe('AwsCreds', () => {
     const creds = make(fetchFn, runner)
 
     expect(await creds.warm()).toEqual({ ok: true })
-    expect(grants.map((g) => g.get('grant_type'))).toEqual([
-      'refresh_token',
-      'authorization_code',
-    ])
+    expect(grants.map((g) => g.get('grant_type'))).toEqual(['refresh_token', 'authorization_code'])
     expect(JSON.parse(readFileSync(tokenFile, 'utf8')).refreshToken).toBe('rt-live')
   })
 
@@ -227,7 +224,11 @@ describe('AwsCreds', () => {
       token: () => json({ id_token: 'id-1' }),
     })
     writeFileSync(tokenFile, JSON.stringify({ refreshToken: 'rt-1' }))
-    const creds = make(fetchFn, vi.fn(async () => ok()), { failCooldownMs: 60_000 })
+    const creds = make(
+      fetchFn,
+      vi.fn(async () => ok()),
+      { failCooldownMs: 60_000 },
+    )
 
     const r = await creds.warm()
     expect(r.ok).toBe(false)
@@ -250,7 +251,11 @@ describe('AwsCreds', () => {
           ? new Response('<Error><Message>nope</Message></Error>', { status: 403 })
           : new Response(stsXml(3600_000), { status: 200 }),
     })
-    const creds = make(fetchFn, vi.fn(async () => ok()), { failCooldownMs: 0 })
+    const creds = make(
+      fetchFn,
+      vi.fn(async () => ok()),
+      { failCooldownMs: 0 },
+    )
     expect((await creds.warm()).ok).toBe(false)
     expect((await creds.warm()).ok).toBe(true)
   })

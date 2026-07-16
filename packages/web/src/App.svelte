@@ -28,6 +28,10 @@
   // The repo whose startup-script modal is open, or null when none.
   let customizingId = $state<string | null>(null)
   const customizing = $derived(repos.find((r) => r.repo.id === customizingId) ?? null)
+  const startupTypes = (r: RepoState) =>
+    r.repo.workloads?.length
+      ? r.repo.workloads
+      : [r.repo.workloadType ?? (r.repo.codeArea === 'frontend' ? 'ui' : 'api')]
   // Which workload the detail pane acts on for a multi-workload repo. Null means
   // "follow the repo default"; a value sticks until the user picks another.
   let pickedType = $state<string | null>(null)
@@ -316,11 +320,16 @@
   {#key customizing.repo.id}
     <StartupModal
       repoId={customizing.repo.id}
-      initial={customizing.startupCommand ?? ''}
+      podTypes={startupTypes(customizing)}
+      initial={customizing.startupCommands ?? {}}
       onclose={() => (customizingId = null)}
-      onsaved={(id, command) => {
+      onsaved={(id, commands) => {
         const r = repos.find((x) => x.repo.id === id)
-        if (r) r.startupCommand = command || undefined
+        if (r) {
+          r.startupCommands = commands
+          const defaultType = r.repo.defaultWorkload ?? startupTypes(r)[0]
+          r.startupCommand = defaultType ? commands[defaultType] || undefined : undefined
+        }
       }}
     />
   {/key}

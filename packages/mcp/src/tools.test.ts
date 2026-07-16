@@ -39,6 +39,27 @@ function fakeClient(over: Partial<DaemonClient> = {}): DaemonClient {
     status: async () => repoState(),
     verb: async () => ok,
     logs: async () => ['line one', 'line two'],
+    queryLogs: async () => ({
+      source: 'application' as const,
+      lines: ['line one', 'line two'],
+      cursor: 'f:1:42',
+    }),
+    runIn: async () => ({
+      ok: true,
+      exitCode: 0,
+      stdout: 'all good',
+      stderr: '',
+      pod: 'p',
+      timedOut: false,
+      truncated: false,
+    }),
+    wait: async () => ({
+      matched: true,
+      reason: 'contains' as const,
+      line: 'Uvicorn running',
+      elapsedMs: 1200,
+      cursor: 'f:1:99',
+    }),
     exec: async () => ({ ...ok, stdout: '' }),
     setStartup: async () => {},
     namespace: async () => ({ current: 'uat', known: ['uat', 'prod'] }),
@@ -98,6 +119,7 @@ describe('toolsForScope', () => {
       'devdock_list',
       'devdock_status',
       'devdock_logs',
+      'devdock_wait',
       'devdock_namespace',
       'devdock_auth_status',
       'devdock_term_list',
@@ -111,6 +133,7 @@ describe('toolsForScope', () => {
       'devdock_list',
       'devdock_status',
       'devdock_logs',
+      'devdock_wait',
       'devdock_namespace',
       'devdock_auth_status',
       'devdock_term_list',
@@ -121,6 +144,7 @@ describe('toolsForScope', () => {
       'devdock_restart',
       'devdock_adopt',
       'devdock_clear',
+      'devdock_run',
       'devdock_exec',
       'devdock_set_startup',
       'devdock_set_namespace',
@@ -161,11 +185,99 @@ describe('renderList', () => {
 })
 
 describe('tool handlers', () => {
-  it('logs passes tail and workload through', async () => {
-    const logs = vi.fn(async () => ['x'])
-    const t = allTools(fakeClient({ logs })).find((x) => x.name === 'devdock_logs')
-    await t?.handler({ repo: 'svc-a', tail: 50, workload: 'cron' })
-    expect(logs).toHaveBeenCalledWith('svc-a', 50, 'cron')
+  it('logs queries by source/cursor and renders the header + lines', async () => {
+    const queryLogs = vi.fn(async () => ({
+      source: 'application' as const,
+      lines: ['boot ok'],
+      cursor: 'f:2:10',
+    }))
+    const t = allTools(fakeClient({ queryLogs })).find((x) => x.name === 'devdock_logs')
+    const out = await t?.handler({ repo: 'svc-a', tail: 50, workload: 'cron', cursor: 'f:2:0' })
+    expect(queryLogs).toHaveBeenCalledWith('svc-a', {
+      workload: 'cron',
+      source: undefined,
+      cursor: 'f:2:0',
+      tail: 50,
+      contains: undefined,
+    })
+    expect(out).toBe('[source=application nextCursor=f:2:10]\nboot ok')
+  })
+
+  it('logs surfaces resync and dropped so an agent knows lines were missed', async () => {
+    const t = allTools(
+      fakeClient({
+        queryLogs: async () => ({
+          source: 'devdock' as const,
+          lines: [],
+          cursor: 'h:9',
+          resync: true,
+          dropped: true,
+        }),
+      }),
+    ).find((x) => x.name === 'devdock_logs')
+    const out = (await t?.handler({ repo: 'svc-a' })) as string
+    expect(out).toContain('resync=true')
+    expect(out).toContain('dropped=true')
+    expect(out).toContain('(no new lines)')
+  })
+
+  it('run reports the real exit code and separates stderr', async () => {
+    const runIn = vi.fn(async () => ({
+      ok: false,
+      exitCode: 2,
+      stdout: '1 failed',
+      stderr: 'AssertionError',
+      pod: 'p-devspace-1',
+      timedOut: false,
+      truncated: false,
+    }))
+    const t = allTools(fakeClient({ runIn })).find((x) => x.name === 'devdock_run')
+    const out = await t?.handler({ repo: 'svc-a', command: 'pytest -q', timeoutMs: 60_000 })
+    expect(runIn).toHaveBeenCalledWith('svc-a', 'pytest -q', {
+      workload: undefined,
+      timeoutMs: 60_000,
+    })
+    expect(out).toBe('exit 2 (pod p-devspace-1)\n1 failed\n--- stderr ---\nAssertionError')
+  })
+
+  it('run surfaces infra errors distinctly from command failures', async () => {
+    const t = allTools(
+      fakeClient({
+        runIn: async () => ({
+          ok: false,
+          exitCode: -1,
+          stdout: '',
+          stderr: '',
+          timedOut: false,
+          truncated: false,
+          infraError: 'no running pod for svc-a — start it first',
+        }),
+      }),
+    ).find((x) => x.name === 'devdock_run')
+    expect(await t?.handler({ repo: 'svc-a', command: 'pytest' })).toContain('INFRA ERROR')
+  })
+
+  it('wait renders a match with the line and cursor', async () => {
+    const t = tool('devdock_wait', 'ro')
+    const out = (await t.handler({ repo: 'svc-a', contains: 'Uvicorn running' })) as string
+    expect(out).toContain('matched: contains — Uvicorn running')
+    expect(out).toContain('nextCursor=f:1:99')
+  })
+
+  it('wait renders a timeout distinctly', async () => {
+    const t = allTools(
+      fakeClient({
+        wait: async () => ({
+          matched: false,
+          reason: 'timeout' as const,
+          status: 'CRASHED' as const,
+          elapsedMs: 30_000,
+        }),
+      }),
+    ).find((x) => x.name === 'devdock_wait')
+    const out = (await t?.handler({ repo: 'svc-a', contains: 'ready' })) as string
+    expect(out).toContain('timeout')
+    expect(out).toContain('status=CRASHED')
   })
 
   it('verbs pass the workload through and report ok', async () => {
@@ -217,9 +329,12 @@ describe('tool handlers', () => {
   })
 
   it('set_startup distinguishes save from clear', async () => {
-    expect(await tool('devdock_set_startup').handler({ repo: 'svc-a', command: 'make run' })).toBe(
-      'startup command saved for svc-a',
+    const setStartup = vi.fn(async () => {})
+    const t = allTools(fakeClient({ setStartup })).find((x) => x.name === 'devdock_set_startup')
+    expect(await t?.handler({ repo: 'svc-a', workload: 'worker', command: 'make run' })).toBe(
+      'startup command saved for svc-a/worker',
     )
+    expect(setStartup).toHaveBeenCalledWith('svc-a', 'make run', 'worker')
     expect(await tool('devdock_set_startup').handler({ repo: 'svc-a', command: '' })).toBe(
       'startup command cleared for svc-a',
     )

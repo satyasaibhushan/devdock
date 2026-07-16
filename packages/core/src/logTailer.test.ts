@@ -61,6 +61,33 @@ describe('LogHub', () => {
     hub.push('new')
     expect(seen).toEqual(['new'])
   })
+
+  it('since resumes exactly where a cursor left off', () => {
+    const hub = new LogHub()
+    hub.push('a')
+    const cursor = hub.currentSeq
+    hub.push('b')
+    hub.push('c')
+    const r = hub.since(cursor)
+    expect(r.lines).toEqual(['b', 'c'])
+    expect(r.dropped).toBe(false)
+    // Nothing new since → empty, cursor stable.
+    const r2 = hub.since(r.nextSeq)
+    expect(r2.lines).toEqual([])
+    expect(r2.nextSeq).toBe(r.nextSeq)
+  })
+
+  it('since flags dropped lines once the ring evicts them', () => {
+    const hub = new LogHub(2)
+    hub.push('a')
+    const cursor = hub.currentSeq // 1: has seen 'a'
+    hub.push('b')
+    hub.push('c')
+    hub.push('d') // ring now [c, d]; 'b' evicted
+    const r = hub.since(cursor)
+    expect(r.lines).toEqual(['c', 'd'])
+    expect(r.dropped).toBe(true)
+  })
 })
 
 describe('LogTailer', () => {

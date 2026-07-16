@@ -36,6 +36,8 @@ export interface Repo {
   workloads?: string[]
   /** The workload acted on when none is chosen (the WORKLOAD_TYPE default). */
   defaultWorkload?: string
+  /** A scalar WORKLOAD_TYPE on a single-config repo. */
+  workloadType?: string
   session: string
 }
 
@@ -60,6 +62,8 @@ export interface RepoState {
   updatedAt: number
   /** Command auto-run in the `devspace dev` session once the pod is up. */
   startupCommand?: string
+  /** Startup commands keyed by pod type (api/worker/cron/ui/etc.). */
+  startupCommands?: Record<string, string>
 }
 
 export type Verb = 'start' | 'build' | 'stop' | 'restart' | 'clear'
@@ -160,12 +164,12 @@ export async function adoptRepo(id: string, workload?: string): Promise<void> {
   if (!res.ok) throw new Error(`adopt ${id} → ${res.status}`)
 }
 
-/** Save (or clear, with an empty string) the repo's startup command. */
-export async function saveStartup(id: string, command: string): Promise<void> {
+/** Save (or clear, with an empty string) one pod type's startup command. */
+export async function saveStartup(id: string, podType: string, command: string): Promise<void> {
   const res = await fetch(`/repos/${encodeURIComponent(id)}/startup`, {
     method: 'PUT',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ command }),
+    body: JSON.stringify({ command, workload: podType }),
   })
   if (!res.ok) throw new Error(`save startup ${id} → ${res.status}`)
 }

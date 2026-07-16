@@ -20,6 +20,10 @@ export interface RunResult {
   code: number
   stdout: string
   stderr: string
+  /** True when timeoutMs elapsed and the process was killed. */
+  timedOut?: boolean
+  /** True when output exceeded maxOutputBytes and only the tail was kept. */
+  truncated?: boolean
 }
 
 export interface RunOptions {
@@ -27,6 +31,9 @@ export interface RunOptions {
   /** Kill the process after this many ms. */
   timeoutMs?: number
   env?: NodeJS.ProcessEnv
+  /** Cap each captured stream to this many bytes, keeping the TAIL — the end
+   *  of a test run or stack trace is the informative part. */
+  maxOutputBytes?: number
 }
 
 /** Run a command to completion and capture its output. Never rejects — a
@@ -37,27 +44,39 @@ export function run(cmd: string, args: string[], opts: RunOptions = {}): Promise
     const child = spawn(cmd, args, { cwd: opts.cwd, env: opts.env })
     let stdout = ''
     let stderr = ''
+    let timedOut = false
+    let truncated = false
     let timer: NodeJS.Timeout | undefined
 
     if (opts.timeoutMs) {
-      timer = setTimeout(() => child.kill('SIGKILL'), opts.timeoutMs)
+      timer = setTimeout(() => {
+        timedOut = true
+        child.kill('SIGKILL')
+      }, opts.timeoutMs)
+    }
+
+    const cap = (s: string): string => {
+      const max = opts.maxOutputBytes
+      if (!max || s.length <= max) return s
+      truncated = true
+      return s.slice(-max)
     }
 
     child.stdout?.on('data', (d) => {
-      stdout += d
+      stdout = cap(stdout + d)
     })
     child.stderr?.on('data', (d) => {
-      stderr += d
+      stderr = cap(stderr + d)
     })
     child.on('error', (err) => {
       if (timer) clearTimeout(timer)
       const code = (err as NodeJS.ErrnoException).code === 'ENOENT' ? 127 : -1
       const hint = code === 127 ? `${cmd}: command not found` : err.message
-      resolve({ code, stdout, stderr: stderr || hint })
+      resolve({ code, stdout, stderr: stderr || hint, timedOut, truncated })
     })
     child.on('close', (code) => {
       if (timer) clearTimeout(timer)
-      resolve({ code: code ?? -1, stdout, stderr })
+      resolve({ code: code ?? -1, stdout, stderr, timedOut, truncated })
     })
   })
 }

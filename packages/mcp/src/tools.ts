@@ -2,7 +2,7 @@
 // (verbs, exec, namespace/auth mutation, terminals) only when the server runs
 // with rw scope — this is the "ro/rw via token scope" gate. Each tool is a
 // thin call into the daemon client.
-import type { RepoState } from '@devdock/core'
+import type { LogSource, RepoState } from '@devdock/core'
 import { z } from 'zod'
 import type { DaemonClient, RepoVerb, VerbResult } from './client.js'
 
@@ -88,20 +88,67 @@ export function allTools(client: DaemonClient): ToolDef[] {
     },
     {
       name: 'devdock_logs',
-      description: "Return the most recent log lines for a repo's workload.",
+      description:
+        "Read a workload's logs by source with cursor-based resume. source=application is the app's real stdout (the devspace dev pane); container is kubectl logs; devdock is devdock's own verb activity; auto (default) prefers application. Pass the returned cursor back to get only NEW lines since the last read.",
       scope: 'ro',
       inputSchema: {
         ...repoArg,
         ...workloadArg,
+        source: z.enum(['auto', 'application', 'container', 'devdock']).optional(),
+        cursor: z.string().optional().describe('cursor from a previous devdock_logs/devdock_wait'),
         tail: z.number().int().positive().max(2000).optional(),
+        contains: z.string().optional().describe('only lines containing this substring'),
       },
       handler: async (a) => {
-        const lines = await client.logs(
-          a.repo as string,
-          a.tail as number | undefined,
-          a.workload as string | undefined,
-        )
-        return lines.length ? lines.join('\n') : '(no logs)'
+        const r = await client.queryLogs(a.repo as string, {
+          workload: a.workload as string | undefined,
+          source: a.source as LogSource | undefined,
+          cursor: a.cursor as string | undefined,
+          tail: a.tail as number | undefined,
+          contains: a.contains as string | undefined,
+        })
+        const flags = [
+          r.resync ? 'resync=true (cursor was stale; restarted from the tail)' : '',
+          r.dropped ? 'dropped=true (some lines were lost before this read)' : '',
+        ].filter(Boolean)
+        const head = `[source=${r.source}${r.pod ? ` pod=${r.pod}` : ''} nextCursor=${r.cursor}${
+          flags.length ? ` ${flags.join(' ')}` : ''
+        }]`
+        return r.lines.length ? `${head}\n${r.lines.join('\n')}` : `${head}\n(no new lines)`
+      },
+    },
+    {
+      name: 'devdock_wait',
+      description:
+        'Block until a condition holds (or timeout): contains= a NEW log line with the substring appears (watching starts now unless a cursor is given), status= the workload reaches it (e.g. RUNNING_MANAGED), ready= a pod is ready. Conditions are OR’d. Use after devdock_run/restart to know when the app actually reloaded — no polling needed.',
+      scope: 'ro',
+      inputSchema: {
+        ...repoArg,
+        ...workloadArg,
+        contains: z.string().optional().describe('log substring to wait for'),
+        source: z.enum(['auto', 'application', 'container', 'devdock']).optional(),
+        cursor: z.string().optional().describe('watch from this cursor instead of from now'),
+        status: z.string().optional().describe('workload status to wait for'),
+        ready: z.boolean().optional().describe('wait for a ready pod'),
+        timeoutMs: z.number().int().positive().max(120_000).optional(),
+      },
+      handler: async (a) => {
+        const r = await client.wait(a.repo as string, {
+          workload: a.workload as string | undefined,
+          contains: a.contains as string | undefined,
+          source: a.source as LogSource | undefined,
+          cursor: a.cursor as string | undefined,
+          status: a.status as string | undefined,
+          ready: a.ready as boolean | undefined,
+          timeoutMs: a.timeoutMs as number | undefined,
+        })
+        const tail = `${r.status ? ` status=${r.status}` : ''} elapsedMs=${r.elapsedMs}${
+          r.cursor ? ` nextCursor=${r.cursor}` : ''
+        }`
+        if (r.matched) {
+          return `matched: ${r.reason}${r.line ? ` — ${r.line}` : ''}${tail}`
+        }
+        return `timeout: condition not met within the window${tail}`
       },
     },
     {
@@ -162,9 +209,38 @@ export function allTools(client: DaemonClient): ToolDef[] {
       }),
     ),
     {
+      name: 'devdock_run',
+      description:
+        "Run a one-shot command inside the workload's pod and get its REAL exit code, stdout, and stderr (kubectl exec). Use this for tests/lint/checks in an edit→verify loop. infraError set means devdock/cluster plumbing failed (no pod, auth, connectivity) — NOT the command; fix that first instead of treating it as a test failure.",
+      scope: 'rw',
+      inputSchema: {
+        ...repoArg,
+        ...workloadArg,
+        command: z.string().min(1).describe('shell command to run in the pod (sh -c)'),
+        timeoutMs: z.number().int().positive().max(600_000).optional(),
+      },
+      handler: async (a) => {
+        const r = await client.runIn(a.repo as string, a.command as string, {
+          workload: a.workload as string | undefined,
+          timeoutMs: a.timeoutMs as number | undefined,
+        })
+        if (r.infraError) return `INFRA ERROR (command did not run to completion): ${r.infraError}`
+        const head = `exit ${r.exitCode}${r.pod ? ` (pod ${r.pod})` : ''}${
+          r.timedOut ? ' — TIMED OUT, output below is partial' : ''
+        }${r.truncated ? ' — output truncated to the tail' : ''}`
+        const body = [
+          r.stdout.trimEnd(),
+          r.stderr.trimEnd() ? `--- stderr ---\n${r.stderr.trimEnd()}` : '',
+        ]
+          .filter(Boolean)
+          .join('\n')
+        return body ? `${head}\n${body}` : `${head}\n(no output)`
+      },
+    },
+    {
       name: 'devdock_exec',
       description:
-        "Type a one-off command into a workload's dev session (tmux send-keys — fire-and-forget, output stays in the session). To capture output, open a terminal and use devdock_term_run instead.",
+        "Type a one-off command into a workload's dev session (tmux send-keys — fire-and-forget, output stays in the session). For a real exit code and captured output use devdock_run; for an interactive shell use devdock_term_run.",
       scope: 'rw',
       inputSchema: {
         ...repoArg,
@@ -185,14 +261,20 @@ export function allTools(client: DaemonClient): ToolDef[] {
     {
       name: 'devdock_set_startup',
       description:
-        "Save the command auto-run in a repo's dev session once its pod is up (empty string clears it).",
+        "Save the command auto-run once a pod type's dev session is up (empty string clears it). Use workload for distinct api/worker/cron/ui commands; omit it for the repo default.",
       scope: 'rw',
-      inputSchema: { ...repoArg, command: z.string().describe('startup command; "" to clear') },
+      inputSchema: {
+        ...repoArg,
+        ...workloadArg,
+        command: z.string().describe('startup command; "" to clear'),
+      },
       handler: async (a) => {
-        await client.setStartup(a.repo as string, a.command as string)
+        const workload = a.workload as string | undefined
+        await client.setStartup(a.repo as string, a.command as string, workload)
+        const target = `${a.repo}${workload ? `/${workload}` : ''}`
         return (a.command as string).trim()
-          ? `startup command saved for ${a.repo}`
-          : `startup command cleared for ${a.repo}`
+          ? `startup command saved for ${target}`
+          : `startup command cleared for ${target}`
       },
     },
     {

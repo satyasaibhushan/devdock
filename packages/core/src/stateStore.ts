@@ -16,9 +16,9 @@ interface Persisted {
   /** last-known status per repo id, keyed for fast lookup across restarts. */
   status: Record<string, RepoStatus>
   grants: Grant[]
-  /** Optional per-repo command auto-run in the `devspace dev` session once its
-   *  pod is up (e.g. the app's start script). Keyed by repo id. */
-  startup: Record<string, string>
+  /** Startup commands by repo and pod type. A string is the legacy per-repo
+   *  shape and applies to every type until the first type-specific edit. */
+  startup: Record<string, string | Record<string, string>>
   /** Startup commands queued by a start whose dev pod isn't ready yet, keyed by
    *  workload key. Persisted because the ready-wait spans a whole devspace
    *  deploy (minutes) — a daemon restart or crash inside that window must not
@@ -96,14 +96,33 @@ export class StateStore {
     this.flush()
   }
 
-  getStartup(repo: string): string | undefined {
-    return this.data.startup[repo]
+  getStartup(repo: string, podType: string): string | undefined {
+    const value = this.data.startup[repo]
+    return typeof value === 'string' ? value : value?.[podType]
   }
 
-  /** Set (or, for an empty command, clear) the repo's startup command. */
-  setStartup(repo: string, command: string): void {
+  /** Return the resolved command for every pod type. Legacy commands are
+   *  expanded in-memory so clients see the behavior they already had. */
+  getStartupCommands(repo: string, podTypes: string[]): Record<string, string> {
+    const value = this.data.startup[repo]
+    if (typeof value === 'string') {
+      return Object.fromEntries(podTypes.map((type) => [type, value]))
+    }
+    return Object.fromEntries(podTypes.map((type) => [type, value?.[type] ?? '']))
+  }
+
+  /** Set (or, for an empty command, clear) one pod type's startup command.
+   *  Editing a legacy per-repo command first expands it across known types. */
+  setStartup(repo: string, podType: string, command: string, podTypes: string[]): void {
+    const current = this.data.startup[repo]
+    const commands =
+      typeof current === 'string'
+        ? Object.fromEntries(podTypes.map((type) => [type, current]))
+        : { ...current }
     const trimmed = command.trim()
-    if (trimmed) this.data.startup[repo] = trimmed
+    if (trimmed) commands[podType] = trimmed
+    else delete commands[podType]
+    if (Object.keys(commands).length) this.data.startup[repo] = commands
     else delete this.data.startup[repo]
     this.flush()
   }

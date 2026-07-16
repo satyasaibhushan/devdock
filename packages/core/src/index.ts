@@ -56,7 +56,20 @@ export {
   type ServiceOptions,
   type ServiceDeps,
   type NamespaceInfo,
+  type LogSource,
+  type LogQueryOptions,
+  type LogQueryResult,
+  type WorkloadRunResult,
+  type WaitOptions,
+  type WaitResult,
 } from './service.js'
+export {
+  encodeCursor,
+  decodeCursor,
+  readFileSlice,
+  type Cursor,
+  type FileSlice,
+} from './logQuery.js'
 export {
   checkTools,
   missingToolWarnings,

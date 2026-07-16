@@ -117,9 +117,10 @@ export interface RepoState {
   hasSession: boolean
   /** epoch ms of last reconcile. */
   updatedAt: number
-  /** Per-repo command auto-run in the `devspace dev` session once its pod is up
-   *  (the app's start script). Undefined when none is configured. */
+  /** Command for the repo's default pod type. Kept for older clients. */
   startupCommand?: string
+  /** Commands auto-run once each pod type's `devspace dev` session is ready. */
+  startupCommands?: Record<string, string>
 }
 
 /** Terminal access mode (spec §8). */

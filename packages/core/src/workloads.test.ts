@@ -5,6 +5,8 @@ import {
   assembleState,
   resolveWorkload,
   scopeRepo,
+  startupPodType,
+  startupPodTypes,
   workloadTypes,
 } from './workloads.js'
 
@@ -108,6 +110,19 @@ describe('resolveWorkload', () => {
   })
   it('is undefined for single-workload repos regardless of request', () => {
     expect(resolveWorkload(single, 'api')).toBeUndefined()
+  })
+})
+
+describe('startup pod types', () => {
+  it('uses discovered workload types and resolves the selected one', () => {
+    expect(startupPodTypes(base)).toEqual(['api', 'cron', 'worker'])
+    expect(startupPodType(base, 'worker')).toBe('worker')
+  })
+
+  it('labels single frontend and backend repos conventionally', () => {
+    expect(startupPodTypes({ ...single, codeArea: 'frontend' })).toEqual(['ui'])
+    expect(startupPodTypes({ ...single, codeArea: 'backend' })).toEqual(['api'])
+    expect(startupPodTypes({ ...single, workloadType: 'cron' })).toEqual(['cron'])
   })
 })
 

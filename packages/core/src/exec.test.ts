@@ -1,5 +1,30 @@
 import { describe, expect, it } from 'vitest'
-import { LineSplitter, runStream } from './exec.js'
+import { LineSplitter, run, runStream } from './exec.js'
+
+describe('run', () => {
+  it('reports timedOut when the timeout kills the process', async () => {
+    const r = await run('node', ['-e', 'setTimeout(() => {}, 60_000)'], { timeoutMs: 100 })
+    expect(r.timedOut).toBe(true)
+    expect(r.code).not.toBe(0)
+  })
+
+  it('keeps the tail when output exceeds maxOutputBytes', async () => {
+    const r = await run('node', ['-e', `process.stdout.write('x'.repeat(5000) + 'THE-END')`], {
+      maxOutputBytes: 100,
+    })
+    expect(r.code).toBe(0)
+    expect(r.truncated).toBe(true)
+    expect(r.stdout.length).toBeLessThanOrEqual(100)
+    expect(r.stdout.endsWith('THE-END')).toBe(true)
+  })
+
+  it('leaves flags falsy on a clean run', async () => {
+    const r = await run('node', ['-e', `process.stdout.write('ok')`])
+    expect(r.code).toBe(0)
+    expect(r.timedOut).toBe(false)
+    expect(r.truncated).toBe(false)
+  })
+})
 
 describe('LineSplitter', () => {
   it('emits whole lines, carrying partials across chunks', () => {
