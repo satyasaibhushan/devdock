@@ -994,6 +994,29 @@ describe('Service.queryLogs', () => {
     expect((await svc.queryLogs('svc-a')).source).toBe('application')
   })
 
+  it('auto ignores a stale application pipe when only an external pod is active', async () => {
+    const base = cannedRunner(READY_PODS, false)
+    const runner = vi.fn(async (cmd: string, args: string[], opts?: object): Promise<RunResult> => {
+      if (cmd === 'kubectl' && args[0] === 'logs') {
+        return { code: 0, stdout: 'current container log\n', stderr: '' }
+      }
+      return base(cmd, args, opts as never)
+    })
+    const svc = new Service(
+      { roots: [root], stateFile },
+      { runner, streamSpawner: fakeStreamSpawner().spawner },
+    )
+    svc.rescan()
+    await svc.reconcileAll()
+    writePipe('stale managed-session log\n')
+
+    const result = await svc.queryLogs('svc-a')
+
+    expect(svc.get('svc-a')?.status).toBe('RUNNING_EXTERNAL')
+    expect(result.source).toBe('container')
+    expect(result.lines).toEqual(['current container log'])
+  })
+
   it('devdock source resumes from a hub cursor', async () => {
     const runner = execRunner(() => ({ code: 0, stdout: '', stderr: '' }))
     const svc = await reconciledService(runner)

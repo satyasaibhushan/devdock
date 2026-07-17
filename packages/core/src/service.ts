@@ -932,8 +932,12 @@ export class Service {
 
     let source = opts.source ?? 'auto'
     if (source === 'auto') {
-      if (readFileSlice(this.devLogPath(key), 0, 1)) source = 'application'
+      const state = this.states.get(id)
+      const workloadState = type ? state?.workloads.find((w) => w.type === type) : state
+      const applicationLogExists = readFileSlice(this.devLogPath(key), 0, 1) !== undefined
+      if (workloadState?.hasSession && applicationLogExists) source = 'application'
       else if (this.pickPod(id, type)) source = 'container'
+      else if (applicationLogExists) source = 'application'
       else source = 'devdock'
     }
 
