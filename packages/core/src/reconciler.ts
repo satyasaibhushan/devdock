@@ -50,23 +50,38 @@ export function deriveStatus(
 
 /** Name-prefix attribution shared by pods and deployments: devspace names both
  *  `<project>-...` / `<project>-devspace-...`. An empty/whitespace name matches
- *  nothing (can't attribute). */
-function matchByName<T extends { name: string }>(items: T[], name: string): T[] {
+ *  nothing (can't attribute). Longest known name wins: an item claimed by a
+ *  longer sibling name (e.g. replica `svc-r1` under parent `svc`) is not also
+ *  attributed to the shorter prefix. */
+function matchByName<T extends { name: string }>(
+  items: T[],
+  name: string,
+  knownNames: string[] = [],
+): T[] {
   const n = name.trim()
   if (!n) return []
-  return items.filter((i) => i.name === n || i.name.startsWith(`${n}-`))
+  const shadows = knownNames.filter((o) => o !== n && o.startsWith(`${n}-`))
+  return items.filter(
+    (i) =>
+      (i.name === n || i.name.startsWith(`${n}-`)) &&
+      !shadows.some((s) => i.name === s || i.name.startsWith(`${s}-`)),
+  )
 }
 
 /** Keep only pods that belong to this repo by devspace's naming convention.
  *  Without this, an unscoped namespace query attributes every pod (e.g. a
  *  crashed `registry`) to every repo. */
-export function matchPods(pods: PodInfo[], name: string): PodInfo[] {
-  return matchByName(pods, name)
+export function matchPods(pods: PodInfo[], name: string, knownNames: string[] = []): PodInfo[] {
+  return matchByName(pods, name, knownNames)
 }
 
 /** Keep only deployment objects that belong to this repo, same convention. */
-export function matchDeployments(deployments: DeploymentInfo[], name: string): DeploymentInfo[] {
-  return matchByName(deployments, name)
+export function matchDeployments(
+  deployments: DeploymentInfo[],
+  name: string,
+  knownNames: string[] = [],
+): DeploymentInfo[] {
+  return matchByName(deployments, name, knownNames)
 }
 
 /** Parse `kubectl get pods -o json` into PodInfo[]. Defensive against junk. */
@@ -133,6 +148,9 @@ export function parseDeployments(json: string): DeploymentInfo[] {
 export interface ClusterCache {
   pods: Map<string, PodInfo[] | null>
   deployments: Map<string, DeploymentInfo[] | null>
+  /** Every name that can claim pods/deployments this pass (repo, member, and
+   *  workload-scoped names) — lets attribution give the longest name priority. */
+  knownNames?: string[]
 }
 
 export function newClusterCache(): ClusterCache {
@@ -167,7 +185,7 @@ export class Reconciler {
     const rawPods = await this.fetchPods(repo, cache)
     const rawDeployments = await this.fetchDeployments(repo, cache)
     const pods = rawPods ?? []
-    const deployments = matchDeployments(rawDeployments ?? [], repo.name)
+    const deployments = matchDeployments(rawDeployments ?? [], repo.name, cache.knownNames)
     const ws: WorkloadState = {
       type,
       status: deriveStatus(pods, hasSession, deployments.length > 0, sessionDead, {
@@ -199,7 +217,7 @@ export class Reconciler {
     if (pods === null) return null
     // Attribute pods to this repo by name (devspace names pods after the
     // project) unless an explicit label selector already scoped the query.
-    return repo.selector ? pods : matchPods(pods, repo.name)
+    return repo.selector ? pods : matchPods(pods, repo.name, cache.knownNames)
   }
 
   /** Namespace-wide deployment objects; the caller attributes by name. No label

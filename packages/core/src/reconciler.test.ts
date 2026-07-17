@@ -101,6 +101,32 @@ describe('matchPods', () => {
   it('an empty name attributes nothing', () => {
     expect(matchPods(pods, '  ')).toEqual([])
   })
+
+  it('a longer known name claims its pods away from the shorter prefix', () => {
+    const mixed: PodInfo[] = [
+      { name: 'svc-api-devspace-abc', phase: 'Running', ready: true, restartCount: 0 },
+      { name: 'svc-r1-api-devspace-def', phase: 'Running', ready: true, restartCount: 0 },
+      { name: 'svc-r1-api', phase: 'Running', ready: true, restartCount: 0 },
+    ]
+    const known = ['svc-api', 'svc-r1-api']
+    expect(matchPods(mixed, 'svc-api', known).map((p) => p.name)).toEqual(['svc-api-devspace-abc'])
+    expect(matchPods(mixed, 'svc-r1-api', known).map((p) => p.name)).toEqual([
+      'svc-r1-api-devspace-def',
+      'svc-r1-api',
+    ])
+  })
+
+  it('an exact-name pod is never shadowed by a longer known name', () => {
+    const exact: PodInfo[] = [{ name: 'svc', phase: 'Running', ready: true, restartCount: 0 }]
+    expect(matchPods(exact, 'svc', ['svc', 'svc-r1'])).toHaveLength(1)
+  })
+
+  it('without knownNames the prefix behavior is unchanged', () => {
+    const mixed: PodInfo[] = [
+      { name: 'svc-r1-api-devspace-def', phase: 'Running', ready: true, restartCount: 0 },
+    ]
+    expect(matchPods(mixed, 'svc')).toHaveLength(1)
+  })
 })
 
 describe('parseDeployments', () => {
@@ -132,6 +158,19 @@ describe('matchDeployments', () => {
     expect(matchDeployments(deps, 'jobs-ui').map((d) => d.name)).toEqual([
       'jobs-ui',
       'jobs-ui-devspace',
+    ])
+  })
+  it('a longer known name claims its deployments away from the shorter prefix', () => {
+    const deps: DeploymentInfo[] = [
+      { name: 'jobs-ui', replicas: 0, readyReplicas: 0 },
+      { name: 'jobs-ui-r1', replicas: 0, readyReplicas: 0 },
+      { name: 'jobs-ui-r1-devspace', replicas: 0, readyReplicas: 0 },
+    ]
+    const known = ['jobs-ui', 'jobs-ui-r1']
+    expect(matchDeployments(deps, 'jobs-ui', known).map((d) => d.name)).toEqual(['jobs-ui'])
+    expect(matchDeployments(deps, 'jobs-ui-r1', known).map((d) => d.name)).toEqual([
+      'jobs-ui-r1',
+      'jobs-ui-r1-devspace',
     ])
   })
 })
@@ -233,6 +272,29 @@ describe('Reconciler', () => {
     )
     expect(state.status).toBe('STOPPED')
     expect(state.deployments).toEqual([])
+  })
+
+  it('cache.knownNames keeps a replica’s pods out of the parent’s view', async () => {
+    const podsJson = JSON.stringify({
+      items: [
+        {
+          metadata: { name: 'svc-devspace-xyz' },
+          status: { phase: 'Running', containerStatuses: [{ ready: true, restartCount: 0 }] },
+        },
+        {
+          metadata: { name: 'svc-r1-devspace-xyz' },
+          status: { phase: 'Running', containerStatuses: [{ ready: true, restartCount: 0 }] },
+        },
+      ],
+    })
+    const rec = new Reconciler(clusterRunner(podsJson))
+    const cache = newClusterCache()
+    cache.knownNames = ['svc', 'svc-r1']
+    const parent = await rec.reconcile(repo, true, cache)
+    expect(parent.pods.map((p) => p.name)).toEqual(['svc-devspace-xyz'])
+    const replica: Repo = { ...repo, id: 'svc-r1', name: 'svc-r1', session: 'devdock-svc-r1' }
+    const rep = await rec.reconcile(replica, true, cache)
+    expect(rep.pods.map((p) => p.name)).toEqual(['svc-r1-devspace-xyz'])
   })
 
   it('a shared cache issues one kubectl query per namespace per pass', async () => {

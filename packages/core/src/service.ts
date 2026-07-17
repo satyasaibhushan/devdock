@@ -635,6 +635,8 @@ export class Service {
     // One `tmux list-panes -a` answers "is each workload's session live/dead?" —
     // the pass shares the map so a 47-repo reconcile is a single tmux call.
     const states = sessions ?? (await this.supervisor.sessionStates())
+    const cc = cache ?? newClusterCache()
+    cc.knownNames ??= this.knownClusterNames()
 
     const workloads = []
     for (const type of workloadTypes(repo)) {
@@ -649,7 +651,7 @@ export class Service {
       const ws = await this.reconciler.reconcileWorkload(
         scoped,
         hasSession,
-        cache ?? newClusterCache(),
+        cc,
         type ?? repo.defaultWorkload ?? '',
         sessionDead,
       )
@@ -735,6 +737,18 @@ export class Service {
     this.applyStartupCommands(state)
     this.applyState(state)
     return state
+  }
+
+  /** Every name that can claim pods this pass — repo names plus their
+   *  workload-scoped variants — so attribution lets the longest name win
+   *  (a replica's pods must not also count as its parent's). */
+  private knownClusterNames(): string[] {
+    const names = new Set<string>()
+    for (const repo of this.repos.values()) {
+      names.add(repo.name)
+      for (const type of workloadTypes(repo)) names.add(scopeRepo(repo, type).name)
+    }
+    return [...names]
   }
 
   async reconcileAll(): Promise<RepoState[]> {
