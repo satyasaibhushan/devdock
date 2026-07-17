@@ -3,7 +3,13 @@
 
 export * from './types.js'
 export * from './exec.js'
-export { StateStore, type Grant } from './stateStore.js'
+export { StateStore, type Grant, type ReplicaRecord } from './stateStore.js'
+export {
+  nextReplicaId,
+  generateReplicaConfig,
+  ingressPathOf,
+  aliasIngressManifest,
+} from './replicas.js'
 export {
   scanRepos,
   parseDevspaceConfig,
