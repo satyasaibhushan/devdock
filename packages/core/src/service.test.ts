@@ -1190,6 +1190,8 @@ describe('Service replicas', () => {
       'ns',
       '--ignore-not-found',
     ])
+    expect(runner).toHaveBeenCalledWith('helm', ['uninstall', 'parent-r1-api', '-n', 'ns'])
+    expect(runner).toHaveBeenCalledWith('helm', ['uninstall', 'parent-r1-worker', '-n', 'ns'])
     expect(runner).toHaveBeenCalledWith('git', [
       '-C',
       parentPath(),

@@ -728,6 +728,14 @@ export class Service {
         rec.namespace,
         '--ignore-not-found',
       ]).catch(() => undefined)
+      // purge leaves the chart's stopped-state release behind (ExternalName
+      // service + base ingress routing to uat); a deleted replica must not.
+      for (const cfg of rec.configPaths) {
+        const release = basename(dirname(cfg))
+        await this.kubectl('helm', ['uninstall', release, '-n', rec.namespace]).catch(
+          () => undefined,
+        )
+      }
     }
     const parentPath = this.repos.get(rec.parentId)?.path ?? dirname(dirname(dirname(rec.path)))
     const removed = await this.runner('git', [
