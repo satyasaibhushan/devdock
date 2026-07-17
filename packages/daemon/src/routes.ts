@@ -83,6 +83,52 @@ export function buildApp(service: Service): FastifyInstance {
     },
   )
 
+  // Replicas — ephemeral branch-pinned parallel deployments. Create returns as
+  // soon as the record persists; the deploy runs in the background (poll /wait).
+  app.get<{ Params: { id: string } }>('/repos/:id/branches', async (req, reply) => {
+    try {
+      return await service.listBranches(req.params.id)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      return reply.code(message.includes('unknown repo') ? 404 : 500).send({ error: message })
+    }
+  })
+
+  app.post<{ Params: { id: string }; Body: { branch?: string } }>(
+    '/repos/:id/replicas',
+    async (req, reply) => {
+      const branch = req.body?.branch
+      if (typeof branch !== 'string' || !branch.trim()) {
+        return reply.code(400).send({ error: 'branch required' })
+      }
+      try {
+        return reply.code(201).send(await service.createReplica(req.params.id, branch))
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        const code = message.includes('unknown repo')
+          ? 404
+          : message.includes('replica of a replica') || message.includes('member layout')
+            ? 400
+            : 500
+        return reply.code(code).send({ error: message })
+      }
+    },
+  )
+
+  app.get('/replicas', async () => service.listReplicas())
+
+  app.delete<{ Params: { id: string } }>('/replicas/:id', async (req, reply) => {
+    try {
+      await service.deleteReplica(req.params.id)
+      return { ok: true }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      return reply.code(message.includes('unknown replica') ? 404 : 500).send({ error: message })
+    }
+  })
+
+  app.post('/replicas/gc', async () => ({ deleted: await service.gcReplicas() }))
+
   // One-shot command in the workload's pod with a REAL exit code (kubectl
   // exec) — the agent-loop counterpart to /exec's fire-and-forget send-keys.
   app.post<{

@@ -392,6 +392,97 @@ describe('daemon routes', () => {
     expect(res.statusCode).toBe(400)
   })
 
+  // ---- replica endpoints ----
+
+  function makeReplicaService() {
+    for (const type of ['api', 'worker']) {
+      const dir = join(root, 'parent', '.devspace', `parent-${type}`)
+      mkdirSync(dir, { recursive: true })
+      writeFileSync(
+        join(dir, 'devspace.yaml'),
+        [
+          `name: parent-${type}`,
+          'namespace: ns',
+          'vars:',
+          `  WORKLOAD_TYPE: ${type}`,
+          '  INGRESS_PATH: parent',
+        ].join('\n'),
+      )
+    }
+    const runner = vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
+      if (cmd === 'git' && args.includes('for-each-ref'))
+        return { code: 0, stdout: 'main\t1700000000\nfeature-x\t1690000000\n', stderr: '' }
+      if (cmd === 'tmux' && args[0] === 'has-session') return { code: 1, stdout: '', stderr: '' }
+      if (cmd === 'kubectl') return { code: 0, stdout: '{"items":[]}', stderr: '' }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+    const svc = new Service({ roots: [root], stateFile: join(root, 'state.json') }, { runner })
+    svc.rescan()
+    return svc
+  }
+
+  it('GET /repos/:id/branches lists local branches, 404 for unknown repo', async () => {
+    const app = buildApp(makeReplicaService())
+    const res = await app.inject({ method: 'GET', url: '/repos/parent/branches' })
+    expect(res.statusCode).toBe(200)
+    expect(res.json()).toEqual([
+      { name: 'main', lastCommitAt: 1_700_000_000_000 },
+      { name: 'feature-x', lastCommitAt: 1_690_000_000_000 },
+    ])
+    expect((await app.inject({ method: 'GET', url: '/repos/nope/branches' })).statusCode).toBe(404)
+  })
+
+  it('replica lifecycle over HTTP: create 201, list, delete, gc', async () => {
+    const app = buildApp(makeReplicaService())
+    const created = await app.inject({
+      method: 'POST',
+      url: '/repos/parent/replicas',
+      payload: { branch: 'feature-x' },
+    })
+    expect(created.statusCode).toBe(201)
+    expect(created.json()).toMatchObject({
+      id: 'parent-r1',
+      parentId: 'parent',
+      branch: 'feature-x',
+    })
+
+    const list = await app.inject({ method: 'GET', url: '/replicas' })
+    expect(list.json().map((r: { id: string }) => r.id)).toEqual(['parent-r1'])
+
+    const gone = await app.inject({ method: 'DELETE', url: '/replicas/parent-r1' })
+    expect(gone.json()).toEqual({ ok: true })
+    expect((await app.inject({ method: 'GET', url: '/replicas' })).json()).toEqual([])
+    expect((await app.inject({ method: 'DELETE', url: '/replicas/parent-r1' })).statusCode).toBe(
+      404,
+    )
+
+    const gc = await app.inject({ method: 'POST', url: '/replicas/gc' })
+    expect(gc.json()).toEqual({ deleted: [] })
+  })
+
+  it('POST /repos/:id/replicas validates branch, layout, and repo', async () => {
+    const app = buildApp(makeReplicaService())
+    const noBranch = await app.inject({
+      method: 'POST',
+      url: '/repos/parent/replicas',
+      payload: {},
+    })
+    expect(noBranch.statusCode).toBe(400)
+    const singleConfig = await app.inject({
+      method: 'POST',
+      url: '/repos/svc-a/replicas',
+      payload: { branch: 'main' },
+    })
+    expect(singleConfig.statusCode).toBe(400)
+    expect(singleConfig.json().error).toContain('member layout')
+    const unknown = await app.inject({
+      method: 'POST',
+      url: '/repos/nope/replicas',
+      payload: { branch: 'main' },
+    })
+    expect(unknown.statusCode).toBe(404)
+  })
+
   it('POST /repos/:id/wait resolves on status and 400s with no condition', async () => {
     const svc = makeRunService()
     await svc.reconcileAll()
