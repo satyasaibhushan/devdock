@@ -120,18 +120,24 @@ describe('Supervisor', () => {
     expect(lines).toEqual(['deploying chart…'])
   })
 
-  it('kill purges (via a login shell) then kills the session', async () => {
+  it('kill removes the session and lock first, then purges (via a login shell)', async () => {
     const calls: { cmd: string; args: string[] }[] = []
-    const runner = vi.fn(async (cmd: string, args: string[]) => {
+    const nsRepo: Repo = { ...repo, namespace: 'panels' }
+    const runner = vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
       calls.push({ cmd, args })
+      if (cmd === 'kubectl' && args.includes('get')) {
+        return ok(JSON.stringify({ data: { 'svc-a': 'server: http://localhost:8091\nrunID: x' } }))
+      }
       return ok()
     })
-    await new Supervisor(runner).kill(repo)
-    expect(calls[0]).toEqual({
+    await new Supervisor(runner).kill(nsRepo)
+    // devdock's own dev session holds the project lock — purge must come last.
+    expect(calls[0]).toEqual({ cmd: 'tmux', args: ['kill-session', '-t', '=devdock-svc-a'] })
+    expect(calls.some((c) => c.cmd === 'kubectl' && c.args.includes('patch'))).toBe(true)
+    expect(calls[calls.length - 1]).toEqual({
       cmd: loginShell,
-      args: [loginShellArgs, devspaceCommand(repo, 'purge')],
+      args: [loginShellArgs, devspaceCommand(nsRepo, 'purge')],
     })
-    expect(calls[1]).toEqual({ cmd: 'tmux', args: ['kill-session', '-t', '=devdock-svc-a'] })
   })
 
   it('clear kills the session, releases the lock, and runs reset pods (not purge)', async () => {

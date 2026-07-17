@@ -165,17 +165,19 @@ export class Supervisor {
     return this.streamRunner(loginShell, args, {}, onLine)
   }
 
-  /** Tear down: `devspace purge` (through a login shell), then kill the tmux
-   *  session if present. */
+  /** Tear down: kill the tmux session first — devdock's own `devspace dev`
+   *  inside it holds the project's namespace session lock, and a purge run
+   *  under a live session fails on that lock — release the lock, then
+   *  `devspace purge` through a login shell. */
   async kill(repo: Repo, onLine?: LineSink): Promise<RunResult> {
-    const args = [loginShellArgs, devspaceCommand(repo, 'purge')]
-    const purge = onLine
-      ? await this.streamRunner(loginShell, args, {}, onLine)
-      : await this.runner(loginShell, args)
     await this.runner('tmux', ['kill-session', '-t', exactTarget(repo.session)]).catch(
       () => undefined,
     )
-    return purge
+    await this.releaseSessionLock(repo)
+    const args = [loginShellArgs, devspaceCommand(repo, 'purge')]
+    return onLine
+      ? await this.streamRunner(loginShell, args, {}, onLine)
+      : await this.runner(loginShell, args)
   }
 
   /** Clear a crashed dev session without touching the image or deployment.
