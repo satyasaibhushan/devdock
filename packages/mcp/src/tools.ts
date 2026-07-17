@@ -152,6 +152,40 @@ export function allTools(client: DaemonClient): ToolDef[] {
       },
     },
     {
+      name: 'devdock_branch_list',
+      description:
+        "List a repo's local branches, most recently committed first — the choices for devdock_replica_create.",
+      scope: 'ro',
+      inputSchema: repoArg,
+      handler: async (a) => {
+        const branches = await client.branches(a.repo as string)
+        if (!branches.length) return 'No local branches.'
+        return branches
+          .map((b) => `${b.name}\t${new Date(b.lastCommitAt).toISOString().slice(0, 10)}`)
+          .join('\n')
+      },
+    },
+    {
+      name: 'devdock_replica_list',
+      description:
+        'List replicas (ephemeral branch-pinned parallel deployments): id, parent repo, branch, age, URL path. Replicas older than 2 days are garbage-collected automatically.',
+      scope: 'ro',
+      inputSchema: {},
+      handler: async () => {
+        const replicas = await client.replicaList()
+        if (!replicas.length) return 'No replicas.'
+        return replicas
+          .map((r) => {
+            const ageH = Math.floor((Date.now() - r.createdAt) / 3_600_000)
+            const age = ageH >= 24 ? `${Math.floor(ageH / 24)}d${ageH % 24}h` : `${ageH}h`
+            return `${r.id}\tparent=${r.parentId}\tbranch=${r.branch}\tage=${age}\turl=/${r.id}/${
+              r.ingressApplied ? '' : ' (url pending — appears once pods run)'
+            }`
+          })
+          .join('\n')
+      },
+    },
+    {
       name: 'devdock_namespace',
       description: 'Show the kube context’s current namespace and the selectable known list.',
       scope: 'ro',
@@ -208,6 +242,31 @@ export function allTools(client: DaemonClient): ToolDef[] {
           ),
       }),
     ),
+    {
+      name: 'devdock_replica_create',
+      description:
+        "Deploy a second copy of a repo pinned to a branch, beside the original in the same namespace (own pods, own /<replica-id>/ URL path, primary checkout untouched). Returns immediately with the replica id; the deploy runs in the background — use devdock_wait with the id (e.g. status=running_managed) to know when it's up, then every devdock tool works on the id like a normal repo. Limitation: the replica reuses the parent's deployed image with the branch's code synced in, so changes needing a rebuilt image (new system deps, Dockerfile edits) won't take effect.",
+      scope: 'rw',
+      inputSchema: {
+        ...repoArg,
+        branch: z.string().min(1).describe('local branch to pin the replica to'),
+      },
+      handler: async (a) => {
+        const r = await client.replicaCreate(a.repo as string, a.branch as string)
+        return `created ${r.id} from ${r.branch} — deploying in the background; poll devdock_wait ${r.id}`
+      },
+    },
+    {
+      name: 'devdock_replica_delete',
+      description:
+        'Tear down a replica: its pods, URL alias, and worktree. The parent repo and the branch itself are untouched.',
+      scope: 'rw',
+      inputSchema: { replica: z.string().describe('replica id (from devdock_replica_list)') },
+      handler: async (a) => {
+        await client.replicaDelete(a.replica as string)
+        return `deleted ${a.replica}`
+      },
+    },
     {
       name: 'devdock_run',
       description:

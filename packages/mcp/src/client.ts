@@ -5,12 +5,18 @@ import type {
   LogQueryResult,
   LogSource,
   NamespaceInfo,
+  ReplicaRecord,
   RepoState,
   RunOutcome,
   TermInfo,
   WaitResult,
   WorkloadRunResult,
 } from '@devdock/core'
+
+export interface BranchInfo {
+  name: string
+  lastCommitAt: number
+}
 
 export interface VerbResult {
   ok: boolean
@@ -71,6 +77,10 @@ export interface DaemonClient {
   setNamespace(ns: string): Promise<NamespaceInfo>
   auth(): Promise<AuthState>
   authLogin(): Promise<AuthState>
+  branches(id: string): Promise<BranchInfo[]>
+  replicaCreate(id: string, branch: string): Promise<ReplicaRecord>
+  replicaList(): Promise<ReplicaRecord[]>
+  replicaDelete(id: string): Promise<void>
   termList(): Promise<TermInfo[]>
   termOpen(opts: TermOpenOpts): Promise<TermInfo>
   termRun(tid: string, command: string, timeoutMs?: number): Promise<RunOutcome>
@@ -144,6 +154,12 @@ export function httpClient(baseUrl: string): DaemonClient {
       }),
     auth: () => request<AuthState>('/auth'),
     authLogin: () => post<AuthState>('/auth/login'),
+    branches: (i) => request<BranchInfo[]>(`/repos/${id(i)}/branches`),
+    replicaCreate: (i, branch) => post<ReplicaRecord>(`/repos/${id(i)}/replicas`, { branch }),
+    replicaList: () => request<ReplicaRecord[]>('/replicas'),
+    replicaDelete: async (i) => {
+      await request(`/replicas/${id(i)}`, { method: 'DELETE' })
+    },
     termList: () => request<TermInfo[]>('/terminals'),
     termOpen: (opts) => post<TermInfo>('/terminals', opts),
     termRun: (tid, command, timeoutMs) =>

@@ -62,6 +62,30 @@ function fakeClient(over: Partial<DaemonClient> = {}): DaemonClient {
     }),
     exec: async () => ({ ...ok, stdout: '' }),
     setStartup: async () => {},
+    branches: async () => [
+      { name: 'main', lastCommitAt: Date.UTC(2026, 6, 1) },
+      { name: 'feature-x', lastCommitAt: Date.UTC(2026, 5, 15) },
+    ],
+    replicaCreate: async (id, branch) => ({
+      id: `${id}-r1`,
+      parentId: id,
+      branch,
+      path: `/x/.agents/replicas/${id}-r1`,
+      createdAt: 0,
+      configPaths: [],
+    }),
+    replicaList: async () => [
+      {
+        id: 'svc-a-r1',
+        parentId: 'svc-a',
+        branch: 'feature-x',
+        path: '/x/.agents/replicas/svc-a-r1',
+        createdAt: Date.now() - 26 * 3_600_000,
+        configPaths: [],
+        ingressApplied: true,
+      },
+    ],
+    replicaDelete: async () => {},
     namespace: async () => ({ current: 'uat', known: ['uat', 'prod'] }),
     setNamespace: async (ns) => ({ current: ns, known: ['uat', ns] }),
     auth: async () => ({ oidc: true, phase: 'ok', checkedAt: 1 }),
@@ -120,6 +144,8 @@ describe('toolsForScope', () => {
       'devdock_status',
       'devdock_logs',
       'devdock_wait',
+      'devdock_branch_list',
+      'devdock_replica_list',
       'devdock_namespace',
       'devdock_auth_status',
       'devdock_term_list',
@@ -134,6 +160,8 @@ describe('toolsForScope', () => {
       'devdock_status',
       'devdock_logs',
       'devdock_wait',
+      'devdock_branch_list',
+      'devdock_replica_list',
       'devdock_namespace',
       'devdock_auth_status',
       'devdock_term_list',
@@ -144,6 +172,8 @@ describe('toolsForScope', () => {
       'devdock_restart',
       'devdock_adopt',
       'devdock_clear',
+      'devdock_replica_create',
+      'devdock_replica_delete',
       'devdock_run',
       'devdock_exec',
       'devdock_set_startup',
@@ -326,6 +356,41 @@ describe('tool handlers', () => {
     expect(await tool('devdock_term_list', 'ro').handler({})).toBe(
       'host:t1\tlocal\talive\nsvc-a.cron:t1\tshell\tsvc-a/cron\texited',
     )
+  })
+
+  it('branch_list renders name and date, most recent first', async () => {
+    const out = (await tool('devdock_branch_list', 'ro').handler({ repo: 'svc-a' })) as string
+    expect(out).toBe('main\t2026-07-01\nfeature-x\t2026-06-15')
+  })
+
+  it('replica_create reports the id and points at devdock_wait', async () => {
+    const replicaCreate = vi.fn(fakeClient().replicaCreate)
+    const t = allTools(fakeClient({ replicaCreate })).find(
+      (x) => x.name === 'devdock_replica_create',
+    )
+    const out = await t?.handler({ repo: 'svc-a', branch: 'feature-x' })
+    expect(replicaCreate).toHaveBeenCalledWith('svc-a', 'feature-x')
+    expect(out).toContain('created svc-a-r1 from feature-x')
+    expect(out).toContain('devdock_wait')
+  })
+
+  it('replica_list renders id, parent, branch, age, and url', async () => {
+    const out = (await tool('devdock_replica_list', 'ro').handler({})) as string
+    expect(out).toContain('svc-a-r1')
+    expect(out).toContain('parent=svc-a')
+    expect(out).toContain('branch=feature-x')
+    expect(out).toContain('age=1d2h')
+    expect(out).toContain('url=/svc-a-r1/')
+    expect(out).not.toContain('pending')
+  })
+
+  it('replica_delete passes the id through', async () => {
+    const replicaDelete = vi.fn(async () => {})
+    const t = allTools(fakeClient({ replicaDelete })).find(
+      (x) => x.name === 'devdock_replica_delete',
+    )
+    expect(await t?.handler({ replica: 'svc-a-r1' })).toBe('deleted svc-a-r1')
+    expect(replicaDelete).toHaveBeenCalledWith('svc-a-r1')
   })
 
   it('set_startup distinguishes save from clear', async () => {
