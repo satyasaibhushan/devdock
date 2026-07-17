@@ -38,6 +38,10 @@ export interface Repo {
   defaultWorkload?: string
   /** A scalar WORKLOAD_TYPE on a single-config repo. */
   workloadType?: string
+  /** Set on replicas: the repo this one was cloned from. */
+  parentId?: string
+  /** The branch a replica was created from (detached at its creation-time tip). */
+  branch?: string
   session: string
 }
 
@@ -172,6 +176,53 @@ export async function saveStartup(id: string, podType: string, command: string):
     body: JSON.stringify({ command, workload: podType }),
   })
   if (!res.ok) throw new Error(`save startup ${id} → ${res.status}`)
+}
+
+// ---- replicas ----
+// Ephemeral branch-pinned parallel deployments of a repo (worktree + renamed
+// devspace configs + alias ingress). A replica's id behaves as a normal repo
+// id everywhere else in this API.
+
+export interface BranchInfo {
+  name: string
+  lastCommitAt: number
+}
+
+export interface ReplicaRecord {
+  id: string
+  parentId: string
+  branch: string
+  path: string
+  createdAt: number
+  namespace?: string
+  ingressApplied?: boolean
+}
+
+export async function fetchBranches(id: string): Promise<BranchInfo[]> {
+  const res = await fetch(`/repos/${encodeURIComponent(id)}/branches`)
+  if (!res.ok) throw new Error(`GET branches ${id} → ${res.status}`)
+  return res.json()
+}
+
+export async function createReplica(id: string, branch: string): Promise<ReplicaRecord> {
+  const res = await fetch(`/repos/${encodeURIComponent(id)}/replicas`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ branch }),
+  })
+  if (!res.ok) {
+    const body = (await res.json().catch(() => null)) as { error?: string } | null
+    throw new Error(body?.error ?? `create replica → ${res.status}`)
+  }
+  return res.json()
+}
+
+export async function deleteReplica(id: string): Promise<void> {
+  const res = await fetch(`/replicas/${encodeURIComponent(id)}`, { method: 'DELETE' })
+  if (!res.ok) {
+    const body = (await res.json().catch(() => null)) as { error?: string } | null
+    throw new Error(body?.error ?? `delete replica → ${res.status}`)
+  }
 }
 
 function wsUrl(path: string): string {

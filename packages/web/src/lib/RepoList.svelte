@@ -9,6 +9,8 @@
     onselect,
     onaction,
     oncustomize,
+    onreplicate,
+    onreplicadelete,
   }: {
     repos: RepoState[]
     selectedId: string | null
@@ -17,6 +19,8 @@
     onselect: (id: string) => void
     onaction: (id: string, verb: Verb) => void
     oncustomize: (id: string) => void
+    onreplicate: (id: string) => void
+    onreplicadelete: (id: string) => void
   } = $props()
 
   // `stop` is surfaced as "kill" — the rest read as-is.
@@ -41,10 +45,18 @@
     { title: 'deployed', statuses: ['DEPLOYED'] },
     { title: 'stopped', statuses: ['STOPPED'] },
   ]
+  // Within a section, keep a replica right after its parent (family key sorts
+  // `parent` and `parent-rN` together; replica ids sort after the bare parent).
+  const familySort = (rs: RepoState[]) =>
+    [...rs].sort((a, b) => {
+      const ka = a.repo.parentId ?? a.repo.id
+      const kb = b.repo.parentId ?? b.repo.id
+      return ka === kb ? a.repo.id.localeCompare(b.repo.id) : ka.localeCompare(kb)
+    })
   const sections = $derived(
     SECTIONS.map((s) => ({
       ...s,
-      repos: filtered.filter((r) => s.statuses.includes(r.status)),
+      repos: familySort(filtered.filter((r) => s.statuses.includes(r.status))),
     })).filter((s) => s.repos.length > 0),
   )
 
@@ -180,7 +192,11 @@
             onclick={() => onselect(r.repo.id)}
           >
             <span class="dot {r.status}" title={r.status}></span>
-            <span class="id" title={r.repo.id}>{r.repo.id}</span>
+            <span class="id" title={r.repo.id}>
+              {#if r.repo.parentId}<span class="rep">↳</span>{/if}
+              {r.repo.id}
+              {#if r.repo.branch}<span class="bpill" title="branch {r.repo.branch}">{r.repo.branch}</span>{/if}
+            </span>
             {#if workloadPills(r).length}
               <span class="wpills">
                 {#each workloadPills(r) as w (w.key)}
@@ -211,6 +227,29 @@
                 {/if}
               </button>
             {/each}
+            {#if r.repo.parentId}
+              <button
+                class="act del"
+                title="delete replica {r.repo.id}"
+                aria-label="delete replica {r.repo.id}"
+                disabled={busyId !== null}
+                onclick={(e) => {
+                  e.stopPropagation()
+                  onreplicadelete(r.repo.id)
+                }}
+              >×</button>
+            {:else}
+              <button
+                class="act plus"
+                title="new replica of {r.repo.id}"
+                aria-label="new replica of {r.repo.id}"
+                disabled={busyId !== null}
+                onclick={(e) => {
+                  e.stopPropagation()
+                  onreplicate(r.repo.id)
+                }}
+              >+</button>
+            {/if}
             <button
               class="act kebab"
               class:set={
@@ -414,6 +453,38 @@
   .act.kebab {
     font-size: 14px;
     padding: 2px 5px;
+  }
+  .act.plus,
+  .act.del {
+    font-size: 13px;
+    padding: 2px 6px;
+  }
+  .act.plus:hover:not(:disabled) {
+    color: var(--ok);
+    border-color: color-mix(in srgb, var(--ok) 45%, transparent);
+  }
+  .act.del:hover:not(:disabled) {
+    color: var(--danger);
+    border-color: color-mix(in srgb, var(--danger) 45%, transparent);
+  }
+  /* Replica rows: the ↳ marker and the branch pill inside the id cell. */
+  .rep {
+    color: var(--accent);
+    font-family: var(--mono);
+    font-size: 11px;
+    margin-right: 2px;
+  }
+  .bpill {
+    font-family: var(--mono);
+    font-size: 9px;
+    font-weight: 400;
+    letter-spacing: 0.02em;
+    padding: 1px 5px;
+    margin-left: 4px;
+    border-radius: 999px;
+    border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+    color: var(--accent);
+    white-space: nowrap;
   }
   /* A configured startup script tints the kebab accent. */
   .act.kebab.set {

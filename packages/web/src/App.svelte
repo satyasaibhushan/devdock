@@ -3,6 +3,7 @@
   import ConfirmModal from './lib/ConfirmModal.svelte'
   import LogViewer from './lib/LogViewer.svelte'
   import NamespacePicker from './lib/NamespacePicker.svelte'
+  import ReplicaModal from './lib/ReplicaModal.svelte'
   import RepoList from './lib/RepoList.svelte'
   import StartupModal from './lib/StartupModal.svelte'
   import TerminalPanel from './lib/TerminalPanel.svelte'
@@ -13,6 +14,7 @@
     type Verb,
     STATUS_VERBS,
     adoptRepo,
+    deleteReplica,
     fetchAuth,
     fetchNamespace,
     fetchRepos,
@@ -46,6 +48,11 @@
   // The "move external session here" confirmation flow.
   let confirmAdopt = $state(false)
   let adoptBusy = $state(false)
+  // The repo whose branch-picker (new replica) modal is open, or null.
+  let replicatingId = $state<string | null>(null)
+  // The replica pending delete confirmation, or null.
+  let deletingReplicaId = $state<string | null>(null)
+  let replicaDeleteBusy = $state(false)
 
   async function refresh() {
     try {
@@ -185,6 +192,37 @@
       adoptBusy = false
     }
   }
+
+  // The selected repo's family: its parent (or itself) plus that parent's
+  // replicas — feeds the replica selector in the detail pane.
+  const familyRoot = $derived.by(() => {
+    if (!selected) return null
+    if (!selected.repo.parentId) return selected
+    return repos.find((r) => r.repo.id === selected.repo.parentId) ?? selected
+  })
+  const family = $derived(
+    familyRoot
+      ? [familyRoot, ...repos.filter((r) => r.repo.parentId === familyRoot.repo.id)]
+      : [],
+  )
+
+  // Tear down a replica: pods, alias ingress, worktree — the parent untouched.
+  async function doReplicaDelete() {
+    const id = deletingReplicaId
+    if (!id || replicaDeleteBusy) return
+    replicaDeleteBusy = true
+    try {
+      await deleteReplica(id)
+      if (selectedId === id) selectedId = repos.find((r) => r.repo.id === id)?.repo.parentId ?? null
+      deletingReplicaId = null
+      await refresh()
+    } catch (e) {
+      toast = `delete replica failed: ${e instanceof Error ? e.message : String(e)}`
+      setTimeout(() => (toast = null), 4000)
+    } finally {
+      replicaDeleteBusy = false
+    }
+  }
 </script>
 
 <header>
@@ -219,6 +257,8 @@
         onselect={(id) => (selectedId = id)}
         onaction={(id, verb) => act(verb, id)}
         oncustomize={(id) => (customizingId = id)}
+        onreplicate={(id) => (replicatingId = id)}
+        onreplicadelete={(id) => (deletingReplicaId = id)}
       />
     </div>
     <button
@@ -253,6 +293,22 @@
         <div class="title">
           <span class="dot {vstatus}"></span>
           <h2>{selected.repo.id}</h2>
+          {#if family.length > 1}
+            <select
+              class="wlselect"
+              value={selected.repo.id}
+              onchange={(e) => (selectedId = e.currentTarget.value)}
+              aria-label="replica"
+            >
+              {#each family as f (f.repo.id)}
+                <option value={f.repo.id}>
+                  {f.repo.parentId
+                    ? `${f.repo.id.slice(f.repo.parentId.length + 1)} · ${f.repo.branch ?? ''}`
+                    : 'primary'}
+                </option>
+              {/each}
+            </select>
+          {/if}
           {#if showSelector}
             <select
               class="wlselect"
@@ -290,6 +346,10 @@
 
       <div class="meta">
         <code>{selected.repo.path}</code>
+        {#if selected.repo.parentId}
+          <span>· branch {selected.repo.branch}</span>
+          <span>· url /{selected.repo.id}/</span>
+        {/if}
         <span>· {view?.pods.length ?? 0} pod{(view?.pods.length ?? 0) === 1 ? '' : 's'}</span>
         {#if vstatus === 'DEPLOYED'}<span>· deployment present</span>{/if}
         {#if selected.repo.ports.length}<span>· :{selected.repo.ports.join(' :')}</span>{/if}
@@ -333,6 +393,31 @@
       }}
     />
   {/key}
+{/if}
+
+{#if replicatingId}
+  {#key replicatingId}
+    <ReplicaModal
+      repoId={replicatingId}
+      onclose={() => (replicatingId = null)}
+      oncreated={async (rec) => {
+        await refresh()
+        selectedId = rec.id
+      }}
+    />
+  {/key}
+{/if}
+
+{#if deletingReplicaId}
+  <ConfirmModal
+    title="Delete {deletingReplicaId}?"
+    message={`This kills ${deletingReplicaId}'s pods, removes its /${deletingReplicaId}/ ingress and deletes its worktree. The parent repo and its running pods are untouched.`}
+    confirmLabel="Delete replica"
+    danger
+    busy={replicaDeleteBusy}
+    onconfirm={doReplicaDelete}
+    oncancel={() => (deletingReplicaId = null)}
+  />
 {/if}
 
 {#if confirmAdopt && selected}
