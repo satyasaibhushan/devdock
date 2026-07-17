@@ -13,6 +13,7 @@ export interface ToolCheck {
 export const DEFAULT_TOOLS: ToolCheck[] = [
   { name: 'tmux', required: true, hint: 'brew install tmux' },
   { name: 'kubectl', required: true, hint: 'https://kubernetes.io/docs/tasks/tools/' },
+  { name: 'git', required: true, hint: 'xcode-select --install (or brew install git)' },
   {
     name: 'devspace',
     required: true,

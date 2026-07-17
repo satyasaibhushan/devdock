@@ -1,7 +1,15 @@
-import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  appendFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { parse as parseYaml } from 'yaml'
 import type { AuthManager } from './auth.js'
 import type { AwsCreds } from './awsCreds.js'
 import { type RunResult, loginShell } from './exec.js'
@@ -1055,6 +1063,230 @@ describe('Service.queryLogs', () => {
     writePipe('ok start\nERROR boom\nok end\n')
     const r = await svc.queryLogs('svc-a', { source: 'application', contains: 'ERROR' })
     expect(r.lines).toEqual(['ERROR boom'])
+  })
+})
+
+describe('Service replicas', () => {
+  // A two-member repo (.devspace/<service>/ layout) — the shape replicas require.
+  const makeParent = () => {
+    for (const type of ['api', 'worker']) {
+      const dir = join(root, 'parent', '.devspace', `parent-${type}`)
+      mkdirSync(dir, { recursive: true })
+      writeFileSync(
+        join(dir, 'devspace.yaml'),
+        [
+          `name: parent-${type}`,
+          'namespace: ns',
+          'vars:',
+          `  WORKLOAD_TYPE: ${type}`,
+          '  INGRESS_PATH: parent',
+          'dev:',
+          '  common: {}',
+        ].join('\n'),
+      )
+    }
+  }
+  const parentPath = () => join(root, 'parent')
+  const replicaPath = (id: string) => join(parentPath(), '.agents', 'replicas', id)
+
+  const newService = (runner = cannedRunner('{"items":[]}', false)) => {
+    const svc = new Service(
+      { roots: [root], stateFile },
+      { runner, streamSpawner: fakeStreamSpawner().spawner },
+    )
+    svc.rescan()
+    return { svc, runner }
+  }
+
+  it('creates a replica: detached worktree, generated configs, inherited startup', async () => {
+    makeParent()
+    const { svc, runner } = newService()
+    svc.setStartupCommand('parent', 'python main.py', 'api')
+
+    const rec = await svc.createReplica('parent', 'feature-x')
+    expect(rec.id).toBe('parent-r1')
+    expect(runner).toHaveBeenCalledWith('git', [
+      '-C',
+      parentPath(),
+      'worktree',
+      'add',
+      '--detach',
+      replicaPath('parent-r1'),
+      'feature-x',
+    ])
+    const generated = parseYaml(
+      readFileSync(
+        join(replicaPath('parent-r1'), '.devspace', 'parent-r1-api', 'devspace.yaml'),
+        'utf8',
+      ),
+    )
+    expect(generated.name).toBe('parent-r1-api')
+    expect(generated.vars.INGRESS_PATH).toBe('parent-r1')
+    expect(generated.vars.IMAGE_TAG).toBe('ns-parent-api')
+
+    const repo = svc.listRepos().find((r) => r.id === 'parent-r1')
+    expect(repo?.parentId).toBe('parent')
+    expect(repo?.branch).toBe('feature-x')
+    expect(repo?.workloads).toEqual(['api', 'worker'])
+    expect(repo?.namespace).toBe('ns')
+    expect(svc.getStartupCommands('parent-r1').api).toBe('python main.py')
+    expect(new StateStore(stateFile).getReplica('parent-r1')?.branch).toBe('feature-x')
+
+    // ids increment; a leftover dir from a crashed create also claims its id
+    expect((await svc.createReplica('parent', 'other')).id).toBe('parent-r2')
+    mkdirSync(replicaPath('parent-r3'), { recursive: true })
+    expect((await svc.createReplica('parent', 'third')).id).toBe('parent-r4')
+  })
+
+  it('rejects replica-of-replica and single-config repos', async () => {
+    makeParent()
+    const { svc } = newService()
+    await svc.createReplica('parent', 'feature-x')
+    await expect(svc.createReplica('parent-r1', 'other')).rejects.toThrow(/replica of a replica/)
+    await expect(svc.createReplica('svc-a', 'other')).rejects.toThrow(/member layout/)
+    await expect(svc.createReplica('parent', '  ')).rejects.toThrow(/branch required/)
+  })
+
+  it('re-materializes replicas from the store after a daemon restart', async () => {
+    makeParent()
+    const { svc } = newService()
+    await svc.createReplica('parent', 'feature-x')
+
+    const { svc: after } = newService()
+    const repo = after.listRepos().find((r) => r.id === 'parent-r1')
+    expect(repo?.parentId).toBe('parent')
+    expect(repo?.branch).toBe('feature-x')
+    expect(repo?.members?.map((m) => m.name)).toEqual(['parent-r1-api', 'parent-r1-worker'])
+  })
+
+  it('lists local branches most recently committed first', async () => {
+    const runner = vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
+      if (cmd === 'git' && args.includes('for-each-ref'))
+        return { code: 0, stdout: 'main\t1700000000\nfeature-x\t1690000000\n', stderr: '' }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+    const { svc } = newService(runner)
+    expect(await svc.listBranches('svc-a')).toEqual([
+      { name: 'main', lastCommitAt: 1_700_000_000_000 },
+      { name: 'feature-x', lastCommitAt: 1_690_000_000_000 },
+    ])
+  })
+
+  it('deleteReplica stops workloads, removes the ingress and worktree, purges the record', async () => {
+    makeParent()
+    const { svc, runner } = newService()
+    const rec = await svc.createReplica('parent', 'feature-x')
+
+    await svc.deleteReplica('parent-r1')
+    const shellCmds = runner.mock.calls
+      .filter((c) => c[0] === loginShell)
+      .map((c) => (c[1] as string[])[1] ?? '')
+    expect(shellCmds.some((c) => c.includes('devspace purge'))).toBe(true)
+    expect(runner).toHaveBeenCalledWith('kubectl', [
+      'delete',
+      'ingress',
+      'parent-r1-alias',
+      '-n',
+      'ns',
+      '--ignore-not-found',
+    ])
+    expect(runner).toHaveBeenCalledWith('git', [
+      '-C',
+      parentPath(),
+      'worktree',
+      'remove',
+      '--force',
+      rec.path,
+    ])
+    expect(svc.listReplicas()).toEqual([])
+    expect(svc.listRepos().some((r) => r.id === 'parent-r1')).toBe(false)
+  })
+
+  it('gcReplicas deletes replicas past the 2-day TTL and keeps fresh ones', async () => {
+    makeParent()
+    const { svc } = newService()
+    await svc.createReplica('parent', 'feature-x')
+    expect(await svc.gcReplicas()).toEqual([]) // fresh — untouched
+    expect(await svc.gcReplicas(Date.now() + 3 * 24 * 60 * 60 * 1000)).toEqual(['parent-r1'])
+    expect(svc.listReplicas()).toEqual([])
+  })
+
+  it('applies the alias ingress once replica pods appear, then marks it done', async () => {
+    makeParent()
+    const podsJson = JSON.stringify({
+      items: [
+        {
+          metadata: { name: 'parent-r1-api-abc' },
+          status: { phase: 'Running', containerStatuses: [{ ready: true, restartCount: 0 }] },
+        },
+      ],
+    })
+    const ingressJson = JSON.stringify({
+      items: [
+        { metadata: { name: 'parent-r1-api' }, spec: { rules: [{ host: 'api-ns.example.dev' }] } },
+      ],
+    })
+    const applied: string[][] = []
+    const runner = vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
+      if (cmd === 'kubectl' && args[0] === 'apply') {
+        applied.push(args)
+        return { code: 0, stdout: '', stderr: '' }
+      }
+      if (cmd === 'kubectl' && args[0] === 'get' && args[1] === 'ingress')
+        return { code: 0, stdout: ingressJson, stderr: '' }
+      if (cmd === 'kubectl' && args[0] === 'get')
+        return {
+          code: 0,
+          stdout: args[1] === 'deployments' ? '{"items":[]}' : podsJson,
+          stderr: '',
+        }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+    const { svc } = newService(runner)
+    await svc.createReplica('parent', 'feature-x')
+    await new Promise((r) => setTimeout(r, 20)) // let the background start's reconcile settle
+
+    await svc.reconcileAll()
+    expect(applied.length).toBeGreaterThanOrEqual(1)
+    const afterFirst = applied.length
+    const manifest = readFileSync(String(applied[0]?.[2]), 'utf8')
+    expect(manifest).toContain('name: parent-r1-alias')
+    expect(manifest).toContain('namespace: ns')
+    expect(manifest).toContain('rewrite-target: /parent/$2') // parent INGRESS_PATH
+    expect(manifest).toContain('host: api-ns.example.dev')
+    expect(manifest).toContain('path: /parent-r1(/|$)(.*)')
+    expect(svc.listReplicas()[0]?.ingressApplied).toBe(true)
+
+    await svc.reconcileAll() // marked applied — later passes skip it
+    expect(applied.length).toBe(afterFirst)
+  })
+
+  it("a replica's pods never count as its parent's (longest name wins)", async () => {
+    makeParent()
+    const podsJson = JSON.stringify({
+      items: [
+        {
+          metadata: { name: 'parent-r1-api-abc' },
+          status: { phase: 'Running', containerStatuses: [{ ready: true, restartCount: 0 }] },
+        },
+        {
+          metadata: { name: 'parent-api-xyz' },
+          status: { phase: 'Running', containerStatuses: [{ ready: true, restartCount: 0 }] },
+        },
+      ],
+    })
+    const base = cannedRunner(podsJson, false)
+    const runner = vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
+      if (cmd === 'kubectl' && args[0] === 'get' && args[1] === 'ingress')
+        return { code: 0, stdout: '{"items":[]}', stderr: '' }
+      return base(cmd, args)
+    })
+    const { svc } = newService(runner)
+    await svc.createReplica('parent', 'feature-x')
+
+    await svc.reconcileAll()
+    expect(svc.get('parent')?.pods.map((p) => p.name)).toEqual(['parent-api-xyz'])
+    expect(svc.get('parent-r1')?.pods.map((p) => p.name)).toEqual(['parent-r1-api-abc'])
   })
 })
 

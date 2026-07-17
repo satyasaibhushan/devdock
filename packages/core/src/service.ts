@@ -1,8 +1,8 @@
 // service — the one brain (spec §19.1). Composes the core modules and exposes
 // transport-free verbs that the daemon (HTTP/WS) and MCP both call.
 import { EventEmitter } from 'node:events'
-import { mkdirSync, writeFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
+import { basename, dirname, join } from 'node:path'
 import { AuthManager, type AuthState } from './auth.js'
 import { type AwsCredential, AwsCreds } from './awsCreds.js'
 import { CrashWatch } from './crashWatch.js'
@@ -11,8 +11,14 @@ import { decodeCursor, encodeCursor, readFileSlice } from './logQuery.js'
 import { LogHub, LogTailer, type SpawnFn, cleanLine } from './logTailer.js'
 import { PtyBroker } from './ptyBroker.js'
 import { type ClusterCache, Reconciler, newClusterCache } from './reconciler.js'
-import { scanRepos } from './registry.js'
-import { StateStore } from './stateStore.js'
+import { parseDevspaceConfig, scanRepos, sessionName } from './registry.js'
+import {
+  aliasIngressManifest,
+  generateReplicaConfig,
+  ingressPathOf,
+  nextReplicaId,
+} from './replicas.js'
+import { type ReplicaRecord, StateStore } from './stateStore.js'
 import { type SessionState, type StreamRunner, Supervisor, verbLabel } from './supervisor.js'
 import { type RunOutcome, type TermInfo, type TermKind, TermRegistry } from './termRegistry.js'
 import type { Repo, RepoState, RepoStatus, TermMode } from './types.js'
@@ -53,6 +59,10 @@ const MAX_RECONNECT_ATTEMPTS = 3
  *  and devspace essentially never see a stale token — and never each spawn
  *  their own kubelogin browser flow. */
 const AUTH_MAINTAIN_MS = 5 * 60 * 1000
+/** Replicas are ephemeral test deployments: anything older than this is
+ *  deleted by the hourly GC pass. */
+const REPLICA_TTL_MS = 2 * 24 * 60 * 60 * 1000
+const REPLICA_GC_MS = 60 * 60 * 1000
 
 /** RFC 1123 label — what Kubernetes accepts as a namespace name. */
 const NAMESPACE_RE = /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/
@@ -206,6 +216,9 @@ export class Service {
   private readonly reconnects = new Map<string, { attempts: number; lastAt: number }>()
   private timer?: NodeJS.Timeout
   private authTimer?: NodeJS.Timeout
+  private gcTimer?: NodeJS.Timeout
+  /** kubectl calls that hit the API server, behind the auth gate. */
+  private readonly kubectl: NonNullable<ServiceDeps['runner']>
   private readonly auth: AuthManager
   private readonly awsCreds: AwsCreds
   /** All terminals: id → live PTY session + scrollback (spec §8). */
@@ -249,6 +262,7 @@ export class Service {
     const streamRunner: StreamRunner = deps.runner
       ? (c, a, o) => baseRunner(c, a, o)
       : (c, a, o, onLine) => runStream(c, a, o, onLine)
+    this.kubectl = gatedRunner
     this.supervisor = deps.supervisor ?? new Supervisor(gatedRunner, streamRunner)
     this.reconciler = deps.reconciler ?? new Reconciler(gatedRunner)
     this.broker = deps.broker ?? new PtyBroker()
@@ -259,12 +273,18 @@ export class Service {
     this.store = new StateStore(this.opts.stateFile)
   }
 
-  /** (Re)discover repos from the filesystem. */
+  /** (Re)discover repos from the filesystem, then materialize replicas from
+   *  their persisted records — never from the scanner, which would re-register
+   *  the parent's own configs found inside each worktree. */
   rescan(): Repo[] {
     const found = scanRepos(this.opts.roots.length ? { roots: this.opts.roots } : {})
     this.repos.clear()
     for (const r of found) this.repos.set(r.id, r)
-    return found
+    for (const rec of this.store.listReplicas()) {
+      const repo = this.materializeReplica(rec)
+      if (repo) this.repos.set(repo.id, repo)
+    }
+    return this.listRepos()
   }
 
   listRepos(): Repo[] {
@@ -566,6 +586,356 @@ export class Service {
     )
   }
 
+  // ---- replicas: ephemeral branch-pinned parallel deployments (spec: replicas) ----
+
+  listReplicas(): ReplicaRecord[] {
+    return this.store.listReplicas()
+  }
+
+  /** Local branches of a repo's checkout, most recently committed first — the
+   *  create-replica picker's data. Worktree branches are local heads too, so
+   *  agents' in-flight branches show up. */
+  async listBranches(id: string): Promise<{ name: string; lastCommitAt: number }[]> {
+    const repo = this.repoOrThrow(id)
+    const r = await this.runner('git', [
+      '-C',
+      repo.path,
+      'for-each-ref',
+      '--sort=-committerdate',
+      '--format',
+      '%(refname:short)\t%(committerdate:unix)',
+      'refs/heads/',
+    ])
+    if (r.code !== 0) throw new Error(r.stderr.trim() || `git for-each-ref exited ${r.code}`)
+    const out: { name: string; lastCommitAt: number }[] = []
+    for (const line of r.stdout.split('\n')) {
+      const [name, ts] = line.trim().split('\t')
+      if (name) out.push({ name, lastCommitAt: Number(ts) * 1000 || 0 })
+    }
+    return out
+  }
+
+  /** Create a replica of `parentId` pinned to `branch`: a detached git
+   *  worktree under `.agents/replicas/` plus generated member configs, so that
+   *  branch's code deploys beside the parent in the same namespace with zero
+   *  changes to tracked files anywhere. Returns once the record is persisted;
+   *  the deploy itself runs in the background (poll status / `wait`). */
+  async createReplica(parentId: string, branch: string): Promise<ReplicaRecord> {
+    const parent = this.repoOrThrow(parentId)
+    if (parent.parentId) throw new Error('cannot create a replica of a replica')
+    if (!parent.members?.length || !parent.root) {
+      throw new Error(
+        `replicas need the .devspace/<service>/ member layout; ${parentId} has a single config`,
+      )
+    }
+    const trimmedBranch = branch.trim()
+    if (!trimmedBranch) throw new Error('branch required')
+    const denied = (await this.ensureAuth(parentId)) ?? (await this.ensureAwsCreds(parentId))
+    if (denied) throw new Error(denied.stderr || 'auth required')
+
+    // Orphan dirs from a crashed create still occupy their id (existsSync), so
+    // a new replica can never collide with leftovers GC hasn't swept yet.
+    const replicasDir = join(parent.path, '.agents', 'replicas')
+    const id = nextReplicaId(
+      parentId,
+      (cand) =>
+        this.repos.has(cand) ||
+        !!this.store.getReplica(cand) ||
+        existsSync(join(replicasDir, cand)),
+    )
+    const wt = join(replicasDir, id)
+    mkdirSync(replicasDir, { recursive: true })
+    // --detach: no branch is checked out twice (git forbids that) and the
+    // worktree can't accumulate commits — replicas are strictly read-only
+    // snapshots of the branch's tip at creation time.
+    const added = await this.runner('git', [
+      '-C',
+      parent.path,
+      'worktree',
+      'add',
+      '--detach',
+      wt,
+      trimmedBranch,
+    ])
+    if (added.code !== 0) {
+      throw new Error(added.stderr.trim() || `git worktree add exited ${added.code}`)
+    }
+    try {
+      let namespace = parent.namespace
+      if (!namespace) namespace = (await this.contextNamespace()) || undefined
+      const configPaths: string[] = []
+      for (const member of parent.members) {
+        const type = member.workloadType ?? member.id
+        const generated = generateReplicaConfig(readFileSync(member.configPath, 'utf8'), {
+          replicaId: id,
+          workloadType: type,
+          // The parent's tag: the dev pipeline never builds images and code
+          // arrives via sync, so replicas run on the parent's base image.
+          imageTag: `${namespace ?? ''}-${member.name}`,
+        })
+        const dir = join(wt, '.devspace', `${id}-${type}`)
+        mkdirSync(dir, { recursive: true })
+        const configPath = join(dir, 'devspace.yaml')
+        writeFileSync(configPath, generated)
+        configPaths.push(configPath)
+      }
+      this.store.copyStartup(parentId, id) // inherit `python main.py` etc.
+      const record: ReplicaRecord = {
+        id,
+        parentId,
+        branch: trimmedBranch,
+        path: wt,
+        createdAt: Date.now(),
+        configPaths,
+        namespace,
+      }
+      this.store.addReplica(record) // persisted before start — restart-safe
+      const repo = this.materializeReplica(record)
+      if (!repo) throw new Error('generated replica configs failed to parse')
+      this.repos.set(id, repo)
+      this.hubFor(id).push(`✓ replica ${id} created from ${trimmedBranch} — deploying`)
+      void this.start(id).catch(() => undefined)
+      return record
+    } catch (err) {
+      await this.runner('git', ['-C', parent.path, 'worktree', 'remove', '--force', wt]).catch(
+        () => undefined,
+      )
+      this.store.removeReplica(id)
+      this.store.clearStartup(id)
+      this.repos.delete(id)
+      throw err
+    }
+  }
+
+  /** Delete a replica: stop its workloads, remove its alias ingress and its
+   *  worktree, and purge every trace from the store. Works from stored paths
+   *  even when the worktree or parent checkout has already gone. */
+  async deleteReplica(id: string): Promise<void> {
+    const rec = this.store.getReplica(id)
+    if (!rec) throw new Error(`unknown replica: ${id}`)
+    const repo = this.repos.get(id)
+    if (repo) {
+      for (const type of workloadTypes(repo)) {
+        await this.stop(id, type).catch(() => undefined)
+      }
+    }
+    if (rec.namespace) {
+      await this.kubectl('kubectl', [
+        'delete',
+        'ingress',
+        rec.ingressName ?? `${id}-alias`,
+        '-n',
+        rec.namespace,
+        '--ignore-not-found',
+      ]).catch(() => undefined)
+    }
+    const parentPath = this.repos.get(rec.parentId)?.path ?? dirname(dirname(dirname(rec.path)))
+    const removed = await this.runner('git', [
+      '-C',
+      parentPath,
+      'worktree',
+      'remove',
+      '--force',
+      rec.path,
+    ]).catch(() => undefined)
+    if (!removed || removed.code !== 0) {
+      await this.runner('rm', ['-rf', rec.path]).catch(() => undefined)
+      await this.runner('git', ['-C', parentPath, 'worktree', 'prune']).catch(() => undefined)
+    }
+    this.store.removeReplica(id)
+    this.store.clearStartup(id)
+    this.repos.delete(id)
+    this.states.delete(id)
+    this.purgeWorkloadState(id)
+  }
+
+  /** Delete replicas past their TTL, plus worktree dirs recorded nowhere
+   *  (a crashed create) that are old enough that nothing can still be
+   *  materializing them. Returns the deleted replica ids. */
+  async gcReplicas(now = Date.now()): Promise<string[]> {
+    const deleted: string[] = []
+    for (const rec of this.store.listReplicas()) {
+      if (now - rec.createdAt < REPLICA_TTL_MS) continue
+      await this.deleteReplica(rec.id).catch(() => undefined)
+      deleted.push(rec.id)
+    }
+    for (const repo of this.repos.values()) {
+      if (repo.parentId || !repo.members?.length) continue
+      const dir = join(repo.path, '.agents', 'replicas')
+      let names: string[]
+      try {
+        names = readdirSync(dir)
+      } catch {
+        continue
+      }
+      for (const name of names) {
+        if (this.store.getReplica(name)) continue
+        const orphan = join(dir, name)
+        try {
+          const st = statSync(orphan)
+          if (!st.isDirectory() || now - st.mtimeMs < REPLICA_TTL_MS) continue
+        } catch {
+          continue
+        }
+        await this.runner('git', ['-C', repo.path, 'worktree', 'remove', '--force', orphan]).catch(
+          () => undefined,
+        )
+        await this.runner('rm', ['-rf', orphan]).catch(() => undefined)
+        await this.runner('git', ['-C', repo.path, 'worktree', 'prune']).catch(() => undefined)
+      }
+    }
+    return deleted
+  }
+
+  /** Build a replica's Repo (base + members) from its stored record, parsing
+   *  only the generated configs. A missing worktree materializes nothing; the
+   *  record is kept so delete/GC can still clean up from stored paths. */
+  private materializeReplica(rec: ReplicaRecord): Repo | undefined {
+    const members: Repo[] = []
+    for (const configPath of rec.configPaths) {
+      let text: string
+      try {
+        text = readFileSync(configPath, 'utf8')
+      } catch {
+        continue
+      }
+      const cfg = parseDevspaceConfig(text)
+      const memberPath = dirname(configPath)
+      const memberId = basename(memberPath)
+      const type =
+        cfg.workloadType ??
+        (memberId.startsWith(`${rec.id}-`) ? memberId.slice(rec.id.length + 1) : memberId)
+      members.push({
+        id: memberId,
+        name: cfg.name ?? memberId,
+        path: memberPath,
+        codeArea: this.repos.get(rec.parentId)?.codeArea,
+        root: rec.path,
+        configPath,
+        namespace: cfg.namespace ?? rec.namespace,
+        workload: cfg.workload,
+        ports: cfg.ports,
+        varDefaults: Object.keys(cfg.varDefaults).length ? cfg.varDefaults : undefined,
+        workloadType: type,
+        session: sessionName(memberId),
+      })
+    }
+    if (!members.length) return undefined
+    members.sort(
+      (a, b) =>
+        Number(a.workloadType !== 'api') - Number(b.workloadType !== 'api') ||
+        (a.workloadType ?? '').localeCompare(b.workloadType ?? ''),
+    )
+    const types = members.map((m) => m.workloadType ?? m.id)
+    const first = members[0] as Repo
+    return {
+      id: rec.id,
+      name: rec.id,
+      path: rec.path,
+      codeArea: this.repos.get(rec.parentId)?.codeArea,
+      root: rec.path,
+      configPath: first.configPath,
+      namespace: first.namespace,
+      workload: first.workload,
+      ports: [...new Set(members.flatMap((m) => m.ports))].sort((a, b) => a - b),
+      workloads: types,
+      defaultWorkload: types.includes('api') ? 'api' : types[0],
+      members,
+      session: sessionName(rec.id),
+      parentId: rec.parentId,
+      branch: rec.branch,
+      replicaCreatedAt: rec.createdAt,
+    }
+  }
+
+  /** Apply the replica's URL-alias Ingress once its pods exist. Failures stay
+   *  silent — the next reconcile pass retries, so a stale AWS token or a slow
+   *  chart ingress only delays the URL, never wedges it. */
+  private async applyReplicaIngress(repo: Repo, rec: ReplicaRecord): Promise<void> {
+    const ns = rec.namespace ?? repo.namespace
+    if (!ns) return
+    const member = repo.members?.[0] ?? repo
+    const parent = this.repos.get(rec.parentId)
+    const parentMember = parent ? scopeRepo(parent, parent.defaultWorkload) : undefined
+    // The shared hostname comes from an existing chart-created ingress —
+    // the replica's own, else the parent's (they serve the same host).
+    const host = await this.ingressHost(ns, [member.name, parentMember?.name])
+    if (!host) return
+    let parentPath = rec.parentId
+    if (parentMember) {
+      try {
+        parentPath = ingressPathOf(readFileSync(parentMember.configPath, 'utf8')) || rec.parentId
+      } catch {
+        /* fall back to the parent id */
+      }
+    }
+    const manifest = aliasIngressManifest({
+      replicaId: rec.id,
+      namespace: ns,
+      host,
+      parentIngressPath: parentPath,
+      serviceName: member.name,
+    })
+    // exec has no stdin, so apply goes through a manifest file.
+    const file = join(dirname(this.opts.stateFile), 'ingress', `${rec.id}.yaml`)
+    mkdirSync(dirname(file), { recursive: true })
+    writeFileSync(file, manifest)
+    const r = await this.kubectl('kubectl', ['apply', '-f', file]).catch(() => undefined)
+    if (!r || r.code !== 0) return
+    this.store.updateReplica(rec.id, { ingressApplied: true, ingressName: `${rec.id}-alias` })
+    this.hubFor(rec.id).push(`✓ url alias ready: https://${host}/${rec.id}/`)
+  }
+
+  /** A hostname served by an ingress in the namespace, preferring ingresses
+   *  named after the given workloads (exact or `<name>-…`). */
+  private async ingressHost(
+    ns: string,
+    preferredNames: (string | undefined)[],
+  ): Promise<string | undefined> {
+    const r = await this.kubectl('kubectl', ['get', 'ingress', '-o', 'json', '-n', ns]).catch(
+      () => undefined,
+    )
+    if (!r || r.code !== 0) return undefined
+    let items: { metadata?: { name?: string }; spec?: { rules?: { host?: string }[] } }[]
+    try {
+      items = (JSON.parse(r.stdout)?.items ?? []) as typeof items
+    } catch {
+      return undefined
+    }
+    for (const want of preferredNames) {
+      if (!want) continue
+      const hit = items.find(
+        (i) => i.metadata?.name === want || i.metadata?.name?.startsWith(`${want}-`),
+      )
+      const host = hit?.spec?.rules?.find((rule) => rule.host)?.host
+      if (host) return host
+    }
+    return undefined
+  }
+
+  /** Drop every per-workload artifact for a repo id — keys are the bare id or
+   *  `<id>::<type>`. */
+  private purgeWorkloadState(id: string): void {
+    const match = (key: string) => key === id || key.startsWith(`${id}::`)
+    for (const [key, t] of [...this.tailers]) {
+      if (!match(key)) continue
+      t.stop()
+      this.tailers.delete(key)
+    }
+    for (const m of [
+      this.hubs,
+      this.logGens,
+      this.watchers,
+      this.transitions,
+      this.noPodsSince,
+      this.reconnects,
+      this.pendingTermOpens,
+    ] as Map<string, unknown>[]) {
+      for (const key of [...m.keys()]) if (match(key)) m.delete(key)
+    }
+    for (const key of [...this.piped]) if (match(key)) this.piped.delete(key)
+  }
+
   // ---- namespace (the UI face of the user's `kn` alias) ----
   /** The kube context's current namespace ('' when unset or unreadable). */
   private async contextNamespace(): Promise<string> {
@@ -736,6 +1106,11 @@ export class Service {
     const state = assembleState(repo, workloads, Date.now())
     this.applyStartupCommands(state)
     this.applyState(state)
+    if (repo.parentId && state.pods.length > 0) {
+      const rec = this.store.getReplica(id)
+      if (rec && !rec.ingressApplied)
+        await this.applyReplicaIngress(repo, rec).catch(() => undefined)
+    }
     return state
   }
 
@@ -1284,6 +1659,10 @@ export class Service {
     this.authTimer = setInterval(() => {
       void this.auth.maintain().catch(() => undefined)
     }, AUTH_MAINTAIN_MS)
+    void this.gcReplicas().catch(() => undefined)
+    this.gcTimer = setInterval(() => {
+      void this.gcReplicas().catch(() => undefined)
+    }, REPLICA_GC_MS)
   }
 
   stopLoop(): void {
@@ -1291,6 +1670,8 @@ export class Service {
     this.timer = undefined
     if (this.authTimer) clearInterval(this.authTimer)
     this.authTimer = undefined
+    if (this.gcTimer) clearInterval(this.gcTimer)
+    this.gcTimer = undefined
     for (const t of this.tailers.values()) t.stop()
     this.terms.closeAll()
   }
