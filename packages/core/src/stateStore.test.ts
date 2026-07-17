@@ -76,4 +76,39 @@ describe('StateStore', () => {
     s.setSessionNamespace('repo-a::api', undefined)
     expect(new StateStore(file).getSessionNamespace('repo-a::api')).toBeUndefined()
   })
+
+  it('persists replica records across instances, updates and removes them', () => {
+    const record = {
+      id: 'svc-r1',
+      parentId: 'svc',
+      branch: 'feature-x',
+      path: '/repos/svc/.agents/replicas/svc-r1',
+      createdAt: 123,
+      configPaths: ['/repos/svc/.agents/replicas/svc-r1/.devspace/svc-r1-api/devspace.yaml'],
+    }
+    new StateStore(file).addReplica(record)
+    const s = new StateStore(file)
+    expect(s.listReplicas()).toEqual([record])
+    expect(s.getReplica('svc-r1')).toEqual(record)
+    s.updateReplica('svc-r1', { ingressApplied: true, ingressName: 'svc-r1-alias' })
+    expect(new StateStore(file).getReplica('svc-r1')?.ingressApplied).toBe(true)
+    s.updateReplica('unknown', { ingressApplied: true }) // no-op, no throw
+    s.removeReplica('svc-r1')
+    expect(new StateStore(file).listReplicas()).toEqual([])
+  })
+
+  it('loads a pre-replica state file with an empty replica set', () => {
+    writeFileSync(file, JSON.stringify({ status: { 'repo-a': 'STOPPED' } }))
+    expect(new StateStore(file).listReplicas()).toEqual([])
+  })
+
+  it('copies startup commands to a replica id and can clear them', () => {
+    const s = new StateStore(file)
+    s.setStartup('svc', 'api', 'python main.py', ['api'])
+    s.copyStartup('svc', 'svc-r1')
+    expect(new StateStore(file).getStartup('svc-r1', 'api')).toBe('python main.py')
+    s.clearStartup('svc-r1')
+    expect(new StateStore(file).getStartup('svc-r1', 'api')).toBeUndefined()
+    expect(s.getStartup('svc', 'api')).toBe('python main.py') // parent untouched
+  })
 })

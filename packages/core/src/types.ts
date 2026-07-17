@@ -65,6 +65,14 @@ export interface Repo {
   members?: Repo[]
   /** The tmux session name devdock uses for this repo. */
   session: string
+  /** For a replica (an ephemeral branch-pinned parallel deployment in a git
+   *  worktree), the id of the repo it was cloned from. Unset otherwise. */
+  parentId?: string
+  /** The branch a replica was created from (its worktree is a detached
+   *  checkout of that branch's creation-time tip). */
+  branch?: string
+  /** epoch ms when a replica was created — drives the 2-day auto-delete. */
+  replicaCreatedAt?: number
 }
 
 /** Per-workload reconciled view for a multi-workload repo (one entry per
