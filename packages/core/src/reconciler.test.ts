@@ -11,6 +11,7 @@ import {
 import type { DeploymentInfo, PodInfo, Repo } from './types.js'
 
 const ready: PodInfo = { name: 'p', phase: 'Running', ready: true, restartCount: 0 }
+const pending: PodInfo = { name: 'p', phase: 'Pending', ready: false, restartCount: 0 }
 const crashy: PodInfo = { name: 'p', phase: 'Running', ready: false, restartCount: 3 }
 
 describe('deriveStatus (spec §6 table)', () => {
@@ -19,6 +20,10 @@ describe('deriveStatus (spec §6 table)', () => {
   })
   it('ready pod, no session → RUNNING_EXTERNAL', () => {
     expect(deriveStatus([ready], false)).toBe('RUNNING_EXTERNAL')
+  })
+  it('unready pods remain BUILDING with or without a session', () => {
+    expect(deriveStatus([pending], true)).toBe('BUILDING')
+    expect(deriveStatus([pending], false)).toBe('BUILDING')
   })
   it('restartCount>0 → CRASHED (takes precedence)', () => {
     expect(deriveStatus([crashy], true)).toBe('CRASHED')

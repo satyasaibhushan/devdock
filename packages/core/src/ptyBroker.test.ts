@@ -112,6 +112,15 @@ describe('PtyBroker', () => {
     expect(broker.locks.isHeld('svc')).toBe(false)
   })
 
+  it('releases the write-lock when spawning the terminal fails', async () => {
+    const broker = new PtyBroker(() => {
+      throw new Error('PTY spawn failed')
+    })
+
+    await expect(broker.open(repo, 'rw')).rejects.toThrow('PTY spawn failed')
+    expect(broker.locks.isHeld('svc')).toBe(false)
+  })
+
   it('openShell runs `devspace enter` in the repo directory', async () => {
     const calls: Array<{ file: string; args: string[]; cwd?: string }> = []
     const pty = fakePty()

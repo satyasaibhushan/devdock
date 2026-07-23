@@ -600,6 +600,76 @@ describe('Service', () => {
     }
   })
 
+  it('waits for pod readiness before startup injection and log tailing', async () => {
+    const before = new Service(
+      { roots: [root], stateFile },
+      { runner: cannedRunner('{"items":[]}', true), streamSpawner: fakeStreamSpawner().spawner },
+    )
+    before.rescan()
+    before.setStartupCommand('svc-a', 'pnpm run dev')
+    await before.start('svc-a')
+
+    let ready = false
+    const runner = vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
+      if (cmd === 'tmux' && args[0] === 'has-session') {
+        return { code: 0, stdout: '', stderr: '' }
+      }
+      if (cmd === 'tmux' && args[0] === 'list-panes') {
+        return { code: 0, stdout: 'devdock-svc-a 0\n', stderr: '' }
+      }
+      if (cmd === 'kubectl' && args[0] === 'get') {
+        const items =
+          args[1] === 'deployments'
+            ? []
+            : [
+                {
+                  metadata: { name: 'svc-a-app-1' },
+                  status: {
+                    phase: ready ? 'Running' : 'Pending',
+                    containerStatuses: [{ ready, restartCount: 0 }],
+                  },
+                },
+              ]
+        return { code: 0, stdout: JSON.stringify({ items }), stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    })
+    const { spawner, spawns } = fakeStreamSpawner()
+
+    vi.useFakeTimers()
+    try {
+      const after = new Service({ roots: [root], stateFile }, { runner, streamSpawner: spawner })
+      after.rescan()
+      await after.reconcileAll()
+      expect(after.get('svc-a')?.status).toBe('BUILDING')
+      after.logs('svc-a')
+      await vi.advanceTimersByTimeAsync(3000)
+
+      expect(spawns).toEqual([])
+      expect(runner).not.toHaveBeenCalledWith('tmux', expect.arrayContaining(['send-keys']))
+      expect(new StateStore(stateFile).getPendingStartup('svc-a')).toBe('pnpm run dev')
+
+      ready = true
+      await after.reconcileAll()
+      after.logs('svc-a')
+      await vi.advanceTimersByTimeAsync(3000)
+
+      expect(spawns).toContainEqual({
+        cmd: 'kubectl',
+        args: ['logs', '-f', 'svc-a-app-1', '-n', 'ns'],
+      })
+      expect(runner).toHaveBeenCalledWith('tmux', [
+        'send-keys',
+        '-t',
+        '=devdock-svc-a:',
+        'pnpm run dev',
+        'Enter',
+      ])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('queues the startup command configured for the selected pod type', async () => {
     mkdirSync(join(root, 'svc-multi'), { recursive: true })
     writeFileSync(

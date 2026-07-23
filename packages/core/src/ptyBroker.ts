@@ -234,8 +234,14 @@ export class PtyBroker {
       if (!token) throw new Error(`write-lock held for ${repo.id}`)
     }
 
-    const spawn = await this.resolveSpawn()
-    const pty = spawn(file, args, { cols, rows, cwd })
+    let pty: PtyLike
+    try {
+      const spawn = await this.resolveSpawn()
+      pty = spawn(file, args, { cols, rows, cwd })
+    } catch (error) {
+      if (token) this.locks.release(repo.id, token)
+      throw error
+    }
 
     let closed = false
     const teardown = () => {

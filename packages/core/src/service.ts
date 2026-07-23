@@ -1085,7 +1085,7 @@ export class Service {
       // Once the dev session's pod is up, fire any queued startup command into
       // the session (the initial dev pod) — one shot per start.
       const pending = this.store.getPendingStartup(key)
-      if (ws.status === 'RUNNING_MANAGED' && pending) {
+      if (ws.status === 'RUNNING_MANAGED' && ws.pods.some((pod) => pod.ready) && pending) {
         this.store.setPendingStartup(key, undefined)
         this.scheduleStartup(scoped, key, pending)
       }
@@ -1503,7 +1503,7 @@ export class Service {
     if (!this.auth.kubectlAllowed(['logs'])) return
     const state = this.states.get(id)
     const pods = type ? (state?.workloads.find((w) => w.type === type)?.pods ?? []) : state?.pods
-    const pod = pods?.[0]
+    const pod = pods?.find((candidate) => candidate.ready)
     if (!pod) return
     const tailer = new LogTailer(this.streamSpawner, this.hubFor(key))
     tailer.start(repo, pod)
