@@ -62,8 +62,32 @@ fi
       join(bin, 'launchctl'),
       `#!/usr/bin/env bash
 printf 'launchctl %s\\n' "$*" >> "$DEVDOCK_TEST_LOG"
-if [[ "${'$'}{1:-}" == print ]]; then printf 'state = running\\n'; fi
-exit 0
+state_file="$DEVDOCK_TEST_LOG.state"
+count_file="$DEVDOCK_TEST_LOG.count"
+case "${'$'}{1:-}" in
+  bootout)
+    printf 'stopping\\n' > "$state_file"
+    printf '0\\n' > "$count_file"
+    ;;
+  bootstrap)
+    if [[ -f "$state_file" ]] && grep -q stopping "$state_file"; then exit 5; fi
+    printf 'running\\n' > "$state_file"
+    ;;
+  print)
+    if [[ ! -f "$state_file" ]]; then exit 1; fi
+    if grep -q stopping "$state_file"; then
+      count="$(cat "$count_file")"
+      if ((count < 1)); then
+        printf '%s\\n' "$((count + 1))" > "$count_file"
+        printf 'state = stopping\\n'
+        exit 0
+      fi
+      rm -f "$state_file" "$count_file"
+      exit 1
+    fi
+    printf 'state = running\\n'
+    ;;
+esac
 `,
     )
     executable(join(bin, 'curl'), '#!/usr/bin/env bash\nexit 0\n')

@@ -4,7 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${DEVDOCK_REPO_ROOT:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"
-NODE_BIN="${DEVDOCK_NODE_BIN:-$(command -v node)}"
+NODE_BIN="$(realpath "${DEVDOCK_NODE_BIN:-$(command -v node)}")"
 PNPM_BIN="${DEVDOCK_PNPM_BIN:-$(command -v pnpm)}"
 LAUNCHCTL_BIN="${DEVDOCK_LAUNCHCTL_BIN:-$(command -v launchctl)}"
 CURL_BIN="${DEVDOCK_CURL_BIN:-$(command -v curl)}"
@@ -80,8 +80,17 @@ if [[ -f "$PLIST_DEST" ]]; then
   cp "$PLIST_DEST" "$PLIST_BACKUP"
 fi
 
-restore_previous() {
+stop_service() {
   "$LAUNCHCTL_BIN" bootout "$SERVICE_TARGET" 2>/dev/null || true
+  for ((attempt = 0; attempt < 50; attempt++)); do
+    if ! "$LAUNCHCTL_BIN" print "$SERVICE_TARGET" >/dev/null 2>&1; then return 0; fi
+    sleep 0.2
+  done
+  return 1
+}
+
+restore_previous() {
+  stop_service || true
   if [[ -n "$PLIST_BACKUP" && -f "$PLIST_BACKUP" ]]; then
     cp "$PLIST_BACKUP" "$PLIST_DEST"
     "$LAUNCHCTL_BIN" bootstrap "$DOMAIN" "$PLIST_DEST" >/dev/null 2>&1 || true
@@ -92,7 +101,10 @@ restore_previous() {
 
 # The portable tree is complete before the brief handover. If bootstrap or the
 # health check fails, put the previous plist back and restart it.
-"$LAUNCHCTL_BIN" bootout "$SERVICE_TARGET" 2>/dev/null || true
+if ! stop_service; then
+  echo "error: $LABEL did not finish stopping; left the previous launch agent in place" >&2
+  exit 1
+fi
 mv "$PLIST_TMP" "$PLIST_DEST"
 if ! "$LAUNCHCTL_BIN" bootstrap "$DOMAIN" "$PLIST_DEST"; then
   restore_previous
