@@ -16,7 +16,7 @@
   <key>EnvironmentVariables</key>
   <dict>
     <key>DEVDOCK_PORT</key>
-    <string>7717</string>
+    <string>__PORT__</string>
     <key>DEVDOCK_ROOTS</key>
     <string>__ROOTS__</string>
     <!-- /usr/sbin so `lsof` resolves (move-here resolves the dev session's
