@@ -245,15 +245,26 @@ export function allTools(client: DaemonClient): ToolDef[] {
     {
       name: 'devdock_replica_create',
       description:
-        "Deploy a second copy of a repo pinned to a branch, beside the original in the same namespace (own pods, own /<replica-id>/ URL path, primary checkout untouched). Returns immediately with the replica id; the deploy runs in the background — use devdock_wait with the id (e.g. status=running_managed) to know when it's up, then every devdock tool works on the id like a normal repo. Limitation: the replica reuses the parent's deployed image with the branch's code synced in, so changes needing a rebuilt image (new system deps, Dockerfile edits) won't take effect.",
+        "Deploy a second copy of a repo pinned to a branch, beside the original in the same namespace (own pods, own /<replica-id>/ URL path, primary checkout untouched). Returns immediately with the replica id; the deploy runs in the background — use devdock_wait with the id (e.g. status=running_managed) to know when it's up, then every devdock tool works on the id like a normal repo. By default the replica reuses the parent's deployed image with the branch's code synced in (fast, but changes needing a rebuilt image — new system deps, Dockerfile edits — won't take effect); set ownImage=true to build the replica's own image from the branch first (slower: a full image build runs before the deploy).",
       scope: 'rw',
       inputSchema: {
         ...repoArg,
         branch: z.string().min(1).describe('local branch to pin the replica to'),
+        ownImage: z
+          .boolean()
+          .optional()
+          .describe(
+            "build the replica's own image from the branch instead of reusing the parent's (needed when the branch changes Dockerfiles or system deps)",
+          ),
       },
       handler: async (a) => {
-        const r = await client.replicaCreate(a.repo as string, a.branch as string)
-        return `created ${r.id} from ${r.branch} — deploying in the background; poll devdock_wait ${r.id}`
+        const r = await client.replicaCreate(
+          a.repo as string,
+          a.branch as string,
+          a.ownImage as boolean | undefined,
+        )
+        const how = r.ownImage ? 'building its own image, then deploying' : 'deploying'
+        return `created ${r.id} from ${r.branch} — ${how} in the background; poll devdock_wait ${r.id}`
       },
     },
     {

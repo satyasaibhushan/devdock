@@ -53,7 +53,8 @@
     {:else}
       <span class="dot" aria-hidden="true"></span>
       <span class="msg">
-        {auth.phase === 'error' ? (auth.message ?? 'kubernetes auth error') : 'kubernetes login required'}
+        {auth.message ??
+          (auth.phase === 'error' ? 'kubernetes auth error' : 'kubernetes login required')}
       </span>
       <button class="act" onclick={login} disabled={busy}>log in</button>
       <button

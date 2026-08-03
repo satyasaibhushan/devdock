@@ -1,6 +1,6 @@
 // replicas — pure helpers for ephemeral branch-pinned parallel deployments.
 // A replica is a git worktree of the parent repo with generated devspace
-// configs (renamed workloads, own URL path, parent's image tag) so it deploys
+// configs (renamed workloads, own URL path, pinned image tag) so it deploys
 // beside the parent in the same namespace without touching tracked files.
 import { parseDocument } from 'yaml'
 
@@ -14,20 +14,23 @@ export function nextReplicaId(parentId: string, isTaken: (id: string) => boolean
   }
 }
 
-/** A replica's copy of one parent member config: same document (comments and
- *  anchors preserved) with the workload renamed to `<replicaId>-<type>` (the
- *  deployment/service/helm names and the `svc:` label all flow from `name:`),
- *  its own URL path, and the image tag pinned to the parent's — the dev
- *  pipeline never builds images and code arrives via sync, so replicas share
- *  the parent's base image (an unpinned tag would ImagePullBackOff). */
+/** A replica's copy of one parent config: same document (comments and anchors
+ *  preserved) with the project renamed — `<replicaId>-<type>` for a member
+ *  config, plain `<replicaId>` for a single root config (the deployment/
+ *  service/helm names and the `svc:` label all flow from `name:`) — and its
+ *  own URL path. When `imageTag` is given it is pinned so the replica shares
+ *  an existing image (the dev pipeline never builds; an unpinned tag would
+ *  ImagePullBackOff); when it references the parent's tag the replica reuses
+ *  the parent's image with branch code synced in, and an own-image replica
+ *  pins a tag derived from its own name and builds it via deploy first. */
 export function generateReplicaConfig(
   parentYaml: string,
-  opts: { replicaId: string; workloadType: string; imageTag: string },
+  opts: { replicaId: string; workloadType?: string; imageTag?: string },
 ): string {
   const doc = parseDocument(parentYaml)
-  doc.setIn(['name'], `${opts.replicaId}-${opts.workloadType}`)
+  doc.setIn(['name'], opts.workloadType ? `${opts.replicaId}-${opts.workloadType}` : opts.replicaId)
   doc.setIn(['vars', 'INGRESS_PATH'], opts.replicaId)
-  doc.setIn(['vars', 'IMAGE_TAG'], opts.imageTag)
+  if (opts.imageTag !== undefined) doc.setIn(['vars', 'IMAGE_TAG'], opts.imageTag)
   return doc.toString()
 }
 
@@ -43,7 +46,9 @@ export function ingressPathOf(configYaml: string): string {
   }
   const raw = js?.vars?.INGRESS_PATH
   const path = typeof raw === 'string' ? raw : (raw as { default?: unknown } | undefined)?.default
-  if (typeof path === 'string' && path.trim()) return path.trim()
+  // A value with unresolved interpolation (e.g. `${DEVSPACE_NAME}`) can't be
+  // used verbatim; fall back to the project name it resolves to in practice.
+  if (typeof path === 'string' && path.trim() && !path.includes('${')) return path.trim()
   return typeof js?.name === 'string' ? js.name : ''
 }
 

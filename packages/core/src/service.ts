@@ -616,18 +616,21 @@ export class Service {
   }
 
   /** Create a replica of `parentId` pinned to `branch`: a detached git
-   *  worktree under `.agents/replicas/` plus generated member configs, so that
-   *  branch's code deploys beside the parent in the same namespace with zero
-   *  changes to tracked files anywhere. Returns once the record is persisted;
-   *  the deploy itself runs in the background (poll status / `wait`). */
-  async createReplica(parentId: string, branch: string): Promise<ReplicaRecord> {
+   *  worktree under `.agents/replicas/` plus generated configs (per-member for
+   *  the `.devspace/<service>/` layout, the root devspace.yaml otherwise), so
+   *  that branch's code deploys beside the parent in the same namespace with
+   *  zero changes to tracked files anywhere. By default the replica reuses the
+   *  parent's deployed image (fast; code arrives via sync); `ownImage` builds
+   *  its own image from the branch first, so Dockerfile / system-dep changes
+   *  take effect. Returns once the record is persisted; the deploy itself runs
+   *  in the background (poll status / `wait`). */
+  async createReplica(
+    parentId: string,
+    branch: string,
+    opts: { ownImage?: boolean } = {},
+  ): Promise<ReplicaRecord> {
     const parent = this.repoOrThrow(parentId)
     if (parent.parentId) throw new Error('cannot create a replica of a replica')
-    if (!parent.members?.length || !parent.root) {
-      throw new Error(
-        `replicas need the .devspace/<service>/ member layout; ${parentId} has a single config`,
-      )
-    }
     const trimmedBranch = branch.trim()
     if (!trimmedBranch) throw new Error('branch required')
     const denied = (await this.ensureAuth(parentId)) ?? (await this.ensureAwsCreds(parentId))
@@ -663,19 +666,45 @@ export class Service {
     try {
       let namespace = parent.namespace
       if (!namespace) namespace = (await this.contextNamespace()) || undefined
+      // Own image: pin `<ns>-${WORKLOAD_NAME}` — the guidelines' default tag
+      // with the namespace frozen at create time. WORKLOAD_NAME flows from the
+      // renamed project, so the tag never collides with the parent's, and
+      // `deploy` builds it before `dev` runs (the dev pipeline never builds).
+      const ownTag = opts.ownImage ? `${namespace ?? ''}-\${WORKLOAD_NAME}` : undefined
       const configPaths: string[] = []
-      for (const member of parent.members) {
-        const type = member.workloadType ?? member.id
-        const generated = generateReplicaConfig(readFileSync(member.configPath, 'utf8'), {
+      if (parent.members?.length) {
+        for (const member of parent.members) {
+          const type = member.workloadType ?? member.id
+          const generated = generateReplicaConfig(readFileSync(member.configPath, 'utf8'), {
+            replicaId: id,
+            workloadType: type,
+            // Default: the parent's tag — code arrives via sync, so the
+            // replica runs on the parent's base image.
+            imageTag: ownTag ?? `${namespace ?? ''}-${member.name}`,
+          })
+          const dir = join(wt, '.devspace', `${id}-${type}`)
+          mkdirSync(dir, { recursive: true })
+          const configPath = join(dir, 'devspace.yaml')
+          writeFileSync(configPath, generated)
+          configPaths.push(configPath)
+        }
+      } else {
+        // Single root config: overwrite the worktree's own devspace.yaml so
+        // relative paths and imports resolve exactly as they do for the
+        // parent. The worktree is force-removed on delete, so the dirty file
+        // never matters. The parent's tag mirrors the guidelines' convention:
+        // `<ns>-<name>` for ui charts, `<ns>-<name>-<type>` otherwise (the
+        // type is left for devspace to interpolate per workload).
+        const parentTag =
+          parent.codeArea === 'frontend'
+            ? `${namespace ?? ''}-${parent.name}`
+            : `${namespace ?? ''}-${parent.name}-\${WORKLOAD_TYPE}`
+        const generated = generateReplicaConfig(readFileSync(parent.configPath, 'utf8'), {
           replicaId: id,
-          workloadType: type,
-          // The parent's tag: the dev pipeline never builds images and code
-          // arrives via sync, so replicas run on the parent's base image.
-          imageTag: `${namespace ?? ''}-${member.name}`,
+          imageTag: ownTag ?? parentTag,
         })
-        const dir = join(wt, '.devspace', `${id}-${type}`)
-        mkdirSync(dir, { recursive: true })
-        const configPath = join(dir, 'devspace.yaml')
+        mkdirSync(wt, { recursive: true })
+        const configPath = join(wt, 'devspace.yaml')
         writeFileSync(configPath, generated)
         configPaths.push(configPath)
       }
@@ -689,12 +718,30 @@ export class Service {
         configPaths,
         namespace,
       }
-      this.store.addReplica(record) // persisted before start — restart-safe
+      if (opts.ownImage) record.ownImage = true
       const repo = this.materializeReplica(record)
       if (!repo) throw new Error('generated replica configs failed to parse')
+      // Every helm release the deploy can create, remembered for uninstall on
+      // delete (uninstall is best-effort, so a superset is harmless).
+      record.releases = [
+        ...new Set([
+          ...workloadTypes(repo).map((t) => scopeRepo(repo, t).name),
+          ...startupPodTypes(repo).map((t) => `${id}-${t}`),
+        ]),
+      ]
+      this.store.addReplica(record) // persisted before start — restart-safe
       this.repos.set(id, repo)
-      this.hubFor(id).push(`✓ replica ${id} created from ${trimmedBranch} — deploying`)
-      void this.start(id).catch(() => undefined)
+      if (opts.ownImage) {
+        this.hubFor(id).push(
+          `✓ replica ${id} created from ${trimmedBranch} — building image, then deploying`,
+        )
+        void this.build(id)
+          .then((r) => (r.code === 0 ? this.start(id) : undefined))
+          .catch(() => undefined)
+      } else {
+        this.hubFor(id).push(`✓ replica ${id} created from ${trimmedBranch} — deploying`)
+        void this.start(id).catch(() => undefined)
+      }
       return record
     } catch (err) {
       await this.runner('git', ['-C', parent.path, 'worktree', 'remove', '--force', wt]).catch(
@@ -730,8 +777,9 @@ export class Service {
       ]).catch(() => undefined)
       // purge leaves the chart's stopped-state release behind (ExternalName
       // service + base ingress routing to uat); a deleted replica must not.
-      for (const cfg of rec.configPaths) {
-        const release = basename(dirname(cfg))
+      // Older records lack `releases`; their config dirs carry the names.
+      const releases = rec.releases ?? rec.configPaths.map((cfg) => basename(dirname(cfg)))
+      for (const release of releases) {
         await this.kubectl('helm', ['uninstall', release, '-n', rec.namespace]).catch(
           () => undefined,
         )
@@ -768,7 +816,7 @@ export class Service {
       deleted.push(rec.id)
     }
     for (const repo of this.repos.values()) {
-      if (repo.parentId || !repo.members?.length) continue
+      if (repo.parentId) continue
       const dir = join(repo.path, '.agents', 'replicas')
       let names: string[]
       try {
@@ -795,10 +843,42 @@ export class Service {
     return deleted
   }
 
-  /** Build a replica's Repo (base + members) from its stored record, parsing
-   *  only the generated configs. A missing worktree materializes nothing; the
-   *  record is kept so delete/GC can still clean up from stored paths. */
+  /** Build a replica's Repo from its stored record, parsing only the
+   *  generated configs — base + members for the `.devspace/<service>/` layout,
+   *  a plain single-config repo when the generated config sits at the worktree
+   *  root. A missing worktree materializes nothing; the record is kept so
+   *  delete/GC can still clean up from stored paths. */
   private materializeReplica(rec: ReplicaRecord): Repo | undefined {
+    const rootConfig = rec.configPaths.length === 1 ? rec.configPaths[0] : undefined
+    if (rootConfig && dirname(rootConfig) === rec.path) {
+      let text: string
+      try {
+        text = readFileSync(rootConfig, 'utf8')
+      } catch {
+        return undefined
+      }
+      const cfg = parseDevspaceConfig(text)
+      // No `root`: like any single-config repo, devspace runs in the worktree
+      // root directly (no DEVSPACE_BINARY_DIR wrapper).
+      return {
+        id: rec.id,
+        name: cfg.name ?? rec.id,
+        path: rec.path,
+        codeArea: this.repos.get(rec.parentId)?.codeArea,
+        configPath: rootConfig,
+        namespace: cfg.namespace ?? rec.namespace,
+        workload: cfg.workload,
+        ports: cfg.ports,
+        varDefaults: Object.keys(cfg.varDefaults).length ? cfg.varDefaults : undefined,
+        workloads: cfg.workloads,
+        defaultWorkload: cfg.defaultWorkload,
+        workloadType: cfg.workloadType,
+        session: sessionName(rec.id),
+        parentId: rec.parentId,
+        branch: rec.branch,
+        replicaCreatedAt: rec.createdAt,
+      }
+    }
     const members: Repo[] = []
     for (const configPath of rec.configPaths) {
       let text: string
@@ -862,7 +942,9 @@ export class Service {
   private async applyReplicaIngress(repo: Repo, rec: ReplicaRecord): Promise<void> {
     const ns = rec.namespace ?? repo.namespace
     if (!ns) return
-    const member = repo.members?.[0] ?? repo
+    // The default workload's chart service (its name flows from the scoped
+    // project name; a scalar WORKLOAD_TYPE suffixes it the same way).
+    const member = scopeRepo(repo, repo.defaultWorkload ?? repo.workloadType)
     const parent = this.repos.get(rec.parentId)
     const parentMember = parent ? scopeRepo(parent, parent.defaultWorkload) : undefined
     // The shared hostname comes from an existing chart-created ingress —

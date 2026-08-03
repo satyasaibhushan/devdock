@@ -30,6 +30,12 @@ export interface ReplicaRecord {
    *  replica materializes from. */
   configPaths: string[]
   namespace?: string
+  /** Helm release names to uninstall on delete. Older records lack this and
+   *  fall back to deriving names from configPaths. */
+  releases?: string[]
+  /** The replica builds its own image from its branch (deploy-then-dev)
+   *  instead of reusing the parent's. */
+  ownImage?: boolean
   /** Whether the URL alias Ingress has been applied (retried each pass until
    *  it sticks). */
   ingressApplied?: boolean

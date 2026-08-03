@@ -460,7 +460,7 @@ describe('daemon routes', () => {
     expect(gc.json()).toEqual({ deleted: [] })
   })
 
-  it('POST /repos/:id/replicas validates branch, layout, and repo', async () => {
+  it('POST /repos/:id/replicas validates branch and repo, accepts single-config repos', async () => {
     const app = buildApp(makeReplicaService())
     const noBranch = await app.inject({
       method: 'POST',
@@ -471,10 +471,10 @@ describe('daemon routes', () => {
     const singleConfig = await app.inject({
       method: 'POST',
       url: '/repos/svc-a/replicas',
-      payload: { branch: 'main' },
+      payload: { branch: 'main', ownImage: true },
     })
-    expect(singleConfig.statusCode).toBe(400)
-    expect(singleConfig.json().error).toContain('member layout')
+    expect(singleConfig.statusCode).toBe(201)
+    expect(singleConfig.json()).toMatchObject({ id: 'svc-a-r1', ownImage: true })
     const unknown = await app.inject({
       method: 'POST',
       url: '/repos/nope/replicas',

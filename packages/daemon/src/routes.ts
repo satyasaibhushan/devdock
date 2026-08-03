@@ -94,7 +94,7 @@ export function buildApp(service: Service): FastifyInstance {
     }
   })
 
-  app.post<{ Params: { id: string }; Body: { branch?: string } }>(
+  app.post<{ Params: { id: string }; Body: { branch?: string; ownImage?: boolean } }>(
     '/repos/:id/replicas',
     async (req, reply) => {
       const branch = req.body?.branch
@@ -102,12 +102,16 @@ export function buildApp(service: Service): FastifyInstance {
         return reply.code(400).send({ error: 'branch required' })
       }
       try {
-        return reply.code(201).send(await service.createReplica(req.params.id, branch))
+        return reply.code(201).send(
+          await service.createReplica(req.params.id, branch, {
+            ownImage: req.body?.ownImage === true,
+          }),
+        )
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
         const code = message.includes('unknown repo')
           ? 404
-          : message.includes('replica of a replica') || message.includes('member layout')
+          : message.includes('replica of a replica')
             ? 400
             : 500
         return reply.code(code).send({ error: message })

@@ -81,6 +81,11 @@ export const OFF_NETWORK_HINT =
  *  interactive authcode flow (it prints the URL and waits for the callback). */
 const INTERACTIVE_RE = /visit the following URL|open the browser|authentication in progress/i
 
+/** kubelogin could not bind its fixed callback port — another kubelogin
+ *  (a devspace dev session refreshing its own token, a kubectl in a terminal)
+ *  is already waiting on it. It exits immediately, without opening a browser. */
+const BIND_ERROR_RE = /address already in use/i
+
 export class AuthManager {
   private readonly runner: AuthRunner
   private readonly cacheDir: string
@@ -136,13 +141,19 @@ export class AuthManager {
    *  subcommands are local (no API server, no token) and always pass. API
    *  calls pass only on a fresh cached token — otherwise a silent refresh is
    *  kicked off (single-flight) and the call is refused, so a stale token can
-   *  never fan out into per-process kubelogin browser storms. */
+   *  never fan out into per-process kubelogin browser storms.
+   *
+   *  Once the phase is login_required, no more probes are kicked from here: a
+   *  dead refresh token cannot be fixed silently, and re-probing every tick
+   *  would hold kubelogin's callback port ~85% of the time — starving the
+   *  Login button (and any external kubelogin) of the port and delaying the
+   *  browser tab by up to a probe timeout. maintain() still re-checks. */
   kubectlAllowed(args: string[]): boolean {
     const sub = args[0]
     if (sub === 'config' || sub === 'oidc-login') return true
     if (this.oidc !== true) return true
     if (this.tokenFresh(TOKEN_MARGIN_MS)) return true
-    void this.probe().catch(() => undefined)
+    if (this.phase !== 'login_required') void this.probe().catch(() => undefined)
     return false
   }
 
@@ -247,6 +258,15 @@ export class AuthManager {
       // wait 3 minutes for a browser callback that was never coming).
       return this.settle('login_required', `Kubernetes login required — ${OFF_NETWORK_HINT}`)
     }
+    if (BIND_ERROR_RE.test(out)) {
+      // Another kubelogin is mid-interactive-flow on the callback port — that
+      // only happens when its refresh failed too, so login IS required. Leave
+      // the squatter alone: its sign-in tab may be open in front of the user.
+      return this.settle(
+        'login_required',
+        'Kubernetes login required — another sign-in is already waiting (check for an open tab, or click log in to take over)',
+      )
+    }
     return this.settle('error', lastLine(r.stderr) ?? `kubelogin exited ${r.code}`)
   }
 
@@ -257,9 +277,18 @@ export class AuthManager {
     // A refresh that landed while we queued behind the lock makes this a no-op.
     if (this.tokenFresh(TOKEN_MARGIN_MS)) return this.settle('ok', undefined)
 
-    const r = await this.runner(args[0] as string, args.slice(1), {
+    let r = await this.runner(args[0] as string, args.slice(1), {
       timeoutMs: this.loginTimeoutMs,
     })
+    if (r.code !== 0 && BIND_ERROR_RE.test(`${r.stdout}\n${r.stderr}`)) {
+      // A stray kubelogin owns the callback port, waiting (up to 180s) for a
+      // callback this login supersedes. The user explicitly asked for a fresh
+      // sign-in — evict the squatter and retry once.
+      await this.evictSquatters(listenPort(args))
+      r = await this.runner(args[0] as string, args.slice(1), {
+        timeoutMs: this.loginTimeoutMs,
+      })
+    }
     this.expiryCache = undefined
     if (r.code === 0) {
       this.lastLoginFailAt = 0
@@ -269,6 +298,27 @@ export class AuthManager {
     const detail = lastLine(r.stderr)
     const message = detail ? `login did not complete: ${detail}` : 'login did not complete'
     return this.settle('login_required', `${message} — ${OFF_NETWORK_HINT}`)
+  }
+
+  /** Kill stray `oidc-login get-token` processes squatting the callback port.
+   *  Only kubelogin processes are killed — they are pure waiters (a browser
+   *  callback that our own login is about to replace), so this loses nothing;
+   *  their parent (devspace, kubectl) reads it as a failed token refresh and
+   *  retries later. Runs only while doLogin holds the auth lock, so the
+   *  listener can never be one of our own probes. */
+  private async evictSquatters(port: number | undefined): Promise<void> {
+    if (!port) return
+    const opts = { timeoutMs: 5_000 }
+    const l = await this.runner('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-t'], opts)
+    for (const pid of l.stdout
+      .split('\n')
+      .map((s) => s.trim())
+      .filter(Boolean)) {
+      if (!/^\d+$/.test(pid)) continue
+      const ps = await this.runner('ps', ['-o', 'command=', '-p', pid], opts)
+      if (ps.code !== 0 || !/oidc[-_]login/.test(ps.stdout)) continue
+      await this.runner('kill', ['-9', pid], opts)
+    }
   }
 
   /** [command, ...args] of the kubeconfig's oidc-login exec plugin, or null
@@ -345,6 +395,19 @@ export class AuthManager {
     this.lock = p.catch(() => undefined)
     return p
   }
+}
+
+/** Port of the exec plugin's `--listen-address` (kubelogin's fixed callback
+ *  port). Undefined when unset — kubelogin then picks from its own defaults,
+ *  and there is no single port worth evicting. */
+function listenPort(args: string[]): number | undefined {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i] as string
+    const value = a === '--listen-address' ? args[i + 1] : a.split('--listen-address=')[1]
+    const port = Number(value?.split(':').pop())
+    if (Number.isInteger(port) && port > 0) return port
+  }
+  return undefined
 }
 
 /** The last non-empty line of a command's stderr — kubelogin puts the useful

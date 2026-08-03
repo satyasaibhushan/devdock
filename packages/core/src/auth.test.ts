@@ -247,6 +247,97 @@ describe('AuthManager', () => {
     mkdirSync(cacheDir, { recursive: true }) // afterEach rm expects it
   })
 
+  it('stops kicking probes from the kubectl gate once login is required', async () => {
+    const exec = vi.fn(() => ({ code: -1, stdout: '', stderr: '' }))
+    const auth = new AuthManager({
+      runner: fakeRunner(OIDC_CONFIG, exec),
+      cacheDir,
+      expiryTtlMs: 0,
+    })
+    await auth.init() // one probe → login_required
+    expect(exec).toHaveBeenCalledTimes(1)
+    expect(auth.kubectlAllowed(['get', 'pods'])).toBe(false)
+    await new Promise((r) => setTimeout(r, 10)) // a kicked probe would have spawned by now
+    expect(exec).toHaveBeenCalledTimes(1) // no new kubelogin holding the callback port
+  })
+
+  it('reads a callback-port conflict as login_required, not error', async () => {
+    const exec = vi.fn(() => ({
+      code: 1,
+      stdout: '',
+      stderr:
+        'error: could not start a local server: listen tcp 127.0.0.1:8040: bind: address already in use',
+    }))
+    const auth = new AuthManager({ runner: fakeRunner(OIDC_CONFIG, exec), cacheDir })
+    const s = await auth.probe()
+    expect(s.phase).toBe('login_required')
+    expect(s.message).toContain('another sign-in')
+  })
+
+  it('evicts a kubelogin squatting the callback port and retries the login', async () => {
+    const calls: string[] = []
+    const bindError = {
+      code: 1,
+      stdout: '',
+      stderr:
+        'could not start a local server: listen tcp 127.0.0.1:8040: bind: address already in use',
+    }
+    const exec = vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
+      if (cmd === 'lsof') {
+        expect(args).toEqual(['-nP', '-iTCP:8040', '-sTCP:LISTEN', '-t'])
+        calls.push('lsof')
+        return ok('4242\n')
+      }
+      if (cmd === 'ps') {
+        expect(args).toEqual(['-o', 'command=', '-p', '4242'])
+        calls.push('ps')
+        return ok('/opt/homebrew/bin/kubectl-oidc_login get-token --listen-address=localhost:8040')
+      }
+      if (cmd === 'kill') {
+        expect(args).toEqual(['-9', '4242'])
+        calls.push('kill')
+        return ok()
+      }
+      if (args.includes('--skip-open-browser')) {
+        calls.push('probe')
+        return { code: -1, stdout: '', stderr: '' }
+      }
+      calls.push('login')
+      if (!calls.includes('kill')) return bindError // lost the port race
+      writeCachedToken(60 * 60_000)
+      return ok('{"kind":"ExecCredential"}')
+    })
+    const auth = new AuthManager({ runner: fakeRunner(OIDC_CONFIG, exec), cacheDir })
+    await auth.init()
+    const s = await auth.login()
+    expect(s.phase).toBe('ok')
+    expect(calls).toEqual(['probe', 'login', 'lsof', 'ps', 'kill', 'login'])
+  })
+
+  it('never kills a non-kubelogin listener on the callback port', async () => {
+    const kills: string[] = []
+    const exec = vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
+      if (cmd === 'lsof') return ok('4242\n')
+      if (cmd === 'ps') return ok('node some-unrelated-server.js')
+      if (cmd === 'kill') {
+        kills.push(args.join(' '))
+        return ok()
+      }
+      if (args.includes('--skip-open-browser')) return { code: -1, stdout: '', stderr: '' }
+      return {
+        code: 1,
+        stdout: '',
+        stderr: 'listen tcp 127.0.0.1:8040: bind: address already in use',
+      }
+    })
+    const auth = new AuthManager({ runner: fakeRunner(OIDC_CONFIG, exec), cacheDir })
+    await auth.init()
+    const s = await auth.login()
+    expect(kills).toEqual([])
+    expect(s.phase).toBe('login_required')
+    expect(s.message).toContain('address already in use')
+  })
+
   it('maintain() force-refreshes a token that is merely near expiry', async () => {
     writeCachedToken(5 * 60_000) // valid, but < REFRESH_AHEAD_MS left
     const exec = vi.fn((_cmd: string, args: string[]) => {

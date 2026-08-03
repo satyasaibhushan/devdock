@@ -196,6 +196,7 @@ export interface ReplicaRecord {
   createdAt: number
   namespace?: string
   ingressApplied?: boolean
+  ownImage?: boolean
 }
 
 export async function fetchBranches(id: string): Promise<BranchInfo[]> {
@@ -204,11 +205,15 @@ export async function fetchBranches(id: string): Promise<BranchInfo[]> {
   return res.json()
 }
 
-export async function createReplica(id: string, branch: string): Promise<ReplicaRecord> {
+export async function createReplica(
+  id: string,
+  branch: string,
+  ownImage = false,
+): Promise<ReplicaRecord> {
   const res = await fetch(`/repos/${encodeURIComponent(id)}/replicas`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ branch }),
+    body: JSON.stringify({ branch, ownImage }),
   })
   if (!res.ok) {
     const body = (await res.json().catch(() => null)) as { error?: string } | null

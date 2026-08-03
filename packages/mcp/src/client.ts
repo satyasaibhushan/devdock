@@ -78,7 +78,7 @@ export interface DaemonClient {
   auth(): Promise<AuthState>
   authLogin(): Promise<AuthState>
   branches(id: string): Promise<BranchInfo[]>
-  replicaCreate(id: string, branch: string): Promise<ReplicaRecord>
+  replicaCreate(id: string, branch: string, ownImage?: boolean): Promise<ReplicaRecord>
   replicaList(): Promise<ReplicaRecord[]>
   replicaDelete(id: string): Promise<void>
   termList(): Promise<TermInfo[]>
@@ -155,7 +155,8 @@ export function httpClient(baseUrl: string): DaemonClient {
     auth: () => request<AuthState>('/auth'),
     authLogin: () => post<AuthState>('/auth/login'),
     branches: (i) => request<BranchInfo[]>(`/repos/${id(i)}/branches`),
-    replicaCreate: (i, branch) => post<ReplicaRecord>(`/repos/${id(i)}/replicas`, { branch }),
+    replicaCreate: (i, branch, ownImage) =>
+      post<ReplicaRecord>(`/repos/${id(i)}/replicas`, { branch, ownImage }),
     replicaList: () => request<ReplicaRecord[]>('/replicas'),
     replicaDelete: async (i) => {
       await request(`/replicas/${id(i)}`, { method: 'DELETE' })

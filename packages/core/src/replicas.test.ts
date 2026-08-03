@@ -67,6 +67,20 @@ describe('generateReplicaConfig', () => {
     expect(js.imports).toEqual(parseYaml(MEMBER_CONFIG).imports)
     expect(out).toContain('# This is a list of dev containers')
   })
+
+  it('uses the bare replica id as the name when no workloadType is given', () => {
+    const single = parseYaml(
+      generateReplicaConfig(MEMBER_CONFIG, { replicaId: 'svc-r1', imageTag: 'ns-svc-api' }),
+    )
+    expect(single.name).toBe('svc-r1')
+    expect(single.vars.INGRESS_PATH).toBe('svc-r1')
+    expect(single.vars.IMAGE_TAG).toBe('ns-svc-api')
+  })
+
+  it('leaves IMAGE_TAG alone when no imageTag is given', () => {
+    const untagged = parseYaml(generateReplicaConfig(MEMBER_CONFIG, { replicaId: 'svc-r1' }))
+    expect(untagged.vars.IMAGE_TAG).toBeUndefined()
+  })
 })
 
 describe('ingressPathOf', () => {
@@ -79,6 +93,10 @@ describe('ingressPathOf', () => {
   it('falls back to the project name, and to empty on junk', () => {
     expect(ingressPathOf('name: svc\nvars: {}\n')).toBe('svc')
     expect(ingressPathOf(': not yaml :')).toBe('')
+  })
+  it('falls back to the name when the path has unresolved interpolation', () => {
+    const yaml = 'name: svc\nvars:\n  INGRESS_PATH: ${DEVSPACE_NAME}\n'
+    expect(ingressPathOf(yaml)).toBe('svc')
   })
 })
 

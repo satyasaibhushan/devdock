@@ -369,9 +369,27 @@ describe('tool handlers', () => {
       (x) => x.name === 'devdock_replica_create',
     )
     const out = await t?.handler({ repo: 'svc-a', branch: 'feature-x' })
-    expect(replicaCreate).toHaveBeenCalledWith('svc-a', 'feature-x')
+    expect(replicaCreate).toHaveBeenCalledWith('svc-a', 'feature-x', undefined)
     expect(out).toContain('created svc-a-r1 from feature-x')
     expect(out).toContain('devdock_wait')
+  })
+
+  it('replica_create passes ownImage through and mentions the image build', async () => {
+    const replicaCreate = vi.fn(async (id: string, branch: string, ownImage?: boolean) => ({
+      id: `${id}-r1`,
+      parentId: id,
+      branch,
+      path: `/x/.agents/replicas/${id}-r1`,
+      createdAt: 0,
+      configPaths: [],
+      ownImage,
+    }))
+    const t = allTools(fakeClient({ replicaCreate })).find(
+      (x) => x.name === 'devdock_replica_create',
+    )
+    const out = await t?.handler({ repo: 'svc-a', branch: 'feature-x', ownImage: true })
+    expect(replicaCreate).toHaveBeenCalledWith('svc-a', 'feature-x', true)
+    expect(out).toContain('building its own image')
   })
 
   it('replica_list renders id, parent, branch, age, and url', async () => {

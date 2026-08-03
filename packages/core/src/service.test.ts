@@ -1208,13 +1208,83 @@ describe('Service replicas', () => {
     expect((await svc.createReplica('parent', 'third')).id).toBe('parent-r4')
   })
 
-  it('rejects replica-of-replica and single-config repos', async () => {
+  it('rejects replica-of-replica and blank branches', async () => {
     makeParent()
     const { svc } = newService()
     await svc.createReplica('parent', 'feature-x')
     await expect(svc.createReplica('parent-r1', 'other')).rejects.toThrow(/replica of a replica/)
-    await expect(svc.createReplica('svc-a', 'other')).rejects.toThrow(/member layout/)
     await expect(svc.createReplica('parent', '  ')).rejects.toThrow(/branch required/)
+  })
+
+  it('creates a replica of a single-config repo from its root devspace.yaml', async () => {
+    const { svc, runner } = newService()
+    const rec = await svc.createReplica('svc-a', 'feature-x')
+    expect(rec.id).toBe('svc-a-r1')
+    const wt = join(root, 'svc-a', '.agents', 'replicas', 'svc-a-r1')
+    expect(runner).toHaveBeenCalledWith('git', [
+      '-C',
+      join(root, 'svc-a'),
+      'worktree',
+      'add',
+      '--detach',
+      wt,
+      'feature-x',
+    ])
+    // The generated config replaces the worktree's own devspace.yaml, so
+    // relative paths and imports resolve exactly as they do for the parent.
+    const generated = parseYaml(readFileSync(join(wt, 'devspace.yaml'), 'utf8'))
+    expect(generated.name).toBe('svc-a-r1')
+    expect(generated.vars.INGRESS_PATH).toBe('svc-a-r1')
+    expect(generated.vars.IMAGE_TAG).toBe('ns-svc-a-${WORKLOAD_TYPE}')
+    expect(rec.releases).toEqual(['svc-a-r1', 'svc-a-r1-api'])
+
+    const repo = svc.listRepos().find((r) => r.id === 'svc-a-r1')
+    expect(repo?.parentId).toBe('svc-a')
+    expect(repo?.branch).toBe('feature-x')
+    expect(repo?.members).toBeUndefined()
+    expect(repo?.root).toBeUndefined()
+    expect(repo?.namespace).toBe('ns')
+
+    // Restart-safe: the record re-materializes as the same single-config shape.
+    const { svc: after } = newService()
+    const again = after.listRepos().find((r) => r.id === 'svc-a-r1')
+    expect(again?.members).toBeUndefined()
+    expect(again?.branch).toBe('feature-x')
+
+    await svc.deleteReplica('svc-a-r1')
+    expect(runner).toHaveBeenCalledWith('helm', ['uninstall', 'svc-a-r1', '-n', 'ns'])
+    expect(runner).toHaveBeenCalledWith('helm', ['uninstall', 'svc-a-r1-api', '-n', 'ns'])
+    expect(runner).toHaveBeenCalledWith('git', [
+      '-C',
+      join(root, 'svc-a'),
+      'worktree',
+      'remove',
+      '--force',
+      wt,
+    ])
+    expect(svc.listReplicas()).toEqual([])
+  })
+
+  it('ownImage pins a replica-owned tag and deploys (building) before dev', async () => {
+    makeParent()
+    const { svc, runner } = newService()
+    const rec = await svc.createReplica('parent', 'feature-x', { ownImage: true })
+    expect(rec.ownImage).toBe(true)
+    const generated = parseYaml(
+      readFileSync(
+        join(replicaPath('parent-r1'), '.devspace', 'parent-r1-api', 'devspace.yaml'),
+        'utf8',
+      ),
+    )
+    // The guidelines' default tag with the namespace frozen: WORKLOAD_NAME
+    // flows from the renamed project, so it never collides with the parent's.
+    expect(generated.vars.IMAGE_TAG).toBe('ns-${WORKLOAD_NAME}')
+
+    await new Promise((r) => setTimeout(r, 30)) // let the background kickoff run
+    const shellCmds = runner.mock.calls
+      .filter((c) => c[0] === loginShell)
+      .map((c) => (c[1] as string[])[1] ?? '')
+    expect(shellCmds.some((c) => c.includes('devspace deploy'))).toBe(true)
   })
 
   it('re-materializes replicas from the store after a daemon restart', async () => {
