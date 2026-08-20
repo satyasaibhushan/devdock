@@ -1,5 +1,8 @@
 // The MCP server is a thin client of the one brain — the daemon's HTTP API
 // (spec §19.1). It never spins its own Service, so it can never diverge.
+import { readFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import type {
   AuthState,
   LogQueryResult,
@@ -31,7 +34,7 @@ export interface ExecResult extends VerbResult {
 }
 
 /** Lifecycle verbs the daemon exposes as POST /repos/:id/<verb>. */
-export type RepoVerb = 'start' | 'build' | 'stop' | 'restart' | 'adopt' | 'clear'
+export type RepoVerb = 'start' | 'build' | 'build-start' | 'restart' | 'destroy' | 'adopt' | 'clear'
 
 export interface TermOpenOpts {
   repo?: string
@@ -77,6 +80,7 @@ export interface DaemonClient {
   setNamespace(ns: string): Promise<NamespaceInfo>
   auth(): Promise<AuthState>
   authLogin(): Promise<AuthState>
+  authClear(): Promise<AuthState>
   branches(id: string): Promise<BranchInfo[]>
   replicaCreate(id: string, branch: string, ownImage?: boolean): Promise<ReplicaRecord>
   replicaList(): Promise<ReplicaRecord[]>
@@ -89,15 +93,31 @@ export interface DaemonClient {
 }
 
 /** A DaemonClient backed by the running daemon's HTTP endpoints. */
-export function httpClient(baseUrl: string): DaemonClient {
+export function httpClient(
+  baseUrl: string,
+  tokenFile = process.env.DEVDOCK_CONTROL_TOKEN_FILE ??
+    join(homedir(), '.devdock', 'control-token'),
+): DaemonClient {
   const url = (path: string) => `${baseUrl.replace(/\/$/, '')}${path}`
   const id = (s: string) => encodeURIComponent(s)
   const wl = (workload?: string) => (workload ? `?workload=${id(workload)}` : '')
+  let token: string | undefined
+  try {
+    token = readFileSync(tokenFile, 'utf8').trim() || undefined
+  } catch {
+    // Loopback daemon access remains available. Remote ingress will reject it.
+  }
 
   async function request<T>(path: string, init?: RequestInit): Promise<T> {
-    const res = await fetch(url(path), init)
-    const data = (await res.json().catch(() => ({}))) as T & { error?: string }
-    if (!res.ok) throw new Error(data.error ?? `${init?.method ?? 'GET'} ${path} → ${res.status}`)
+    const headers = new Headers(init?.headers)
+    if (token) headers.set('authorization', `Bearer ${token}`)
+    const res = await fetch(url(path), { ...init, headers })
+    const data = (await res.json().catch(() => ({}))) as T & { error?: string; stderr?: string }
+    if (!res.ok) {
+      throw new Error(
+        data.error ?? data.stderr ?? `${init?.method ?? 'GET'} ${path} → ${res.status}`,
+      )
+    }
     return data
   }
 
@@ -154,6 +174,7 @@ export function httpClient(baseUrl: string): DaemonClient {
       }),
     auth: () => request<AuthState>('/auth'),
     authLogin: () => post<AuthState>('/auth/login'),
+    authClear: () => post<AuthState>('/auth/clear'),
     branches: (i) => request<BranchInfo[]>(`/repos/${id(i)}/branches`),
     replicaCreate: (i, branch, ownImage) =>
       post<ReplicaRecord>(`/repos/${id(i)}/replicas`, { branch, ownImage }),

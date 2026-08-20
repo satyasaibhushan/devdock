@@ -219,7 +219,16 @@ export function scanRepos(opts: ScanOptions = {}): Repo[] {
       session: sessionName(id),
     })
   }
-  return groupByRoot(repos).sort((a, b) => a.id.localeCompare(b.id))
+  const grouped = groupByRoot(repos)
+  const identities = new Map<string, string>()
+  for (const repo of grouped) {
+    const existing = identities.get(repo.id)
+    if (existing && existing !== repo.path) {
+      throw new Error(`duplicate repo id "${repo.id}": ${existing} and ${repo.path}`)
+    }
+    identities.set(repo.id, repo.path)
+  }
+  return grouped.sort((a, b) => a.id.localeCompare(b.id))
 }
 
 /** Repos whose workloads live in separate `.devspace/<name>-<type>/` configs

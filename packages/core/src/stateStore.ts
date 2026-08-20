@@ -1,6 +1,15 @@
 // stateStore — persists repos, last-known status, and terminal grants.
 // JSON-backed to start (spec §11: "SQLite or JSON to start; don't overbuild").
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import {
+  closeSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { dirname } from 'node:path'
 import type { RepoStatus, TermMode } from './types.js'
 
@@ -79,8 +88,11 @@ const EMPTY: Persisted = {
 
 export class StateStore {
   private data: Persisted
+  private lastSerialized: string
+  private lastError: string | undefined
   constructor(private readonly file: string) {
     this.data = StateStore.load(file)
+    this.lastSerialized = JSON.stringify(this.data, null, 2)
   }
 
   private static load(file: string): Persisted {
@@ -95,14 +107,53 @@ export class StateStore {
         sessionNamespaces: parsed.sessionNamespaces ?? {},
         replicas: parsed.replicas ?? {},
       }
-    } catch {
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        try {
+          renameSync(file, `${file}.corrupt-${Date.now()}`)
+        } catch {
+          // Preserve startup even if the damaged file cannot be quarantined.
+        }
+      }
       return structuredClone(EMPTY)
     }
   }
 
   private flush(): void {
-    mkdirSync(dirname(this.file), { recursive: true })
-    writeFileSync(this.file, JSON.stringify(this.data, null, 2))
+    const serialized = JSON.stringify(this.data, null, 2)
+    if (serialized === this.lastSerialized) return
+    const parent = dirname(this.file)
+    const temp = `${this.file}.tmp-${process.pid}`
+    try {
+      mkdirSync(parent, { recursive: true })
+      writeFileSync(temp, serialized, { mode: 0o600 })
+      const fileFd = openSync(temp, 'r')
+      try {
+        fsyncSync(fileFd)
+      } finally {
+        closeSync(fileFd)
+      }
+      renameSync(temp, this.file)
+      const dirFd = openSync(parent, 'r')
+      try {
+        fsyncSync(dirFd)
+      } finally {
+        closeSync(dirFd)
+      }
+      this.lastSerialized = serialized
+      this.lastError = undefined
+    } catch (error) {
+      this.lastError = error instanceof Error ? error.message : String(error)
+      try {
+        unlinkSync(temp)
+      } catch {
+        // temp may not have been created
+      }
+    }
+  }
+
+  health(): { ok: boolean; error?: string } {
+    return this.lastError ? { ok: false, error: this.lastError } : { ok: true }
   }
 
   getStatus(repo: string): RepoStatus | undefined {

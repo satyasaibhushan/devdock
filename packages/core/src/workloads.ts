@@ -1,3 +1,4 @@
+import { lifecycleActions } from './lifecycle.js'
 // workloads — one repo, several deployable workloads (spec §6.1).
 // A repo deploys more than one workload in one of two ways, both kept as ONE
 // row that scopes the reconciler/supervisor per workload:
@@ -38,11 +39,19 @@ export function workloadTypes(repo: Repo): (string | undefined)[] {
   return repo.workloads?.length ? repo.workloads : [undefined]
 }
 
-/** Resolve the workload to act on: the requested one if the repo offers it,
- *  else its default, else the first. `undefined` for single-workload repos. */
+/** Resolve an explicit workload exactly. A stale/typoed target must never
+ *  silently operate on the default workload. */
 export function resolveWorkload(repo: Repo, requested?: string): string | undefined {
-  if (!repo.workloads?.length) return undefined
-  if (requested && repo.workloads.includes(requested)) return requested
+  if (!repo.workloads?.length) {
+    if (requested) throw new Error(`unknown workload "${requested}" for repo "${repo.id}"`)
+    return undefined
+  }
+  if (requested) {
+    if (repo.workloads.includes(requested)) return requested
+    throw new Error(
+      `unknown workload "${requested}" for repo "${repo.id}"; expected one of: ${repo.workloads.join(', ')}`,
+    )
+  }
   if (repo.defaultWorkload && repo.workloads.includes(repo.defaultWorkload)) {
     return repo.defaultWorkload
   }
@@ -59,6 +68,13 @@ export function startupPodTypes(repo: Repo): string[] {
 
 /** Resolve a lifecycle workload selection to its startup-command pod type. */
 export function startupPodType(repo: Repo, workload?: string): string {
+  if (!repo.workloads?.length) {
+    const types = startupPodTypes(repo)
+    if (workload && !types.includes(workload)) {
+      throw new Error(`unknown startup pod type "${workload}" for repo "${repo.id}"`)
+    }
+    return workload ?? types[0] ?? 'api'
+  }
   return resolveWorkload(repo, workload) ?? startupPodTypes(repo)[0] ?? 'api'
 }
 
@@ -91,13 +107,21 @@ export function assembleState(
   workloads: WorkloadState[],
   updatedAt: number,
 ): RepoState {
+  const hydrated = workloads.map((workload) => ({
+    ...workload,
+    actions: workload.unreachable ? [] : lifecycleActions(workload.status),
+  }))
+  const status = aggregateStatus(hydrated.map((w) => w.status))
+  const defaultType = repo.defaultWorkload ?? repo.workloads?.[0] ?? ''
+  const target = hydrated.find((workload) => workload.type === defaultType) ?? hydrated[0]
   return {
     repo,
-    status: aggregateStatus(workloads.map((w) => w.status)),
-    workloads,
-    pods: workloads.flatMap((w) => w.pods),
-    deployments: workloads.flatMap((w) => w.deployments),
-    hasSession: workloads.some((w) => w.hasSession),
+    status,
+    actions: target?.actions ?? [],
+    workloads: hydrated,
+    pods: hydrated.flatMap((w) => w.pods),
+    deployments: hydrated.flatMap((w) => w.deployments),
+    hasSession: hydrated.some((w) => w.hasSession),
     updatedAt,
   }
 }

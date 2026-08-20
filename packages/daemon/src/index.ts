@@ -2,6 +2,7 @@
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { Service, checkTools, missingToolWarnings, pathShadowWarnings } from '@devdock/core'
+import { AccessGate } from './accessGate.js'
 import { buildApp } from './routes.js'
 import { attachWs } from './wsServer.js'
 
@@ -25,9 +26,12 @@ async function main() {
     stateFile: join(homedir(), '.devdock', 'state.json'),
   })
 
-  const app = buildApp(service)
+  const gate = AccessGate.load(
+    process.env.DEVDOCK_CONTROL_TOKEN_FILE ?? join(homedir(), '.devdock', 'control-token'),
+  )
+  const app = buildApp(service, gate)
   await app.listen({ port: PORT, host: HOST })
-  attachWs(app.server, service)
+  attachWs(app.server, service, gate)
 
   await service.startLoop()
   console.log(`devdock daemon listening on http://${HOST}:${PORT} — roots: ${roots.join(', ')}`)

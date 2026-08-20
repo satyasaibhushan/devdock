@@ -31,9 +31,15 @@ const PLAIN_CONFIG = JSON.stringify({
 
 /** A JWT whose payload carries the given expiry — signature is irrelevant,
  *  jwtExpiryMs only decodes the middle segment. */
-function makeToken(expiresInMs: number): string {
+function makeToken(
+  expiresInMs: number,
+  identity: { iss: string; aud: string | string[] } = {
+    iss: 'https://issuer.example',
+    aud: 'abc',
+  },
+): string {
   const payload = Buffer.from(
-    JSON.stringify({ exp: Math.floor((Date.now() + expiresInMs) / 1000) }),
+    JSON.stringify({ exp: Math.floor((Date.now() + expiresInMs) / 1000), ...identity }),
   ).toString('base64url')
   return `h.${payload}.s`
 }
@@ -44,10 +50,13 @@ beforeEach(() => {
 })
 afterEach(() => rmSync(cacheDir, { recursive: true, force: true }))
 
-function writeCachedToken(expiresInMs: number): void {
+function writeCachedToken(
+  expiresInMs: number,
+  identity?: { iss: string; aud: string | string[] },
+): void {
   writeFileSync(
     join(cacheDir, 'entry'),
-    JSON.stringify({ id_token: makeToken(expiresInMs), refresh_token: 'r' }),
+    JSON.stringify({ id_token: makeToken(expiresInMs, identity), refresh_token: 'r' }),
   )
 }
 
@@ -87,11 +96,12 @@ describe('AuthManager', () => {
     expect(runner.mock.calls.every((c) => c[1][0] === 'config')).toBe(true)
   })
 
-  it('treats unreadable kubeconfig output as no oidc (fakes, broken kubectl)', async () => {
+  it('fails closed when the active kube context cannot be inspected', async () => {
     const auth = new AuthManager({ runner: fakeRunner(''), cacheDir })
     const s = await auth.ensure()
-    expect(s.phase).toBe('ok')
-    expect(s.oidc).toBe(false)
+    expect(s.phase).toBe('error')
+    expect(s.oidc).toBe(true)
+    expect(auth.kubectlAllowed(['get', 'pods'])).toBe(false)
   })
 
   it('reports ok from a fresh cached token without spawning kubelogin', async () => {
@@ -102,6 +112,34 @@ describe('AuthManager', () => {
     expect(s.phase).toBe('ok')
     expect(s.tokenExpiresAt).toBeGreaterThan(Date.now())
     expect(exec).not.toHaveBeenCalled()
+  })
+
+  it('ignores a newer cached token from a different issuer or client', async () => {
+    writeCachedToken(60 * 60_000, { iss: 'https://other.example', aud: 'other-client' })
+    const exec = vi.fn(() => ({ code: -1, stdout: '', stderr: '' }))
+    const auth = new AuthManager({ runner: fakeRunner(OIDC_CONFIG, exec), cacheDir })
+    const state = await auth.init()
+    expect(state.phase).toBe('login_required')
+    expect(state.tokenExpiresAt).toBeUndefined()
+    expect(exec).toHaveBeenCalledTimes(1)
+  })
+
+  it('rechecks the active context instead of trusting the previous context token', async () => {
+    writeCachedToken(60 * 60_000)
+    let config = OIDC_CONFIG
+    const exec = vi.fn(() => ({ code: -1, stdout: '', stderr: '' }))
+    const runner = vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
+      if (cmd === 'kubectl' && args[0] === 'config') return ok(config)
+      return exec()
+    })
+    const auth = new AuthManager({ runner, cacheDir })
+    expect((await auth.init()).phase).toBe('ok')
+
+    config = OIDC_CONFIG.replace('https://issuer.example', 'https://new-issuer.example')
+    const state = await auth.syncContext()
+    expect(state.phase).toBe('login_required')
+    expect(state.tokenExpiresAt).toBeUndefined()
+    expect(exec).toHaveBeenCalledTimes(1)
   })
 
   it('probes with --skip-open-browser and reads success as ok', async () => {
@@ -161,72 +199,88 @@ describe('AuthManager', () => {
     expect(auth.kubectlAllowed(['get', 'pods'])).toBe(true)
   })
 
-  it('coalesces concurrent ensure() calls into one interactive login', async () => {
+  it('never starts a login from ensure after a probe fails', async () => {
     let logins = 0
-    const exec = vi.fn(async (_cmd: string, args: string[]) => {
-      if (args.includes('--skip-open-browser')) return { code: -1, stdout: '', stderr: '' }
+    const probe = vi.fn(() => ({ code: -1, stdout: '', stderr: '' }))
+    const loginRunner = vi.fn(async () => {
       logins++
-      await new Promise((r) => setTimeout(r, 20)) // the user signs in…
-      writeCachedToken(60 * 60_000)
-      return ok('{"kind":"ExecCredential"}')
-    })
-    const auth = new AuthManager({ runner: fakeRunner(OIDC_CONFIG, exec), cacheDir })
-    const [a, b, c] = await Promise.all([auth.ensure(), auth.ensure(), auth.ensure()])
-    expect(a?.phase).toBe('ok')
-    expect(b?.phase).toBe('ok')
-    expect(c?.phase).toBe('ok')
-    expect(logins).toBe(1)
-  })
-
-  it('does not auto-reopen the browser during the failure cooldown', async () => {
-    let logins = 0
-    const exec = vi.fn(async (_cmd: string, args: string[]) => {
-      if (args.includes('--skip-open-browser')) return { code: -1, stdout: '', stderr: '' }
-      logins++
-      return { code: -1, stdout: '', stderr: '' } // timed out — user is at home
+      return ok()
     })
     const auth = new AuthManager({
-      runner: fakeRunner(OIDC_CONFIG, exec),
+      runner: fakeRunner(OIDC_CONFIG, probe),
+      loginRunner,
       cacheDir,
-      loginCooldownMs: 60_000,
     })
-    const first = await auth.ensure()
-    expect(first.phase).toBe('login_required')
-    expect(logins).toBe(1)
-    const second = await auth.ensure() // within cooldown → no new browser tab
-    expect(second.phase).toBe('login_required')
-    expect(logins).toBe(1)
-    // …but an explicit login (the UI button) always may retry.
-    await auth.login()
-    expect(logins).toBe(2)
+    const [a, b, c] = await Promise.all([auth.ensure(), auth.ensure(), auth.ensure()])
+    expect([a.phase, b.phase, c.phase]).toEqual([
+      'login_required',
+      'login_required',
+      'login_required',
+    ])
+    expect(logins).toBe(0)
   })
 
-  it('reports an interactive login immediately and retains its failure reason', async () => {
-    const exec = vi.fn((_cmd: string, args: string[]) => {
-      if (args.includes('--skip-open-browser')) return { code: -1, stdout: '', stderr: '' }
-      return { code: 1, stdout: '', stderr: 'could not open the default browser' }
+  it('coalesces explicit logins and always passes --skip-open-browser', async () => {
+    const loginRunner = vi.fn(async (_cmd, args: string[]) => {
+      expect(args).toContain('--skip-open-browser')
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      writeCachedToken(60 * 60_000)
+      return ok()
     })
-    const auth = new AuthManager({ runner: fakeRunner(OIDC_CONFIG, exec), cacheDir })
+    const auth = new AuthManager({
+      runner: fakeRunner(OIDC_CONFIG, () => ({ code: -1, stdout: '', stderr: '' })),
+      loginRunner,
+      cacheDir,
+    })
+    await auth.init()
+    const results = await Promise.all([auth.login(), auth.login(), auth.login()])
+    expect(results.every((result) => result.phase === 'ok')).toBe(true)
+    expect(loginRunner).toHaveBeenCalledTimes(1)
+  })
+
+  it('surfaces the login URL without opening it and retains a failure reason', async () => {
+    let finishLogin: (() => void) | undefined
+    const loginRunner = vi.fn(async (_cmd, _args, _opts, onLine) => {
+      onLine('Please visit https://issuer.example/authorize?state=abc')
+      await new Promise<void>((resolve) => {
+        finishLogin = resolve
+      })
+      return { code: 1, stdout: '', stderr: 'callback timed out' }
+    })
+    const auth = new AuthManager({
+      runner: fakeRunner(OIDC_CONFIG, () => ({ code: -1, stdout: '', stderr: '' })),
+      loginRunner,
+      cacheDir,
+    })
     await auth.init()
 
     const login = auth.login()
-    expect(auth.snapshot()).toMatchObject({ oidc: true, phase: 'logging_in' })
+    await vi.waitFor(() => expect(auth.snapshot().loginUrl).toContain('/authorize'))
+    expect(auth.snapshot()).toMatchObject({
+      oidc: true,
+      phase: 'logging_in',
+      message: 'open the sign-in URL to continue',
+    })
 
+    finishLogin?.()
     const result = await login
     expect(result.phase).toBe('login_required')
-    expect(result.message).toContain('could not open the default browser')
+    expect(result.message).toContain('callback timed out')
   })
 
   it('does not hide an in-flight login when clearing the cache', async () => {
     let finishLogin: (() => void) | undefined
-    const exec = vi.fn(async (_cmd: string, args: string[]) => {
-      if (args.includes('--skip-open-browser')) return { code: -1, stdout: '', stderr: '' }
+    const loginRunner = vi.fn(async () => {
       await new Promise<void>((resolve) => {
         finishLogin = resolve
       })
       return { code: -1, stdout: '', stderr: '' }
     })
-    const auth = new AuthManager({ runner: fakeRunner(OIDC_CONFIG, exec), cacheDir })
+    const auth = new AuthManager({
+      runner: fakeRunner(OIDC_CONFIG, () => ({ code: -1, stdout: '', stderr: '' })),
+      loginRunner,
+      cacheDir,
+    })
     await auth.init()
 
     const login = auth.login()
@@ -274,68 +328,24 @@ describe('AuthManager', () => {
     expect(s.message).toContain('another sign-in')
   })
 
-  it('evicts a kubelogin squatting the callback port and retries the login', async () => {
-    const calls: string[] = []
+  it('does not retry a failed explicit login', async () => {
     const bindError = {
       code: 1,
       stdout: '',
       stderr:
         'could not start a local server: listen tcp 127.0.0.1:8040: bind: address already in use',
     }
-    const exec = vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
-      if (cmd === 'lsof') {
-        expect(args).toEqual(['-nP', '-iTCP:8040', '-sTCP:LISTEN', '-t'])
-        calls.push('lsof')
-        return ok('4242\n')
-      }
-      if (cmd === 'ps') {
-        expect(args).toEqual(['-o', 'command=', '-p', '4242'])
-        calls.push('ps')
-        return ok('/opt/homebrew/bin/kubectl-oidc_login get-token --listen-address=localhost:8040')
-      }
-      if (cmd === 'kill') {
-        expect(args).toEqual(['-9', '4242'])
-        calls.push('kill')
-        return ok()
-      }
-      if (args.includes('--skip-open-browser')) {
-        calls.push('probe')
-        return { code: -1, stdout: '', stderr: '' }
-      }
-      calls.push('login')
-      if (!calls.includes('kill')) return bindError // lost the port race
-      writeCachedToken(60 * 60_000)
-      return ok('{"kind":"ExecCredential"}')
+    const loginRunner = vi.fn(async () => bindError)
+    const auth = new AuthManager({
+      runner: fakeRunner(OIDC_CONFIG, () => ({ code: -1, stdout: '', stderr: '' })),
+      loginRunner,
+      cacheDir,
     })
-    const auth = new AuthManager({ runner: fakeRunner(OIDC_CONFIG, exec), cacheDir })
     await auth.init()
     const s = await auth.login()
-    expect(s.phase).toBe('ok')
-    expect(calls).toEqual(['probe', 'login', 'lsof', 'ps', 'kill', 'login'])
-  })
-
-  it('never kills a non-kubelogin listener on the callback port', async () => {
-    const kills: string[] = []
-    const exec = vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
-      if (cmd === 'lsof') return ok('4242\n')
-      if (cmd === 'ps') return ok('node some-unrelated-server.js')
-      if (cmd === 'kill') {
-        kills.push(args.join(' '))
-        return ok()
-      }
-      if (args.includes('--skip-open-browser')) return { code: -1, stdout: '', stderr: '' }
-      return {
-        code: 1,
-        stdout: '',
-        stderr: 'listen tcp 127.0.0.1:8040: bind: address already in use',
-      }
-    })
-    const auth = new AuthManager({ runner: fakeRunner(OIDC_CONFIG, exec), cacheDir })
-    await auth.init()
-    const s = await auth.login()
-    expect(kills).toEqual([])
     expect(s.phase).toBe('login_required')
     expect(s.message).toContain('address already in use')
+    expect(loginRunner).toHaveBeenCalledTimes(1)
   })
 
   it('maintain() force-refreshes a token that is merely near expiry', async () => {

@@ -16,6 +16,7 @@ SERVICE_TARGET="$DOMAIN/$LABEL"
 INSTALL_ROOT="${DEVDOCK_INSTALL_ROOT:-$HOME/.local/share/devdock}"
 RELEASES="$INSTALL_ROOT/releases"
 PLIST_DEST="${DEVDOCK_PLIST_DEST:-$HOME/Library/LaunchAgents/$LABEL.plist}"
+MCP_LINK="${DEVDOCK_MCP_LINK:-$HOME/.local/bin/devdock-mcp}"
 
 mkdir -p "$HOME/.devdock" "$RELEASES" "$(dirname "$PLIST_DEST")"
 
@@ -37,10 +38,12 @@ trap cleanup EXIT
   cd "$REPO_ROOT"
   "$PNPM_BIN" --filter @devdock/core exec tsc -b tsconfig.json --force
   "$PNPM_BIN" --filter @devdock/daemon exec tsc -b tsconfig.json --force
+  "$PNPM_BIN" --filter @devdock/mcp exec tsc -b tsconfig.json --force
   "$PNPM_BIN" --filter @devdock/web build
 
   mkdir -p "$STAGING/packages"
   "$PNPM_BIN" --filter @devdock/daemon deploy --prod --legacy "$STAGING/packages/daemon"
+  "$PNPM_BIN" --filter @devdock/mcp deploy --prod --legacy "$STAGING/packages/mcp"
   mkdir -p "$STAGING/packages/web"
   cp -R "$REPO_ROOT/packages/web/dist" "$STAGING/packages/web/dist"
 )
@@ -48,7 +51,10 @@ trap cleanup EXIT
 STAGED_DAEMON="$STAGING/packages/daemon/dist/index.js"
 STAGED_CORE="$STAGING/packages/daemon/node_modules/@devdock/core/dist/index.js"
 STAGED_ROUTES="$STAGING/packages/daemon/dist/routes.js"
-for required in "$STAGED_DAEMON" "$STAGED_CORE" "$STAGED_ROUTES"; do
+STAGED_MCP="$STAGING/packages/mcp/dist/index.js"
+STAGED_MCP_SERVER="$STAGING/packages/mcp/dist/server.js"
+STAGED_MCP_SDK="$STAGING/packages/mcp/node_modules/@modelcontextprotocol/sdk/package.json"
+for required in "$STAGED_DAEMON" "$STAGED_CORE" "$STAGED_ROUTES" "$STAGED_MCP" "$STAGED_MCP_SERVER" "$STAGED_MCP_SDK"; do
   if [[ ! -f "$required" ]]; then
     echo "error: portable release is missing $required" >&2
     exit 1
@@ -59,6 +65,7 @@ done
 # catches missing/broken production dependencies before touching the live job.
 "$NODE_BIN" --input-type=module --eval 'await import(process.argv[1])' "$STAGED_CORE"
 "$NODE_BIN" --input-type=module --eval 'await import(process.argv[1])' "$STAGED_ROUTES"
+"$NODE_BIN" --input-type=module --eval 'await import(process.argv[1])' "$STAGED_MCP_SERVER"
 
 REVISION="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || printf 'local')"
 RELEASE_ID="$(date -u +%Y%m%dT%H%M%SZ)-$REVISION-$$"
@@ -66,6 +73,10 @@ RELEASE="$RELEASES/$RELEASE_ID"
 mv "$STAGING" "$RELEASE"
 STAGING=""
 DAEMON_JS="$RELEASE/packages/daemon/dist/index.js"
+MCP_JS="$RELEASE/packages/mcp/dist/index.js"
+mkdir -p "$RELEASE/bin"
+printf '#!/usr/bin/env bash\nexec %q %q "$@"\n' "$NODE_BIN" "$MCP_JS" > "$RELEASE/bin/devdock-mcp"
+chmod 755 "$RELEASE/bin/devdock-mcp"
 
 sed -e "s|__NODE__|$NODE_BIN|g" \
     -e "s|__DAEMON__|$DAEMON_JS|g" \
@@ -128,6 +139,10 @@ if [[ "$HEALTHY" != true ]]; then
   exit 1
 fi
 
+mkdir -p "$(dirname "$MCP_LINK")"
+ln -sfn "$RELEASE/bin/devdock-mcp" "$MCP_LINK"
+
 echo "devdock daemon installed -> $DAEMON_JS"
+echo "devdock MCP installed -> $MCP_LINK"
 echo "health: http://127.0.0.1:$PORT/health"
 echo "logs: ~/.devdock/daemon.{out,err}.log | roots: $ROOTS"

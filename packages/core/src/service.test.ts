@@ -836,14 +836,15 @@ describe('Service', () => {
 
   it('refuses verbs while kubernetes login is required, without spawning devspace', async () => {
     const runner = cannedRunner('{"items":[]}', false)
+    const ensure = vi.fn()
     const auth = {
-      snapshot: () => ({ oidc: true, phase: 'login_required', checkedAt: Date.now() }),
-      ensure: async () => ({
+      snapshot: () => ({
         oidc: true,
         phase: 'login_required',
         message: 'kubernetes login required — sign in from the office network',
         checkedAt: Date.now(),
       }),
+      ensure,
       kubectlAllowed: () => true,
       init: async () => ({ oidc: true, phase: 'login_required', checkedAt: Date.now() }),
     } as unknown as AuthManager
@@ -856,10 +857,12 @@ describe('Service', () => {
     expect(runner.mock.calls.some((c) => c[0] === 'tmux' && c[1][0] === 'new-session')).toBe(false)
     // …and the failure is narrated into the workload's log hub
     expect(svc.logs('svc-a').some((l) => l.includes('office network'))).toBe(true)
+    expect(ensure).not.toHaveBeenCalled()
   })
 
   it('returns start promptly while Kubernetes login is still in progress', async () => {
     const runner = cannedRunner('{"items":[]}', false)
+    const ensure = vi.fn(() => new Promise(() => undefined))
     const auth = {
       snapshot: () => ({
         oidc: true,
@@ -867,7 +870,7 @@ describe('Service', () => {
         message: 'Kubernetes login required',
         checkedAt: Date.now(),
       }),
-      ensure: vi.fn(() => new Promise(() => undefined)),
+      ensure,
       kubectlAllowed: () => true,
       init: async () => ({ oidc: true, phase: 'login_required', checkedAt: Date.now() }),
     } as unknown as AuthManager
@@ -884,6 +887,7 @@ describe('Service', () => {
     expect(result.code).toBe(1)
     expect(result.stderr).toContain('Kubernetes login required')
     expect(runner.mock.calls.some((c) => c[0] === 'tmux' && c[1][0] === 'new-session')).toBe(false)
+    expect(ensure).not.toHaveBeenCalled()
   })
 
   it('refuses start/build while the AWS credential cannot be warmed', async () => {

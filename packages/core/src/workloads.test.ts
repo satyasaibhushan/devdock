@@ -104,12 +104,13 @@ describe('resolveWorkload', () => {
   it('honours a requested workload the repo offers', () => {
     expect(resolveWorkload(base, 'worker')).toBe('worker')
   })
-  it('falls back to the default for an unknown/absent request', () => {
-    expect(resolveWorkload(base, 'nope')).toBe('api')
+  it('uses the default only when no workload was requested', () => {
     expect(resolveWorkload(base)).toBe('api')
   })
-  it('is undefined for single-workload repos regardless of request', () => {
-    expect(resolveWorkload(single, 'api')).toBeUndefined()
+  it('fails closed for unknown and inapplicable workload ids', () => {
+    expect(() => resolveWorkload(base, 'nope')).toThrow(/unknown workload/)
+    expect(() => resolveWorkload(single, 'api')).toThrow(/unknown workload/)
+    expect(resolveWorkload(single)).toBeUndefined()
   })
 })
 
@@ -178,6 +179,26 @@ describe('assembleState', () => {
     expect(state.pods.map((p) => p.name)).toEqual(['acs-api-1'])
     expect(state.deployments.map((d) => d.name)).toEqual(['acs-org-management-api'])
     expect(state.hasSession).toBe(true)
+    expect(state.actions).toEqual(['restart', 'destroy'])
     expect(state.updatedAt).toBe(123)
+  })
+
+  it('uses the default workload actions, not an unrelated aggregate status', () => {
+    const state = assembleState(
+      base,
+      [
+        { type: 'api', status: 'STOPPED', pods: [], deployments: [], hasSession: false },
+        {
+          type: 'worker',
+          status: 'RUNNING_MANAGED',
+          pods: [],
+          deployments: [],
+          hasSession: true,
+        },
+      ],
+      123,
+    )
+    expect(state.status).toBe('RUNNING_MANAGED')
+    expect(state.actions).toEqual(['build', 'build_start'])
   })
 })

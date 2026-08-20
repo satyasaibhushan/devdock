@@ -128,25 +128,44 @@ export function runStream(
     }
     let stdout = ''
     let stderr = ''
+    let timedOut = false
+    let truncated = false
+    let timer: NodeJS.Timeout | undefined
+
+    if (opts.timeoutMs) {
+      timer = setTimeout(() => {
+        timedOut = true
+        child.kill('SIGKILL')
+      }, opts.timeoutMs)
+    }
+
+    const cap = (s: string): string => {
+      const max = opts.maxOutputBytes
+      if (!max || s.length <= max) return s
+      truncated = true
+      return s.slice(-max)
+    }
 
     child.stdout?.on('data', (d) => {
-      stdout += d
+      stdout = cap(stdout + d)
       outLines.ingest(String(d))
     })
     child.stderr?.on('data', (d) => {
-      stderr += d
+      stderr = cap(stderr + d)
       errLines.ingest(String(d))
     })
     child.on('error', (err) => {
+      if (timer) clearTimeout(timer)
       const code = (err as NodeJS.ErrnoException).code === 'ENOENT' ? 127 : -1
       const hint = code === 127 ? `${cmd}: command not found` : err.message
       onLine(hint)
       flush()
-      resolve({ code, stdout, stderr: stderr || hint })
+      resolve({ code, stdout, stderr: stderr || hint, timedOut, truncated })
     })
     child.on('close', (code) => {
+      if (timer) clearTimeout(timer)
       flush()
-      resolve({ code: code ?? -1, stdout, stderr })
+      resolve({ code: code ?? -1, stdout, stderr, timedOut, truncated })
     })
   })
 }

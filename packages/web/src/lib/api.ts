@@ -52,6 +52,7 @@ export interface WorkloadState {
   pods: PodInfo[]
   deployments: DeploymentInfo[]
   hasSession: boolean
+  actions: Verb[]
 }
 
 export interface RepoState {
@@ -63,6 +64,7 @@ export interface RepoState {
   pods: PodInfo[]
   deployments?: DeploymentInfo[]
   hasSession: boolean
+  actions: Verb[]
   updatedAt: number
   /** Command auto-run in the `devspace dev` session once the pod is up. */
   startupCommand?: string
@@ -70,24 +72,7 @@ export interface RepoState {
   startupCommands?: Record<string, string>
 }
 
-export type Verb = 'start' | 'build' | 'stop' | 'restart' | 'clear'
-
-// The verbs that make sense for a workload's current state — the single source
-// of truth shared by the detail pane and the list rows. `restart`
-// (kill → build → start) is offered in every state as a one-click recycle.
-//  - killed (STOPPED): build it first.
-//  - built (DEPLOYED): start it, or kill it.
-//  - running/building: kill it (start would just collide).
-//  - crashed: clear pod (reset dev pod, no image change), restart, or kill.
-export const STATUS_VERBS: Record<RepoStatus, Verb[]> = {
-  STOPPED: ['build', 'restart'],
-  DEPLOYED: ['start', 'restart', 'stop'],
-  BUILDING: ['restart', 'stop'],
-  RUNNING_MANAGED: ['restart', 'stop'],
-  RUNNING_EXTERNAL: ['restart', 'stop'],
-  CRASHED: ['clear', 'restart', 'stop'],
-  RESTARTING: ['restart', 'stop'],
-}
+export type Verb = 'start' | 'build' | 'build_start' | 'restart' | 'destroy'
 
 /** The global namespace view — the kube context's current namespace plus every
  *  namespace devdock has learned (cluster-wide listing is RBAC-forbidden). */
@@ -123,6 +108,7 @@ export interface AuthState {
   phase: 'unknown' | 'ok' | 'login_required' | 'logging_in' | 'error'
   message?: string
   tokenExpiresAt?: number
+  loginUrl?: string
   checkedAt: number
 }
 
@@ -154,9 +140,10 @@ export async function fetchRepos(): Promise<RepoState[]> {
 
 export async function runVerb(id: string, verb: Verb, workload?: string): Promise<void> {
   const q = workload ? `?workload=${encodeURIComponent(workload)}` : ''
-  const res = await fetch(`/repos/${encodeURIComponent(id)}/${verb}${q}`, { method: 'POST' })
-  if (!res.ok) throw new Error(`${verb} ${id} → ${res.status}`)
+  const path = verb === 'build_start' ? 'build-start' : verb
+  const res = await fetch(`/repos/${encodeURIComponent(id)}/${path}${q}`, { method: 'POST' })
   const body = (await res.json()) as { ok?: boolean; stderr?: string }
+  if (!res.ok) throw new Error(body.stderr ?? `${verb} ${id} → ${res.status}`)
   if (!body.ok) throw new Error(body.stderr ?? `${verb} failed`)
 }
 

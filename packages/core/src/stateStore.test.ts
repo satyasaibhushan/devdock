@@ -1,4 +1,12 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -28,7 +36,31 @@ describe('StateStore', () => {
   })
 
   it('tolerates a missing/corrupt file', () => {
+    writeFileSync(file, '{broken')
     expect(new StateStore(file).getStatus('nope')).toBeUndefined()
+    expect(readdirSync(dir).some((name) => name.startsWith('state.json.corrupt-'))).toBe(true)
+  })
+
+  it('writes atomically and skips unchanged state', () => {
+    const s = new StateStore(file)
+    s.setStatus('repo-a', 'STOPPED')
+    const first = readFileSync(file, 'utf8')
+    const inode = statSync(file).ino
+    s.setStatus('repo-a', 'STOPPED')
+    expect(readFileSync(file, 'utf8')).toBe(first)
+    expect(statSync(file).ino).toBe(inode)
+    expect(readdirSync(dir).some((name) => name.includes('.tmp-'))).toBe(false)
+    expect(s.health()).toEqual({ ok: true })
+  })
+
+  it('keeps operating and reports degraded health when persistence fails', () => {
+    const blocker = join(dir, 'not-a-directory')
+    writeFileSync(blocker, 'x')
+    const s = new StateStore(join(blocker, 'state.json'))
+    expect(() => s.setStatus('repo-a', 'STOPPED')).not.toThrow()
+    expect(s.getStatus('repo-a')).toBe('STOPPED')
+    expect(s.health()).toMatchObject({ ok: false })
+    expect(existsSync(join(blocker, 'state.json'))).toBe(false)
   })
 
   it('remembers namespaces once each, preserving order', () => {

@@ -16,6 +16,7 @@ function repoState(over: Partial<RepoState> = {}): RepoState {
       session: 'devdock-svc-a',
     },
     status: 'RUNNING_MANAGED',
+    actions: ['restart', 'destroy'],
     workloads: [
       {
         type: '',
@@ -23,6 +24,7 @@ function repoState(over: Partial<RepoState> = {}): RepoState {
         pods: [{ name: 'p', phase: 'Running', ready: true, restartCount: 0 }],
         deployments: [],
         hasSession: true,
+        actions: ['restart', 'destroy'],
       },
     ],
     pods: [{ name: 'p', phase: 'Running', ready: true, restartCount: 0 }],
@@ -90,6 +92,7 @@ function fakeClient(over: Partial<DaemonClient> = {}): DaemonClient {
     setNamespace: async (ns) => ({ current: ns, known: ['uat', ns] }),
     auth: async () => ({ oidc: true, phase: 'ok', checkedAt: 1 }),
     authLogin: async () => ({ oidc: true, phase: 'logging_in', checkedAt: 2 }),
+    authClear: async () => ({ oidc: true, phase: 'login_required', checkedAt: 3 }),
     termList: async () => [
       {
         id: 'host:t1',
@@ -168,7 +171,8 @@ describe('toolsForScope', () => {
       'devdock_term_read',
       'devdock_start',
       'devdock_build',
-      'devdock_stop',
+      'devdock_build_start',
+      'devdock_destroy',
       'devdock_restart',
       'devdock_adopt',
       'devdock_clear',
@@ -179,6 +183,7 @@ describe('toolsForScope', () => {
       'devdock_set_startup',
       'devdock_set_namespace',
       'devdock_auth_login',
+      'devdock_auth_clear',
       'devdock_term_open',
       'devdock_term_run',
       'devdock_term_close',
@@ -200,8 +205,16 @@ describe('renderList', () => {
           pods: [{ name: 'p', phase: 'Running', ready: true, restartCount: 0 }],
           deployments: [],
           hasSession: true,
+          actions: ['restart', 'destroy'],
         },
-        { type: 'cron', status: 'STOPPED', pods: [], deployments: [], hasSession: false },
+        {
+          type: 'cron',
+          status: 'STOPPED',
+          pods: [],
+          deployments: [],
+          hasSession: false,
+          actions: ['build', 'build_start'],
+        },
       ],
     })
     expect(renderList([multi])).toBe(

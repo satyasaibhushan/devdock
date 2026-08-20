@@ -12,7 +12,6 @@
     type NamespaceInfo,
     type RepoState,
     type Verb,
-    STATUS_VERBS,
     adoptRepo,
     deleteReplica,
     fetchAuth,
@@ -157,7 +156,7 @@
     !view ? 'none' : view.hasSession ? 'tmux' : view.pods.length ? 'pod' : 'none',
   )
 
-  const verbs = $derived(selected ? STATUS_VERBS[vstatus] : [])
+  const verbs = $derived(view?.actions ?? selected?.actions ?? [])
 
   // The detail pane acts on the chosen workload (`wl`); a list row acts on the
   // repo's default workload, so it passes its own id and leaves `workload` unset.
@@ -336,10 +335,10 @@
           {/if}
           {#each verbs as v (v)}
             <button
-              class:danger={v === 'stop'}
+              class:danger={v === 'destroy'}
               disabled={busy !== null || adoptBusy}
               onclick={() => act(v)}
-            >{v === 'stop' ? 'kill' : v === 'clear' ? 'clear pod' : v}</button>
+            >{v === 'build_start' ? 'build + start' : v}</button>
           {/each}
         </div>
       </div>

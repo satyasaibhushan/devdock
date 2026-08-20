@@ -265,7 +265,8 @@ export class Supervisor {
     if (!lock.readable) return this.externalDevPidsByProcess(repo)
     if (lock.port === undefined) return [] // no lock entry — nothing to take over
     const pid = await this.pidOnPort(lock.port)
-    return pid === undefined ? [] : [pid] // no listener — stale lock, owner gone
+    if (pid === undefined) return [] // no listener — stale lock, owner gone
+    return (await this.isDevOwner(repo, pid)) ? [pid] : []
   }
 
   /** Read this project's entry in the namespace's `devspace-dependencies`
@@ -309,18 +310,14 @@ export class Supervisor {
   private async externalDevPidsByProcess(repo: Repo): Promise<number[]> {
     const ps = await this.runner('ps', ['-axww', '-o', 'pid=,command=']).catch(() => undefined)
     if (!ps || ps.code !== 0) return []
-    const wlType = repo.varDefaults?.WORKLOAD_TYPE
     const out: number[] = []
     for (const line of ps.stdout.split('\n')) {
       const m = line.trim().match(/^(\d+)\s+(.+)$/)
       if (!m) continue
       const cmd = m[2] as string
-      // `devspace dev` only — not deploy/purge/enter/logs (which don't hold the
-      // session). `\bdev\b` excludes `deploy`; the adjacency excludes a `dev` in
-      // a binary path like /Users/dev/.
-      if (!/devspace\s+dev\b/.test(cmd)) continue
-      if (wlType && !cmd.includes(`WORKLOAD_TYPE=${wlType}`)) continue
-      if ((await this.cwdOf(Number(m[1]))) === repo.path) out.push(Number(m[1]))
+      if (this.commandMatches(repo, cmd) && (await this.cwdOf(Number(m[1]))) === repo.path) {
+        out.push(Number(m[1]))
+      }
     }
     return out
   }
@@ -334,6 +331,24 @@ export class Supervisor {
     // -Fn field output: a line per field, the cwd path on an `n`-prefixed line.
     const n = r.stdout.split('\n').find((l) => l.startsWith('n'))
     return n ? n.slice(1) : undefined
+  }
+
+  private commandMatches(repo: Repo, command: string): boolean {
+    if (!/devspace\s+dev\b/.test(command)) return false
+    const workload = repo.varDefaults?.WORKLOAD_TYPE
+    return !workload || command.includes(`WORKLOAD_TYPE=${workload}`)
+  }
+
+  /** A port number or PID is only a hint. Prove both executable role and cwd
+   *  before returning or signalling it, so stale locks and PID reuse fail shut. */
+  private async isDevOwner(repo: Repo, pid: number): Promise<boolean> {
+    const ps = await this.runner('ps', ['-o', 'command=', '-p', String(pid)]).catch(() => undefined)
+    return (
+      !!ps &&
+      ps.code === 0 &&
+      this.commandMatches(repo, ps.stdout) &&
+      (await this.cwdOf(pid)) === repo.path
+    )
   }
 
   /** Whether a process is still alive (`kill -0`). */
@@ -359,22 +374,27 @@ export class Supervisor {
     const tries = grace.tries ?? 20
     const intervalMs = grace.intervalMs ?? 300
     const pids = await this.externalDevPids(repo)
+    const signalled: number[] = []
     for (const pid of pids) {
+      // Re-read the lock and process identity immediately before the signal.
+      // A PID resolved moments ago may already belong to another process.
+      if (!(await this.externalDevPids(repo)).includes(pid)) continue
       onLine?.(`stopping external devspace dev (pid ${pid})`)
       await this.runner('kill', ['-TERM', String(pid)]).catch(() => undefined)
+      signalled.push(pid)
     }
     // Give devspace time (default ~6s) to release its session and exit cleanly.
     for (let i = 0; i < tries; i++) {
-      if (!(await this.anyAlive(pids))) break
+      if (!(await this.anyAlive(signalled))) break
       await delay(intervalMs)
     }
-    for (const pid of pids) {
-      if (await this.alive(pid)) {
+    for (const pid of signalled) {
+      if ((await this.alive(pid)) && (await this.isDevOwner(repo, pid))) {
         onLine?.(`force-killing devspace dev (pid ${pid})`)
         await this.runner('kill', ['-KILL', String(pid)]).catch(() => undefined)
       }
     }
-    return { pids }
+    return { pids: signalled }
   }
 
   private async anyAlive(pids: number[]): Promise<boolean> {

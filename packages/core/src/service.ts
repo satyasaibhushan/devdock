@@ -7,6 +7,7 @@ import { AuthManager, type AuthState } from './auth.js'
 import { type AwsCredential, AwsCreds } from './awsCreds.js'
 import { CrashWatch } from './crashWatch.js'
 import { type RunResult, run, runStream, spawnStream } from './exec.js'
+import { type LifecycleAction, lifecyclePlan } from './lifecycle.js'
 import { decodeCursor, encodeCursor, readFileSlice } from './logQuery.js'
 import { LogHub, LogTailer, type SpawnFn, cleanLine } from './logTailer.js'
 import { PtyBroker } from './ptyBroker.js'
@@ -235,7 +236,20 @@ export class Service {
       reconcileMs: opts.reconcileMs ?? 5000,
     }
     const baseRunner = deps.runner ?? run
-    this.auth = deps.auth ?? new AuthManager({ runner: baseRunner })
+    // Injected runners are test doubles and generally do not model kubeconfig.
+    // Keep auth disabled unless the test supplies its own AuthManager.
+    this.auth =
+      deps.auth ??
+      new AuthManager(
+        deps.runner
+          ? {
+              runner: async (cmd, args, options) =>
+                cmd === 'kubectl' && args[0] === 'config'
+                  ? { code: 0, stdout: '{"users":[]}', stderr: '' }
+                  : baseRunner(cmd, args, options),
+            }
+          : {},
+      )
     // With an injected (test) runner, default to a disabled warmer — unit tests
     // must never read the machine's ~/.aws-cli-oidc config or mint credentials.
     this.awsCreds =
@@ -278,12 +292,19 @@ export class Service {
    *  the parent's own configs found inside each worktree. */
   rescan(): Repo[] {
     const found = scanRepos(this.opts.roots.length ? { roots: this.opts.roots } : {})
-    this.repos.clear()
-    for (const r of found) this.repos.set(r.id, r)
+    const next = new Map<string, Repo>()
+    for (const r of found) next.set(r.id, r)
     for (const rec of this.store.listReplicas()) {
       const repo = this.materializeReplica(rec)
-      if (repo) this.repos.set(repo.id, repo)
+      if (!repo) continue
+      const existing = next.get(repo.id)
+      if (existing && existing.path !== repo.path) {
+        throw new Error(`duplicate repo id "${repo.id}": ${existing.path} and ${repo.path}`)
+      }
+      next.set(repo.id, repo)
     }
+    this.repos.clear()
+    for (const [id, repo] of next) this.repos.set(id, repo)
     return this.listRepos()
   }
 
@@ -297,6 +318,11 @@ export class Service {
 
   get(id: string): RepoState | undefined {
     return this.states.get(id)
+  }
+
+  health(): { ok: boolean; state: { ok: boolean; error?: string } } {
+    const state = this.store.health()
+    return { ok: state.ok, state }
   }
 
   private repoOrThrow(id: string): Repo {
@@ -339,10 +365,42 @@ export class Service {
   // Every verb narrates into the repo's log hub — the same output you'd see
   // running the devspace command in a terminal streams to the Logs panel live.
 
-  /** Verb gate: start one shared Kubernetes auth attempt when needed, but do
-   *  not hold a lifecycle HTTP request open for a browser callback. The UI
-   *  clears its button state promptly; after sign-in, the user can retry the
-   *  verb. */
+  /** Execute one state-checked lifecycle action. Every transport uses this
+   *  interface so invalid actions cannot bypass the UI's buttons. */
+  async lifecycle(id: string, action: LifecycleAction, workload?: string): Promise<RunResult> {
+    const { type } = this.scoped(id, workload)
+    const state = this.states.get(id) ?? (await this.reconcileOne(id))
+    const selected = state.workloads.find((candidate) => candidate.type === (type ?? ''))
+    if (selected?.unreachable) {
+      return {
+        code: 2,
+        stdout: '',
+        stderr: 'cannot determine workload state while the cluster is unreachable',
+      }
+    }
+    const status = selected?.status ?? state.status
+    try {
+      lifecyclePlan(status, action)
+    } catch (error) {
+      return {
+        code: 2,
+        stdout: '',
+        stderr: error instanceof Error ? error.message : String(error),
+      }
+    }
+
+    if (action === 'build') return this.build(id, workload)
+    if (action === 'start') return this.start(id, workload)
+    if (action === 'destroy') return this.stop(id, workload)
+    if (action === 'restart') return this.restart(id, workload)
+
+    const built = await this.build(id, workload)
+    if (built.code !== 0) return built
+    return this.start(id, workload)
+  }
+
+  /** Lifecycle calls never trigger auth. A failed probe stays failed until an
+   *  explicit UI/MCP login, preventing retries from background activity. */
   private ensureAuth(key: string): RunResult | null {
     const hub = this.hubFor(key)
     const before = this.auth.snapshot()
@@ -351,17 +409,8 @@ export class Service {
       (before.tokenExpiresAt !== undefined && before.tokenExpiresAt > Date.now() + 60_000)
     if (quiet) return null
 
-    hub.push('! kubernetes login being verified — a Google sign-in may open in your browser')
-    void this.auth
-      .ensure(true)
-      .then((s) => {
-        if (s.phase === 'ok') hub.push('✓ kubernetes auth ok — retry the requested action')
-        else hub.push(`✗ ${s.message ?? 'kubernetes login required'}`)
-      })
-      .catch(() => hub.push('✗ kubernetes login check failed'))
-
-    const detail =
-      before.message ?? 'Kubernetes login is in progress — complete the sign-in, then retry'
+    const detail = before.message ?? 'Kubernetes login required'
+    hub.push(`✗ ${detail} — use the login button or devdock_auth_login`)
     return { code: 1, stdout: '', stderr: `kubernetes auth: ${detail}` }
   }
 
@@ -1217,6 +1266,8 @@ export class Service {
   }
 
   async reconcileAll(): Promise<RepoState[]> {
+    const authSync = this.auth.syncContext?.()
+    if (authSync) await authSync.catch(() => undefined)
     // Share one cluster snapshot + one session map across the pass — repos in
     // the same namespace reuse a single kubectl query instead of one each.
     const cache = newClusterCache()
@@ -1716,8 +1767,8 @@ export class Service {
     return this.auth.snapshot()
   }
 
-  /** Kick off an interactive login (the UI button) without holding the HTTP
-   *  request open for the whole browser flow — poll /auth for the outcome. */
+  /** Kick off one explicit login without holding the HTTP request open. The
+   *  sign-in URL appears in later /auth polls; no browser is launched. */
   authLogin(): AuthState {
     void this.auth.login().catch(() => undefined)
     return this.auth.snapshot()
@@ -1743,7 +1794,7 @@ export class Service {
     this.rescan()
     await this.reconcileAll()
     this.timer = setInterval(() => {
-      void this.reconcileAll()
+      void this.reconcileAll().catch(() => undefined)
       this.terms.sweep() // reap idle/dead agent terminals alongside each pass
     }, this.opts.reconcileMs)
     this.authTimer = setInterval(() => {

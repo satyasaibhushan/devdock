@@ -227,8 +227,10 @@ describe('Supervisor', () => {
       port?: number
       listeners?: Record<number, number>
       alive?: Set<number>
+      commands?: Record<number, string>
+      cwds?: Record<number, string>
     }) {
-      const { port, listeners = {}, alive = new Set<number>() } = opts
+      const { port, listeners = {}, alive = new Set<number>(), commands = {}, cwds = {} } = opts
       return vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
         if (cmd === 'kubectl') {
           const data: Record<string, string> = {}
@@ -236,11 +238,19 @@ describe('Supervisor', () => {
           return ok(JSON.stringify({ data }))
         }
         if (cmd === 'lsof') {
+          if (args.includes('-d')) {
+            const pid = Number(args[args.indexOf('-p') + 1])
+            return ok(`p${pid}\nfcwd\nn${cwds[pid] ?? repo.path}\n`)
+          }
           // Lock path: `-iTCP:<port> -sTCP:LISTEN` → the listening pid (if any).
           const tcp = args.find((a) => a.startsWith('-iTCP:'))
           const p = tcp ? Number(tcp.slice('-iTCP:'.length)) : Number.NaN
           const pid = listeners[p]
           return pid ? ok(`p${pid}\n`) : { code: 1, stdout: '', stderr: '' }
+        }
+        if (cmd === 'ps') {
+          const pid = Number(args[args.indexOf('-p') + 1])
+          return ok(commands[pid] ?? '/usr/local/bin/devspace dev -n panels')
         }
         if (cmd === 'kill') {
           const pid = Number(args[1])
@@ -254,6 +264,17 @@ describe('Supervisor', () => {
     it('resolves the lock owner port to its listening PID', async () => {
       const runner = lockRunner({ port: 8091, listeners: { 8091: 111 } })
       expect(await new Supervisor(runner).externalDevPids(repo)).toEqual([111])
+    })
+
+    it('rejects an unrelated process that reused a stale lock port', async () => {
+      const runner = lockRunner({
+        port: 8091,
+        listeners: { 8091: 111 },
+        commands: { 111: 'node unrelated-server.js' },
+      })
+      expect(await new Supervisor(runner).externalDevPids(repo)).toEqual([])
+      expect((await new Supervisor(runner).stopExternalDev(repo)).pids).toEqual([])
+      expect(runner).not.toHaveBeenCalledWith('kill', ['-TERM', '111'])
     })
 
     it('treats a lock with no listener as stale (no pid to take over)', async () => {

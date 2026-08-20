@@ -47,9 +47,13 @@ const VERBS: Array<{ verb: RepoVerb; description: string }> = [
   { verb: 'start', description: 'Start dev mode for a workload (devspace dev in a tmux session).' },
   {
     verb: 'build',
-    description: 'Build & deploy a workload without entering dev mode (devspace deploy).',
+    description: 'Deploy a stopped workload without entering dev mode.',
   },
-  { verb: 'stop', description: 'Tear down a workload (devspace purge + kill its tmux session).' },
+  {
+    verb: 'build-start',
+    description: 'Deploy a stopped workload, then start its dev session.',
+  },
+  { verb: 'destroy', description: 'Purge a deployed workload and stop its dev session.' },
   {
     verb: 'restart',
     description: 'Recycle a workload from any state: stop, then build, then start.',
@@ -230,7 +234,7 @@ export function allTools(client: DaemonClient): ToolDef[] {
     },
     ...VERBS.map(
       ({ verb, description }): ToolDef => ({
-        name: `devdock_${verb}`,
+        name: `devdock_${verb.replace('-', '_')}`,
         description,
         scope: 'rw',
         inputSchema: { ...repoArg, ...workloadArg },
@@ -358,10 +362,18 @@ export function allTools(client: DaemonClient): ToolDef[] {
     {
       name: 'devdock_auth_login',
       description:
-        'Kick off the interactive kubernetes OIDC login (opens a browser on the host). Returns immediately; poll devdock_auth_status for the outcome.',
+        'Explicitly start one kubernetes OIDC login without opening a browser. Poll devdock_auth_status for the sign-in URL and outcome.',
       scope: 'rw',
       inputSchema: {},
       handler: async () => JSON.stringify(await client.authLogin()),
+    },
+    {
+      name: 'devdock_auth_clear',
+      description:
+        'Clear the kubernetes OIDC token cache and failed-login state. A new login starts only after devdock_auth_login is called.',
+      scope: 'rw',
+      inputSchema: {},
+      handler: async () => JSON.stringify(await client.authClear()),
     },
     {
       name: 'devdock_term_open',

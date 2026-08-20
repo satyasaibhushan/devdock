@@ -5,6 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readlinkSync,
   rmSync,
   writeFileSync,
 } from 'node:fs'
@@ -50,10 +51,12 @@ if [[ " $* " == *" @devdock/web "* ]]; then
 fi
 if [[ " $* " == *" deploy "* ]]; then
   target="${'${@: -1}'}"
-  mkdir -p "$target/dist" "$target/node_modules/@devdock/core/dist"
+  mkdir -p "$target/dist" "$target/node_modules/@devdock/core/dist" "$target/node_modules/@modelcontextprotocol/sdk"
   printf 'export {}\\n' > "$target/dist/index.js"
   printf 'export {}\\n' > "$target/dist/routes.js"
+  printf 'export {}\\n' > "$target/dist/server.js"
   printf 'export {}\\n' > "$target/node_modules/@devdock/core/dist/index.js"
+  printf '{}\\n' > "$target/node_modules/@modelcontextprotocol/sdk/package.json"
 fi
 `,
     )
@@ -112,14 +115,26 @@ esac
     expect(daemonPath).toBeDefined()
     expect(daemonPath).toContain(installRoot)
     expect(existsSync(daemonPath as string)).toBe(true)
+    const mcpLink = join(home, '.local', 'bin', 'devdock-mcp')
+    const mcpLauncher = readlinkSync(mcpLink)
+    expect(mcpLauncher).toContain('/releases/')
+    expect(existsSync(mcpLink)).toBe(true)
+    const release = dirname(dirname(mcpLauncher))
+    expect(existsSync(join(release, 'packages', 'mcp', 'dist', 'index.js'))).toBe(true)
+    expect(
+      existsSync(join(release, 'packages', 'mcp', 'node_modules', '@modelcontextprotocol', 'sdk')),
+    ).toBe(true)
 
     rmSync(join(repo, 'node_modules'), { recursive: true, force: true })
     rmSync(join(repo, 'packages', 'core', 'dist'), { recursive: true, force: true })
     rmSync(join(repo, 'packages', 'daemon', 'dist'), { recursive: true, force: true })
+    rmSync(join(repo, 'packages', 'mcp', 'dist'), { recursive: true, force: true })
     expect(existsSync(daemonPath as string)).toBe(true)
+    expect(existsSync(mcpLink)).toBe(true)
 
     const calls = readFileSync(log, 'utf8')
     expect(calls).toContain('pnpm --filter @devdock/daemon deploy --prod --legacy')
+    expect(calls).toContain('pnpm --filter @devdock/mcp deploy --prod --legacy')
     expect(calls).toContain('launchctl bootstrap')
   })
 })

@@ -2,17 +2,33 @@
 import { existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import type { Service } from '@devdock/core'
+import type { LifecycleAction, Service } from '@devdock/core'
 import fastifyStatic from '@fastify/static'
 import Fastify, { type FastifyInstance } from 'fastify'
+import type { AccessGate } from './accessGate.js'
 
 /** The built web UI (`packages/web/dist`), relative to this module at
  *  `packages/daemon/dist/routes.js`. Bundled into the daemon so port 7717
  *  serves the UI too — there's no separate dev server to keep alive. */
 const WEB_DIST = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'web', 'dist')
 
-export function buildApp(service: Service): FastifyInstance {
+export function buildApp(service: Service, gate?: AccessGate): FastifyInstance {
   const app = Fastify({ logger: false })
+
+  if (gate) {
+    app.addHook('onRequest', async (req, reply) => {
+      if (
+        !gate.authorize({
+          authorization: req.headers.authorization,
+          host: req.headers.host,
+          origin: req.headers.origin,
+          remoteAddress: req.ip,
+        })
+      ) {
+        return reply.code(403).send({ error: 'forbidden' })
+      }
+    })
+  }
 
   // Serve the web UI off the same origin as the API, so its relative fetches and
   // ws:// connections (api.ts uses location.host) just work with no proxy. The
@@ -23,7 +39,10 @@ export function buildApp(service: Service): FastifyInstance {
     app.register(fastifyStatic, { root: WEB_DIST })
   }
 
-  app.get('/health', async () => ({ ok: true }))
+  app.get('/health', async (_req, reply) => {
+    const health = service.health()
+    return health.ok ? health : reply.code(503).send(health)
+  })
 
   // The global namespace selector: reads/moves the kube context's namespace
   // (what the user's `kn` alias does), so the UI and terminal always agree.
@@ -346,18 +365,55 @@ export function buildApp(service: Service): FastifyInstance {
     },
   )
 
-  const verbs = ['start', 'build', 'stop', 'restart', 'adopt', 'clear'] as const
-  for (const verb of verbs) {
+  const lifecycleRoutes: Array<{ route: string; action: LifecycleAction }> = [
+    { route: 'start', action: 'start' },
+    { route: 'build', action: 'build' },
+    { route: 'build-start', action: 'build_start' },
+    { route: 'restart', action: 'restart' },
+    { route: 'destroy', action: 'destroy' },
+  ]
+  for (const { route, action } of lifecycleRoutes) {
+    app.post<{ Params: { id: string }; Querystring: { workload?: string } }>(
+      `/repos/:id/${route}`,
+      async (req, reply) => {
+        try {
+          const result = await service.lifecycle(req.params.id, action, req.query.workload)
+          const body = { ok: result.code === 0, code: result.code, stderr: result.stderr }
+          return result.code === 0 ? body : reply.code(409).send(body)
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err)
+          const code = message.includes('unknown repo')
+            ? 404
+            : message.includes('not valid') || message.includes('unknown workload')
+              ? 409
+              : 500
+          return reply.code(code).send({ error: message })
+        }
+      },
+    )
+  }
+
+  // Recovery and ownership transfer are not lifecycle states. Keep them as
+  // explicit expert operations instead of advertising them as normal actions.
+  for (const verb of ['adopt', 'clear'] as const) {
     app.post<{ Params: { id: string }; Querystring: { workload?: string } }>(
       `/repos/:id/${verb}`,
       async (req, reply) => {
         try {
           const result = await service[verb](req.params.id, req.query.workload)
-          return { ok: result.code === 0, code: result.code, stderr: result.stderr }
+          const body = { ok: result.code === 0, code: result.code, stderr: result.stderr }
+          return result.code === 0 ? body : reply.code(409).send(body)
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err)
-          const code = message.includes('unknown repo') ? 404 : 500
-          return reply.code(code).send({ error: message })
+          return reply
+            .code(
+              message.includes('unknown repo')
+                ? 404
+                : message.includes('unknown workload')
+                  ? 409
+                  : 500,
+            )
+            .send({ error: message })
         }
       },
     )

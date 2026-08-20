@@ -188,4 +188,14 @@ describe('scanRepos', () => {
     expect(repos.find((r) => r.id === 'jobs-ui')?.codeArea).toBe('frontend')
     expect(repos.find((r) => r.id === 'jobs-api')?.codeArea).toBe('backend')
   })
+
+  it('fails instead of overwriting two repos with the same id', () => {
+    for (const area of ['backend', 'frontend']) {
+      mkdirSync(join(root, area, 'shared-name'), { recursive: true })
+      writeFileSync(join(root, area, 'shared-name', 'devspace.yaml'), 'name: shared-name\n')
+    }
+    expect(() => scanRepos({ roots: [join(root, 'backend'), join(root, 'frontend')] })).toThrow(
+      /duplicate repo id "shared-name"/,
+    )
+  })
 })

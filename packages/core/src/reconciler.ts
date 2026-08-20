@@ -2,6 +2,7 @@
 // Queries kubectl for pod + deployment reality, checks the tmux session,
 // derives status.
 import { type RunResult, run } from './exec.js'
+import { lifecycleActions } from './lifecycle.js'
 import type {
   DeploymentInfo,
   PodInfo,
@@ -194,7 +195,9 @@ export class Reconciler {
       pods,
       deployments,
       hasSession,
+      actions: [],
     }
+    ws.actions = lifecycleActions(ws.status)
     // A failed query means the cluster view is unknown, not empty — flag it so
     // the service can hold the last known status and skip retire decisions.
     if (rawPods === null || rawDeployments === null) ws.unreachable = true

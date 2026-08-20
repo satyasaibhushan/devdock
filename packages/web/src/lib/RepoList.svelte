@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { type RepoState, type RepoStatus, type Verb, STATUS_VERBS } from './api'
+  import { type RepoState, type RepoStatus, type Verb } from './api'
 
   let {
     repos,
@@ -23,13 +23,12 @@
     onreplicadelete: (id: string) => void
   } = $props()
 
-  // `stop` is surfaced as "kill" — the rest read as-is.
   const VERB_LABEL: Record<Verb, string> = {
     start: 'start',
     build: 'build',
-    stop: 'kill',
+    build_start: 'build + start',
     restart: 'restart',
-    clear: 'clear pod',
+    destroy: 'destroy',
   }
 
   let query = $state('')
@@ -102,7 +101,7 @@
     <svg viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true">
       <path d="M7 4.5v15l12-7.5z" />
     </svg>
-  {:else if v === 'stop'}
+  {:else if v === 'destroy'}
     <svg viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true">
       <rect x="5" y="5" width="14" height="14" rx="2.5" />
     </svg>
@@ -119,7 +118,7 @@
       <path d="M21 12a9 9 0 1 1-6.2-8.5" />
       <path d="M21 3v6h-6" />
     </svg>
-  {:else if v === 'build'}
+  {:else if v === 'build' || v === 'build_start'}
     <svg
       viewBox="0 0 24 24"
       fill="none"
@@ -134,22 +133,6 @@
       <path
         d="m21.5 11.5-1.9-1.9a2 2 0 0 1-.6-1.4V7l-2.3-2.3a6 6 0 0 0-4.2-1.7l-3.5.7.9.8a6.2 6.2 0 0 1 2.1 4.6V10l2 2h1.2a2 2 0 0 1 1.4.6l1.9 1.9"
       />
-    </svg>
-  {:else if v === 'clear'}
-    <svg
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      stroke-width="2"
-      stroke-linecap="round"
-      stroke-linejoin="round"
-      aria-hidden="true"
-    >
-      <path d="M3 6h18" />
-      <path d="M8 6V4h8v2" />
-      <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" />
-      <path d="M10 11v6" />
-      <path d="M14 11v6" />
     </svg>
   {/if}
 {/snippet}
@@ -208,7 +191,7 @@
             {/if}
           </button>
           <div class="actions">
-            {#each STATUS_VERBS[r.status] as v (v)}
+            {#each r.actions as v (v)}
               <button
                 class="act {v}"
                 title="{VERB_LABEL[v]} {r.repo.id}"

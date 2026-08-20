@@ -2,6 +2,12 @@
 // Everything else (daemon HTTP/WS, MCP) is a thin caller of these.
 
 export * from './types.js'
+export {
+  lifecycleActions,
+  lifecyclePlan,
+  type LifecycleAction,
+  type LifecycleStep,
+} from './lifecycle.js'
 export * from './exec.js'
 export { StateStore, type Grant, type ReplicaRecord } from './stateStore.js'
 export {
@@ -100,6 +106,7 @@ export {
   jwtExpiryMs,
   type AuthState,
   type AuthPhase,
+  type AuthLoginRunner,
   type AuthRunner,
   type AuthManagerOptions,
 } from './auth.js'

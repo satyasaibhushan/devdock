@@ -1,4 +1,5 @@
 // Shared domain types for @devdock/core.
+import type { LifecycleAction } from './lifecycle.js'
 
 /** Reconciled lifecycle state of a repo's workload (see spec §6).
  *  STOPPED = nothing in the cluster; DEPLOYED = deployment objects exist in
@@ -84,6 +85,8 @@ export interface WorkloadState {
   pods: PodInfo[]
   deployments: DeploymentInfo[]
   hasSession: boolean
+  /** Lifecycle actions valid for this exact reconciled state. */
+  actions: LifecycleAction[]
   /** True when the kubectl queries behind this view failed (cluster
    *  unreachable, expired credentials, kube context switched away). pods and
    *  deployments are then unknown — not gone — and must not drive destructive
@@ -123,6 +126,8 @@ export interface RepoState {
   deployments: DeploymentInfo[]
   /** Whether any workload has a live dev session. */
   hasSession: boolean
+  /** Lifecycle actions valid for the default workload. */
+  actions: LifecycleAction[]
   /** epoch ms of last reconcile. */
   updatedAt: number
   /** Command for the repo's default pod type. Kept for older clients. */

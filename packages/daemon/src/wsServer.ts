@@ -2,12 +2,26 @@
 import type { Server } from 'node:http'
 import type { CrashEvent, RepoState, Service, TermMode } from '@devdock/core'
 import { WebSocket, WebSocketServer } from 'ws'
+import type { AccessGate } from './accessGate.js'
 
 /** Attach devdock's websocket endpoints to an existing HTTP server. */
-export function attachWs(server: Server, service: Service): WebSocketServer {
+export function attachWs(server: Server, service: Service, gate?: AccessGate): WebSocketServer {
   const wss = new WebSocketServer({ noServer: true })
 
   server.on('upgrade', (req, socket, head) => {
+    if (
+      gate &&
+      !gate.authorize({
+        authorization: req.headers.authorization,
+        host: req.headers.host,
+        origin: req.headers.origin,
+        remoteAddress: req.socket.remoteAddress,
+      })
+    ) {
+      socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n')
+      socket.destroy()
+      return
+    }
     const url = new URL(req.url ?? '/', 'http://localhost')
     const route = matchRoute(url.pathname)
     if (!route) {

@@ -1,6 +1,6 @@
 <script lang="ts">
   // Kubernetes auth indicator (header) — visible only when something needs the
-  // user: login required (one shared browser sign-in for all workloads),
+  // user: login required (one explicit shared sign-in for all workloads),
   // sign-in in progress, or an auth error. Silent when ok or when the cluster
   // doesn't use oidc-login at all.
   import { type AuthState, clearAuthCache, startAuthLogin } from './api.js'
@@ -49,7 +49,10 @@
   >
     {#if auth.phase === 'logging_in'}
       <span class="spin" aria-hidden="true"></span>
-      <span class="msg">{auth.message ?? 'complete the Google sign-in in your browser…'}</span>
+      <span class="msg">{auth.message ?? 'preparing sign-in…'}</span>
+      {#if auth.loginUrl}
+        <a class="act" href={auth.loginUrl} target="_blank" rel="noreferrer">open sign-in</a>
+      {/if}
     {:else}
       <span class="dot" aria-hidden="true"></span>
       <span class="msg">

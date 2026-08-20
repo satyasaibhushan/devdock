@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { type RunResult, Service } from '@devdock/core'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { AccessGate } from './accessGate.js'
 import { buildApp } from './routes.js'
 
 let root: string
@@ -37,7 +38,24 @@ describe('daemon routes', () => {
     const { svc } = makeService()
     const app = buildApp(svc)
     const res = await app.inject({ method: 'GET', url: '/health' })
-    expect(res.json()).toEqual({ ok: true })
+    expect(res.json()).toEqual({ ok: true, state: { ok: true } })
+  })
+
+  it('applies ingress authority before routes run', async () => {
+    const { svc } = makeService()
+    const app = buildApp(svc, new AccessGate('secret'))
+    const blocked = await app.inject({
+      method: 'GET',
+      url: '/repos',
+      headers: { host: '127.0.0.1:7717', origin: 'https://evil.example' },
+    })
+    expect(blocked.statusCode).toBe(403)
+    const authorized = await app.inject({
+      method: 'GET',
+      url: '/repos',
+      headers: { authorization: 'Bearer secret' },
+    })
+    expect(authorized.statusCode).toBe(200)
   })
 
   it('GET /repos/:id 404 for unknown', async () => {
@@ -56,11 +74,17 @@ describe('daemon routes', () => {
     expect(one.json().status).toBe('STOPPED')
   })
 
-  it('POST /repos/:id/start invokes the supervisor', async () => {
+  it('rejects Start from STOPPED and offers Build + Start instead', async () => {
     const { svc, start } = makeService()
     await svc.reconcileAll()
     const app = buildApp(svc)
-    const res = await app.inject({ method: 'POST', url: '/repos/svc-a/start' })
+    const invalid = await app.inject({ method: 'POST', url: '/repos/svc-a/start' })
+    expect(invalid.statusCode).toBe(409)
+    expect(invalid.json().stderr).toContain('not available')
+    expect(start).not.toHaveBeenCalled()
+
+    const res = await app.inject({ method: 'POST', url: '/repos/svc-a/build-start' })
+    expect(res.statusCode).toBe(200)
     expect(res.json()).toMatchObject({ ok: true })
     expect(start).toHaveBeenCalled()
   })
