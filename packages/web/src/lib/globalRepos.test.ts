@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { InstanceView, RepoState } from './api'
-import { globalRepos, retainOwners } from './globalRepos'
+import { globalRepos, ownerInstanceIds, retainOwners } from './globalRepos'
 
 function state(owner?: string, namespace = 'sai'): RepoState {
   return {
@@ -36,6 +36,28 @@ function machine(id: string, repo = state('box'), online = true): InstanceView {
 }
 
 describe('global repo directory', () => {
+  it('does not display an action target as ownership for an unclaimed deployed repo', () => {
+    const instances = [machine('mac', state()), machine('box', state())]
+    for (const preferred of ['mac', 'box']) {
+      const row = globalRepos(instances, preferred)[0]
+      if (!row) throw new Error('Missing fixture repo')
+      expect(row.workloads[0]?.instanceId).toBe(preferred)
+      expect(ownerInstanceIds(row)).toEqual([])
+    }
+  })
+  it('keeps only the claimed API badge when stopped workloads target another machine', () => {
+    const repo = state('box')
+    const worker = repo.workloads[1]
+    if (!worker) throw new Error('Missing fixture workload')
+    worker.ownerInstanceId = undefined
+    worker.status = 'STOPPED'
+    const instances = [machine('mac', repo), machine('box', repo)]
+    for (const preferred of ['mac', 'box']) {
+      const row = globalRepos(instances, preferred)[0]
+      if (!row) throw new Error('Missing fixture repo')
+      expect(ownerInstanceIds(row)).toEqual(['box'])
+    }
+  })
   it('deduplicates and routes to the owner independently of the preferred machine', () => {
     const instances = [machine('mac'), machine('box')]
     expect(globalRepos(instances, 'mac')).toHaveLength(1)

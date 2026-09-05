@@ -111,3 +111,7 @@ export function workloadTarget(
     repo?.workloads[0]
   )
 }
+
+export function ownerInstanceIds(repo: RepoState): string[] {
+  return [...new Set(repo.workloads.flatMap((w) => (w.ownerInstanceId ? [w.ownerInstanceId] : [])))]
+}

@@ -330,7 +330,11 @@
         <div class="title">
           <span class="dot {vstatus}"></span>
           <h2>{selected.repo.id}</h2>
-          <span class="pill" title="Actions, logs and terminals use this instance">{instanceSymbol(owner)} {owner?.name ?? 'Owner not connected'}</span>
+          {#if view?.ownerInstanceId}
+            <span class="pill" title="Deployment owner">{instanceSymbol(owner)} {owner?.name ?? 'Owner not connected'}</span>
+          {:else}
+            <span class="pill" title="No confirmed deployment owner. This is the action target only.">target: {owner?.name ?? 'Unavailable'}</span>
+          {/if}
           {#if family.length > 1}
             <select
               class="wlselect"

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { type RepoState, type RepoStatus, type Verb, type InstanceView } from './api'
-  import { instanceSymbol } from './globalRepos'
+  import { instanceSymbol, ownerInstanceIds } from './globalRepos'
 
   let {
     instances,
@@ -181,7 +181,7 @@
             <span class="id" title={r.repo.id}>
               {#if r.repo.parentId}<span class="rep">↳</span>{/if}
               {r.repo.id}
-              {#each [...new Set(r.workloads.map((w) => w.instanceId).filter(Boolean))] as id (id)}
+              {#each ownerInstanceIds(r) as id (id)}
                 {@const machine = instances.find((i) => i.id === id)}
                 <span class="owner" class:offline={!machine?.online} title="{machine?.name ?? 'Owner not connected'}{machine?.online ? '' : ' · offline'}">{instanceSymbol(machine)}</span>
               {/each}
