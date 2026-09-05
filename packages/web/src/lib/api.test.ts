@@ -3,6 +3,20 @@ import { attachTerminal, createTerminal, openLogs, runVerb } from './api'
 
 afterEach(() => vi.unstubAllGlobals())
 describe('explicit instance routing', () => {
+  it('opens normal terminals on the chosen machine without dropping repo scope', async () => {
+    const fetch = vi.fn(async (_path: string, _init?: RequestInit) => ({
+      ok: true,
+      json: async () => ({ id: 'accounts:t2' }),
+    }))
+    vi.stubGlobal('fetch', fetch)
+    await createTerminal({ repo: 'accounts', workload: 'api', kind: 'local' }, 'box')
+    expect(fetch.mock.calls[0]?.[0]).toBe('/instances/box/api/terminals')
+    expect(JSON.parse(String(fetch.mock.calls[0]?.[1]?.body))).toEqual({
+      repo: 'accounts',
+      workload: 'api',
+      kind: 'local',
+    })
+  })
   it('keeps actions and terminal creation on their captured instance', async () => {
     const fetch = vi.fn(async (_path: string, _init?: RequestInit) => ({
       ok: true,

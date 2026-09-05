@@ -59,6 +59,23 @@ function fakeStreamSpawner() {
 }
 
 describe('Service', () => {
+  it('opens normal repo terminals on the host and retains their panel scope', async () => {
+    const spawn = vi.fn(() => ({ onData() {}, onExit() {}, write() {}, resize() {}, kill() {} }))
+    const broker = new PtyBroker(spawn)
+    const svc = new Service(
+      { roots: [root], stateFile },
+      { broker, runner: cannedRunner('{"items":[]}', false) },
+    )
+    svc.rescan()
+    const terminal = await svc.openRegisteredTerminal({ repo: 'svc-a', kind: 'local' })
+    expect(terminal).toMatchObject({ repo: 'svc-a', kind: 'local', attach: 'host' })
+    expect(spawn).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.any(Array),
+      expect.objectContaining({ cwd: join(root, 'svc-a') }),
+    )
+    expect(svc.listTerminals()).toContainEqual(terminal)
+  })
   it('stops a pending dev session without deleting the deployment or reconnecting', async () => {
     const pods = JSON.stringify({
       items: [{ metadata: { name: 'svc-a-devspace-1' }, status: { phase: 'Pending' } }],

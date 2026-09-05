@@ -27,6 +27,28 @@
   let activeTid = $state<string | null>(null)
   let full = $state(false)
   let createError = $state<string | null>(null)
+  let adding = $state(false)
+  let addButton: HTMLButtonElement
+  let menu: HTMLDivElement
+  let menuX = $state(0)
+  let menuY = $state(0)
+  function openMenu(event: MouseEvent | KeyboardEvent) {
+    event.preventDefault()
+    const rect = addButton.getBoundingClientRect()
+    menuX = Math.max(8, Math.min(rect.left, window.innerWidth - 260))
+    menuY = Math.max(8, Math.min(rect.bottom + 6, window.innerHeight - 100))
+    menu.showPopover()
+    menu.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus()
+  }
+  function menuKey(event: KeyboardEvent) {
+    if (event.key === 'Escape') { menu.hidePopover(); addButton.focus(); return }
+    if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return
+    event.preventDefault()
+    const buttons = [...menu.querySelectorAll<HTMLButtonElement>('button:not(:disabled)')]
+    const current = buttons.findIndex((button) => button === document.activeElement)
+    const next = event.key === 'Home' ? 0 : event.key === 'End' ? buttons.length - 1 : (current + (event.key === 'ArrowUp' ? -1 : 1) + buttons.length) % buttons.length
+    buttons[next]?.focus()
+  }
   // Per-viewer ro/rw, by terminal id. THIS browser's choice only — another
   // window (or an agent) can be writing to the same terminal regardless.
   let viewer = $state<Record<string, 'ro' | 'rw'>>({})
@@ -83,16 +105,18 @@
   // touch) and read-write for shells you explicitly opened to type into.
   const modeOf = (t: TermInfo): 'ro' | 'rw' => viewer[t.id] ?? (t.kind === 'auto' ? 'ro' : 'rw')
 
-  async function add() {
-    if (!canAdd) return
+  async function add(normal = false) {
+    if (adding || (!normal && !canAdd)) return
+    menu?.hidePopover()
+    adding = true
     createError = null
     try {
-      const t = await createTerminal(repo ? { repo, workload, kind: 'shell' } : { kind: 'local' }, instance)
+      const t = await createTerminal({ repo, workload, kind: normal || !repo ? 'local' : 'shell' }, instance)
       await refresh()
       activeTid = t.id
     } catch (e) {
       createError = e instanceof Error ? e.message : String(e)
-    }
+    } finally { adding = false }
   }
 
   // Close for everyone — the daemon kills the PTY, agents lose it too.
@@ -111,7 +135,7 @@
 
   function label(t: TermInfo): string {
     if (t.kind === 'auto') return t.attach === 'tmux' ? 'devspace dev' : 'pod shell'
-    return t.kind === 'shell' ? 'enter' : 'shell'
+    return t.kind === 'shell' ? 'devspace shell' : 'normal shell'
   }
 
   // Badge shows just the per-scope number — the panel already names the scope.
@@ -143,10 +167,15 @@
         </div>
       {/each}
       <button
+        bind:this={addButton}
         class="add"
-        title={repo ? 'new devspace enter shell into this pod' : 'new shell on this machine'}
-        disabled={!canAdd}
-        onclick={add}>+</button
+        title={repo ? 'Open DevSpace terminal. Right-click for a normal terminal on this machine.' : 'Open normal terminal on this machine'}
+        aria-label="New terminal"
+        aria-haspopup="menu"
+        aria-disabled={!canAdd || adding}
+        oncontextmenu={openMenu}
+        onkeydown={(event) => { if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) openMenu(event) }}
+        onclick={() => add()}>+</button
       >
     </div>
 
@@ -172,7 +201,7 @@
           <p>No terminal open.</p>
         {/if}
         {#if canAdd}
-          <button onclick={add}>+ open a shell</button>
+          <button onclick={() => add()}>+ open a shell</button>
         {:else}
           <p class="hint">Nothing running — start the workload first.</p>
         {/if}
@@ -187,7 +216,17 @@
   </div>
 </div>
 
+<div bind:this={menu} popover="auto" class="terminal-menu" role="menu" tabindex="-1" aria-label="New terminal" style:left="{menuX}px" style:top="{menuY}px" onkeydown={menuKey}>
+  <button role="menuitem" disabled={!repo || !canAdd || adding} onclick={() => add()}>Open DevSpace terminal</button>
+  <button role="menuitem" disabled={adding} onclick={() => add(true)}>Open normal terminal</button>
+</div>
+{#if createError && terms.length > 0}<p class="err" role="alert">{createError}</p>{/if}
+
 <style>
+  .terminal-menu { position: fixed; margin: 0; padding: 5px; width: 250px; border: 1px solid var(--line); border-radius: 7px; background: var(--bg, #0b0f14); color: var(--ink); box-shadow: 0 10px 30px #0007; }
+  .terminal-menu button { display: block; width: 100%; padding: 9px 10px; text-align: left; font: inherit; font-size: 12px; color: inherit; background: transparent; border: 0; border-radius: 4px; cursor: pointer; }
+  .terminal-menu button:hover:not(:disabled), .terminal-menu button:focus-visible { background: var(--accent-dim, #182a29); outline: 1px solid var(--accent); }
+  .terminal-menu button:disabled { opacity: .4; cursor: default; }
   .panel {
     display: flex;
     flex-direction: column;

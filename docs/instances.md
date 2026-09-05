@@ -31,6 +31,11 @@ waiting for a pod in BUILDING. It stops that instance's tmux dev session and
 automatic reconnection, keeping the deployment, pods and ownership claim.
 It does not run purge, reset pods, deploy or rebuild. `Destroy` remains separate.
 
+In a repo's terminal panel, click `+` for a DevSpace shell. Right-click `+`
+for `Open DevSpace terminal` or `Open normal terminal`. The normal shell runs
+in that repo's checkout on the same instance, not necessarily on the browser's
+machine. Both appear as tabs. The menu also opens with Shift+F10.
+
 ## Authentication and authority
 
 SSH uses the user's existing configuration with batch mode and host-key checking.

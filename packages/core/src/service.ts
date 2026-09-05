@@ -1792,8 +1792,12 @@ export class Service {
   }): Promise<TermInfo> {
     const kind = opts.kind ?? (opts.repo ? 'auto' : 'local')
     if (kind === 'local') {
-      const session = await this.broker.openLocal('rw', 200, 50, opts.cwd)
-      return this.terms.add({ kind, attach: 'host' }, session)
+      const scope = opts.repo ? this.scoped(opts.repo, opts.workload) : undefined
+      const session = await this.broker.openLocal('rw', 200, 50, opts.cwd ?? scope?.repo.path)
+      return this.terms.add(
+        { kind, attach: 'host', repo: opts.repo, workload: scope?.type },
+        session,
+      )
     }
     const repoId = opts.repo
     if (!repoId) throw new Error(`repo required for a ${kind} terminal`)
