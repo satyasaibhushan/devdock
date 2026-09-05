@@ -25,6 +25,11 @@ describe('deriveStatus (spec §6 table)', () => {
     expect(deriveStatus([pending], true)).toBe('BUILDING')
     expect(deriveStatus([pending], false)).toBe('BUILDING')
   })
+  it('pending deployment without a dev session remains startable and purgeable', () => {
+    expect(deriveStatus([pending], false, true)).toBe('DEPLOYED')
+    expect(deriveStatus([{ ...pending, name: 'svc-devspace-abc' }], false, true)).toBe('DEPLOYED')
+    expect(deriveStatus([pending], true, true)).toBe('BUILDING')
+  })
   it('restartCount>0 → CRASHED (takes precedence)', () => {
     expect(deriveStatus([crashy], true)).toBe('CRASHED')
   })

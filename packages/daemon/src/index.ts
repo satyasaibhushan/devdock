@@ -1,13 +1,21 @@
 // @devdock/daemon — the only brain. Composes the core Service with HTTP + WS.
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { Service, checkTools, missingToolWarnings, pathShadowWarnings } from '@devdock/core'
+import {
+  AwsCreds,
+  Service,
+  checkTools,
+  missingToolWarnings,
+  pathShadowWarnings,
+} from '@devdock/core'
 import { AccessGate } from './accessGate.js'
+import { listen } from './listener.js'
 import { buildApp } from './routes.js'
 import { attachWs } from './wsServer.js'
 
 const PORT = Number(process.env.DEVDOCK_PORT ?? 7717)
 const HOST = process.env.DEVDOCK_HOST ?? '127.0.0.1'
+const SOCKET = process.env.DEVDOCK_SOCKET || undefined
 
 async function main() {
   for (const w of missingToolWarnings(await checkTools())) {
@@ -21,23 +29,28 @@ async function main() {
     .catch(() => undefined)
 
   const roots = (process.env.DEVDOCK_ROOTS ?? join(homedir(), 'Code')).split(':').filter(Boolean)
-  const service = new Service({
-    roots,
-    stateFile: join(homedir(), '.devdock', 'state.json'),
-  })
+  const service = new Service(
+    { roots, stateFile: join(homedir(), '.devdock', 'state.json') },
+    process.env.DEVDOCK_AWS_AUTH === 'external'
+      ? { awsCreds: new AwsCreds({ oidcConfigPath: null }) }
+      : {},
+  )
 
   const gate = AccessGate.load(
     process.env.DEVDOCK_CONTROL_TOKEN_FILE ?? join(homedir(), '.devdock', 'control-token'),
+    Boolean(SOCKET),
   )
   const app = buildApp(service, gate)
-  await app.listen({ port: PORT, host: HOST })
-  attachWs(app.server, service, gate)
+  const address = await listen(app, { port: PORT, host: HOST, socket: SOCKET })
+  const streams = attachWs(app.server, service, gate)
 
   await service.startLoop()
-  console.log(`devdock daemon listening on http://${HOST}:${PORT} — roots: ${roots.join(', ')}`)
+  console.log(`devdock daemon listening on ${address}, roots: ${roots.join(', ')}`)
 
   const shutdown = () => {
     service.stopLoop()
+    for (const client of streams.clients) client.terminate()
+    streams.close()
     void app.close().then(() => process.exit(0))
   }
   process.on('SIGINT', shutdown)

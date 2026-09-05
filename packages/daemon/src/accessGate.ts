@@ -13,9 +13,12 @@ export interface IngressRequest {
  * traffic and loopback clients are trusted; remote clients need the daemon
  * control token. */
 export class AccessGate {
-  constructor(private readonly token: string) {}
+  constructor(
+    private readonly token: string,
+    private readonly unixSocket = false,
+  ) {}
 
-  static load(file: string): AccessGate {
+  static load(file: string, unixSocket = false): AccessGate {
     let token: string
     try {
       token = readFileSync(file, 'utf8').trim()
@@ -33,12 +36,15 @@ export class AccessGate {
       }
     }
     chmodSync(file, 0o600)
-    return new AccessGate(token)
+    return new AccessGate(token, unixSocket)
   }
 
   authorize(request: IngressRequest): boolean {
     if (this.matchesBearer(request.authorization)) return true
-    if (!isLoopback(request.remoteAddress)) return false
+    // A private Unix listener relies on filesystem permissions, not TCP loopback.
+    if (!isLoopback(request.remoteAddress) && !(this.unixSocket && !request.remoteAddress)) {
+      return false
+    }
     if (!request.origin) return true
     try {
       const origin = new URL(request.origin)

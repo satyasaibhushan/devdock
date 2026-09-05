@@ -4,6 +4,14 @@ import { AccessGate } from './accessGate.js'
 describe('AccessGate', () => {
   const gate = new AccessGate('secret')
 
+  it('trusts addressless requests only on an explicitly private Unix listener', () => {
+    expect(gate.authorize({})).toBe(false)
+    const unix = new AccessGate('secret', true)
+    expect(unix.authorize({})).toBe(true)
+    expect(unix.authorize({ remoteAddress: '10.0.0.2' })).toBe(false)
+    expect(unix.authorize({ host: 'localhost', origin: 'https://evil.example' })).toBe(false)
+  })
+
   it('allows same-origin loopback browser requests', () => {
     expect(
       gate.authorize({

@@ -1,0 +1,26 @@
+[Unit]
+Description=DevDock control daemon
+After=network.target docker.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/devdock/node %h/.local/share/devdock/current/packages/daemon/dist/index.js
+WorkingDirectory=%h/.local/share/devdock/current
+Environment=PATH=%h/.local/bin:%h/.local/share/devdock/bin:/usr/local/bin:/usr/bin:/bin
+Environment=SHELL=/bin/bash
+Environment=DEVDOCK_ROOTS=/srv/Code/backend
+Environment=DEVDOCK_SOCKET=%t/devdock/control.sock
+Environment=DEVDOCK_AWS_AUTH=external
+Environment=DOCKER_HOST=unix://%t/docker.sock
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus
+Environment=HTTPS_PROXY=http://127.0.0.1:18080
+Environment=NO_PROXY=localhost,127.0.0.1,.amazonaws.com
+Environment=AWS_PAGER=
+RuntimeDirectory=devdock
+RuntimeDirectoryMode=0700
+UMask=0077
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -38,8 +38,9 @@ export function deriveStatus(
   }
   if (anyReady) return hasSession ? 'RUNNING_MANAGED' : 'RUNNING_EXTERNAL'
 
-  // Pods exist but none ready yet → still coming up.
-  if (pods.length > 0) return 'BUILDING'
+  // An accepted deployment can still be pending. Without a dev session it
+  // must remain startable and purgeable instead of appearing busy forever.
+  if (pods.length > 0) return hasDeployment && !hasSession ? 'DEPLOYED' : 'BUILDING'
 
   // No pods. A live session means devspace dev is mid-build/deploy.
   if (hasSession) return 'BUILDING'

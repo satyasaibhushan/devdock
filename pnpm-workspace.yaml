@@ -2,11 +2,6 @@ packages:
   - packages/*
 
 allowBuilds:
-  '@biomejs/biome': set this to true or false
-  esbuild: set this to true or false
-  node-pty: set this to true or false
-
-onlyBuiltDependencies:
-  - "@biomejs/biome"
-  - esbuild
-  - node-pty
+  '@biomejs/biome': true
+  esbuild: true
+  node-pty: true
