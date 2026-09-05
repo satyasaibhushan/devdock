@@ -32,16 +32,26 @@
   let menu: HTMLDivElement
   let menuX = $state(0)
   let menuY = $state(0)
+  let menuOpen = $state(false)
+  function closeMenu() {
+    menu?.hidePopover()
+    menuOpen = false
+  }
+  function dismissMenuOutside(event: PointerEvent | FocusEvent) {
+    if (!menuOpen) return
+    const path = event.composedPath()
+    if (!path.includes(menu) && !path.includes(addButton)) closeMenu()
+  }
   function openMenu(event: MouseEvent | KeyboardEvent) {
     event.preventDefault()
     const rect = addButton.getBoundingClientRect()
     menuX = Math.max(8, Math.min(rect.left, window.innerWidth - 260))
     menuY = Math.max(8, Math.min(rect.bottom + 6, window.innerHeight - 100))
     menu.showPopover()
+    menuOpen = true
     menu.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus()
   }
   function menuKey(event: KeyboardEvent) {
-    if (event.key === 'Escape') { menu.hidePopover(); addButton.focus(); return }
     if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return
     event.preventDefault()
     const buttons = [...menu.querySelectorAll<HTMLButtonElement>('button:not(:disabled)')]
@@ -107,7 +117,7 @@
 
   async function add(normal = false) {
     if (adding || (!normal && !canAdd)) return
-    menu?.hidePopover()
+    closeMenu()
     adding = true
     createError = null
     try {
@@ -143,11 +153,18 @@
   const shortId = (t: TermInfo): string => t.id.slice(t.id.lastIndexOf(':t') + 2)
 
   function onkey(e: KeyboardEvent) {
+    if (e.key === 'Escape' && menuOpen) {
+      e.preventDefault()
+      e.stopPropagation()
+      closeMenu()
+      addButton.focus()
+      return
+    }
     if (e.key === 'Escape' && full) full = false
   }
 </script>
 
-<svelte:window onkeydown={onkey} />
+<svelte:window onkeydown={onkey} onpointerdown={dismissMenuOutside} onfocusin={dismissMenuOutside} />
 
 <div class="panel" class:full>
   <div class="tabs">
@@ -172,6 +189,7 @@
         title={repo ? 'Open DevSpace terminal. Right-click for a normal terminal on this machine.' : 'Open normal terminal on this machine'}
         aria-label="New terminal"
         aria-haspopup="menu"
+        aria-expanded={menuOpen}
         aria-disabled={!canAdd || adding}
         oncontextmenu={openMenu}
         onkeydown={(event) => { if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) openMenu(event) }}
@@ -216,7 +234,8 @@
   </div>
 </div>
 
-<div bind:this={menu} popover="auto" class="terminal-menu" role="menu" tabindex="-1" aria-label="New terminal" style:left="{menuX}px" style:top="{menuY}px" onkeydown={menuKey}>
+<!-- Auto popovers light-dismiss on the pointerup that completes a right-click. -->
+<div bind:this={menu} popover="manual" class="terminal-menu" role="menu" tabindex="-1" aria-label="New terminal" style:left="{menuX}px" style:top="{menuY}px" onkeydown={menuKey}>
   <button role="menuitem" disabled={!repo || !canAdd || adding} onclick={() => add()}>Open DevSpace terminal</button>
   <button role="menuitem" disabled={adding} onclick={() => add(true)}>Open normal terminal</button>
 </div>
