@@ -1,11 +1,13 @@
 <script lang="ts">
-  import { type BranchInfo, type ReplicaRecord, type InstanceView, createReplica, fetchBranches, fetchInstances, selectedInstance, selectInstance } from './api'
+  import { type BranchInfo, type ReplicaRecord, type InstanceView, createReplica, fetchBranches, fetchInstances } from './api'
 
   let {
+    preferred = '',
     repoId,
     onclose,
     oncreated,
   }: {
+    preferred?: string
     repoId: string
     onclose: () => void
     oncreated: (rec: ReplicaRecord) => void
@@ -22,7 +24,8 @@
   $effect(() => {
     void fetchInstances().then((items) => {
       instances = items.filter((item) => item.online && item.repos.some((repo) => repo.repo.id === repoId))
-      if (instances.length === 1) target = instances[0]?.local ? '' : instances[0]?.id ?? null
+      const initial = instances.find((item) => item.id === preferred) ?? (instances.length === 1 ? instances[0] : undefined)
+      if (initial) target = initial.local ? '' : initial.id
       loading = false
     }).catch(() => { error = 'Cannot load target instances'; loading = false })
   })
@@ -58,7 +61,6 @@
     error = null
     try {
       const rec = await createReplica(repoId, picked, false, target)
-      if (target !== selectedInstance) { selectInstance(target, rec.id); return }
       oncreated(rec)
       onclose()
     } catch (e) {

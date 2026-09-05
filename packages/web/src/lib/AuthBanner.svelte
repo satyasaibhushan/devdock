@@ -6,9 +6,11 @@
   import { type AuthState, clearAuthCache, startAuthLogin } from './api.js'
 
   let {
+    instance = '',
     auth,
     onchanged,
   }: {
+    instance?: string
     auth: AuthState
     /** Parent refreshes its /auth snapshot (and toasts failures). */
     onchanged: (next: AuthState) => void
@@ -21,7 +23,7 @@
   async function login() {
     busy = true
     try {
-      onchanged(await startAuthLogin())
+      onchanged(await startAuthLogin(instance))
     } catch {
       // next poll shows the real state
     } finally {
@@ -32,7 +34,7 @@
   async function clearCache() {
     busy = true
     try {
-      onchanged(await clearAuthCache())
+      onchanged(await clearAuthCache(instance))
     } catch {
       // next poll shows the real state
     } finally {

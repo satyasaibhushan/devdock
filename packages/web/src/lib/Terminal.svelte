@@ -9,10 +9,11 @@
   // scrollback, then streams. Closing this component only detaches the
   // viewer — the terminal keeps running for other clients.
   let {
+    instance = '',
     tid,
     mode,
     onclosed,
-  }: { tid: string; mode: 'ro' | 'rw'; onclosed?: () => void } = $props()
+  }: { instance?: string; tid: string; mode: 'ro' | 'rw'; onclosed?: () => void } = $props()
   let host: HTMLDivElement
   let error = $state<string | null>(null)
   let ready = $state(false)
@@ -105,7 +106,7 @@
 
     // Dial in at the fitted size so the PTY (and tmux) renders full-pane from
     // the first frame instead of a 200x50 headless canvas.
-    const socket = attachTerminal(tidVal, modeVal, term.cols, term.rows, needsReplay)
+    const socket = attachTerminal(tidVal, modeVal, term.cols, term.rows, needsReplay, instance)
     needsReplay = false
     ws = socket
     socket.onmessage = (ev) => {

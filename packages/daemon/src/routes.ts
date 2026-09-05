@@ -65,7 +65,7 @@ export function buildApp(
         online: true,
         auth: service.authState(),
         aws: service.awsAuthState(),
-        repos: service.list(),
+        repos: await service.listWithOwnership(),
       },
       ...(await Promise.all(
         instances.list().map(async (link) => {
@@ -189,7 +189,7 @@ export function buildApp(
     return r.cred
   })
 
-  app.get('/repos', async () => service.list())
+  app.get('/repos', async () => service.listWithOwnership())
 
   app.get<{ Params: { id: string } }>('/repos/:id', async (req, reply) => {
     const state = service.get(req.params.id)

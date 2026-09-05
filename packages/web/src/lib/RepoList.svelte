@@ -1,7 +1,9 @@
 <script lang="ts">
-  import { type RepoState, type RepoStatus, type Verb } from './api'
+  import { type RepoState, type RepoStatus, type Verb, type InstanceView } from './api'
+  import { instanceSymbol } from './globalRepos'
 
   let {
+    instances,
     repos,
     selectedId,
     busyId,
@@ -12,6 +14,7 @@
     onreplicate,
     onreplicadelete,
   }: {
+    instances: InstanceView[]
     repos: RepoState[]
     selectedId: string | null
     busyId: string | null
@@ -178,6 +181,10 @@
             <span class="id" title={r.repo.id}>
               {#if r.repo.parentId}<span class="rep">↳</span>{/if}
               {r.repo.id}
+              {#each [...new Set(r.workloads.map((w) => w.instanceId).filter(Boolean))] as id (id)}
+                {@const machine = instances.find((i) => i.id === id)}
+                <span class="owner" class:offline={!machine?.online} title="{machine?.name ?? 'Owner not connected'}{machine?.online ? '' : ' · offline'}">{instanceSymbol(machine)}</span>
+              {/each}
               {#if r.repo.branch}<span class="bpill" title="branch {r.repo.branch}">{r.repo.branch}</span>{/if}
             </span>
             {#if workloadPills(r).length}
@@ -257,6 +264,8 @@
 </div>
 
 <style>
+  .owner { display: inline-block; margin-left: 6px; color: var(--accent); font-size: 14px; }
+  .owner.offline { color: var(--muted); }
   .panel {
     display: flex;
     flex-direction: column;

@@ -17,10 +17,11 @@
   //  instead ensurePrimary reacts to changes and re-ensures the primary
   //  against the new target while every other tab keeps streaming.
   let {
+    instance = '',
     repo,
     workload,
     attach = 'none',
-  }: { repo?: string; workload?: string; attach?: 'tmux' | 'pod' | 'none' } = $props()
+  }: { instance?: string; repo?: string; workload?: string; attach?: 'tmux' | 'pod' | 'none' } = $props()
 
   let terms = $state<TermInfo[]>([])
   let activeTid = $state<string | null>(null)
@@ -37,7 +38,7 @@
 
   async function refresh() {
     try {
-      const all = await fetchTerminals()
+      const all = await fetchTerminals(instance)
       terms = all
         .filter((t) => t.alive && mine(t))
         .sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id))
@@ -61,7 +62,7 @@
     if (key === lastEnsure) return
     lastEnsure = key
     try {
-      await createTerminal({ repo, workload, kind: 'auto' })
+      await createTerminal({ repo, workload, kind: 'auto' }, instance)
       await refresh()
     } catch (e) {
       createError = e instanceof Error ? e.message : String(e)
@@ -86,7 +87,7 @@
     if (!canAdd) return
     createError = null
     try {
-      const t = await createTerminal(repo ? { repo, workload, kind: 'shell' } : { kind: 'local' })
+      const t = await createTerminal(repo ? { repo, workload, kind: 'shell' } : { kind: 'local' }, instance)
       await refresh()
       activeTid = t.id
     } catch (e) {
@@ -97,7 +98,7 @@
   // Close for everyone — the daemon kills the PTY, agents lose it too.
   async function close(tid: string) {
     try {
-      await deleteTerminal(tid)
+      await deleteTerminal(tid, instance)
     } catch {
       /* already gone */
     }
@@ -179,7 +180,7 @@
     {:else}
       {#each terms as t (t.id)}
         <div class="screen" class:shown={t.id === activeTid}>
-          <Terminal tid={t.id} mode={modeOf(t)} onclosed={refresh} />
+          <Terminal {instance} tid={t.id} mode={modeOf(t)} onclosed={refresh} />
         </div>
       {/each}
     {/if}

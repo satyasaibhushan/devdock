@@ -2,12 +2,14 @@
   import { saveStartup } from './api'
 
   let {
+    instanceFor = () => '',
     repoId,
     podTypes,
     initial,
     onclose,
     onsaved,
   }: {
+    instanceFor?: (type: string) => string
     repoId: string
     podTypes: string[]
     initial: Record<string, string>
@@ -33,7 +35,7 @@
     error = null
     try {
       await Promise.all(
-        podTypes.map((type) => saveStartup(repoId, type, commands[type] ?? '')),
+        podTypes.map((type) => saveStartup(repoId, type, commands[type] ?? '', instanceFor(type))),
       )
       const normalized = Object.fromEntries(
         podTypes.map((type) => [type, (commands[type] ?? '').trim()]),

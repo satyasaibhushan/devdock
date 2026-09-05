@@ -47,6 +47,10 @@ export interface Repo {
 
 /** One workload's reconciled view inside a (possibly multi-workload) repo. */
 export interface WorkloadState {
+  ownerInstanceId?: string
+  ownershipKnown?: boolean
+  instanceId?: string
+  unavailable?: boolean
   type: string
   status: RepoStatus
   pods: PodInfo[]
@@ -81,7 +85,8 @@ export interface NamespaceInfo {
   known: string[]
 }
 
-export const selectedInstance = new URLSearchParams(globalThis.location?.search ?? '').get('instance') ?? ''
+export const selectedInstance =
+  new URLSearchParams(globalThis.location?.search ?? '').get('instance') ?? ''
 
 export function instancePath(path: string, instance = selectedInstance): string {
   return instance ? `/instances/${encodeURIComponent(instance)}/api${path}` : path
@@ -108,13 +113,23 @@ export async function fetchInstances(): Promise<InstanceView[]> {
   return response.json()
 }
 
-export async function linkInstance(host: string, endpoint: string, terminals: boolean): Promise<void> {
-  const response = await globalThis.fetch('/instances', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ host, endpoint, terminals }) })
+export async function linkInstance(
+  host: string,
+  endpoint: string,
+  terminals: boolean,
+): Promise<void> {
+  const response = await globalThis.fetch('/instances', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ host, endpoint, terminals }),
+  })
   if (!response.ok) throw new Error(((await response.json()) as { error: string }).error)
 }
 
 export async function unlinkInstance(id: string): Promise<void> {
-  const response = await globalThis.fetch(`/instances/${encodeURIComponent(id)}`, { method: 'DELETE' })
+  const response = await globalThis.fetch(`/instances/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+  })
   if (!response.ok) throw new Error('Cannot unlink instance')
 }
 
@@ -128,19 +143,26 @@ export function selectInstance(id: string, repo?: string): void {
   location.assign(url.toString())
 }
 
-export async function fetchNamespace(): Promise<NamespaceInfo> {
-  const res = await fetch('/namespace')
+export async function fetchNamespace(instance = selectedInstance): Promise<NamespaceInfo> {
+  const res = await fetch('/namespace', undefined, instance)
   if (!res.ok) throw new Error(`GET /namespace → ${res.status}`)
   return res.json()
 }
 
 /** Switch the kube context's namespace (the UI face of the user's `kn` alias). */
-export async function switchNamespace(namespace: string): Promise<NamespaceInfo> {
-  const res = await fetch('/namespace', {
-    method: 'PUT',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ namespace }),
-  })
+export async function switchNamespace(
+  namespace: string,
+  instance = selectedInstance,
+): Promise<NamespaceInfo> {
+  const res = await fetch(
+    '/namespace',
+    {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ namespace }),
+    },
+    instance,
+  )
   if (!res.ok) {
     const body = (await res.json().catch(() => null)) as { error?: string } | null
     throw new Error(body?.error ?? `PUT /namespace → ${res.status}`)
@@ -159,22 +181,22 @@ export interface AuthState {
   checkedAt: number
 }
 
-export async function fetchAuth(): Promise<AuthState> {
-  const res = await fetch('/auth')
+export async function fetchAuth(instance = selectedInstance): Promise<AuthState> {
+  const res = await fetch('/auth', undefined, instance)
   if (!res.ok) throw new Error(`GET /auth → ${res.status}`)
   return res.json()
 }
 
 /** Kick off the (single-flight) interactive login; poll /auth for the outcome. */
-export async function startAuthLogin(): Promise<AuthState> {
-  const res = await fetch('/auth/login', { method: 'POST' })
+export async function startAuthLogin(instance = selectedInstance): Promise<AuthState> {
+  const res = await fetch('/auth/login', { method: 'POST' }, instance)
   if (!res.ok) throw new Error(`POST /auth/login → ${res.status}`)
   return res.json()
 }
 
 /** The UI face of `rm -r ~/.kube/cache/oidc-login`. */
-export async function clearAuthCache(): Promise<AuthState> {
-  const res = await fetch('/auth/clear', { method: 'POST' })
+export async function clearAuthCache(instance = selectedInstance): Promise<AuthState> {
+  const res = await fetch('/auth/clear', { method: 'POST' }, instance)
   if (!res.ok) throw new Error(`POST /auth/clear → ${res.status}`)
   return res.json()
 }
@@ -185,10 +207,19 @@ export async function fetchRepos(): Promise<RepoState[]> {
   return res.json()
 }
 
-export async function runVerb(id: string, verb: Verb, workload?: string): Promise<void> {
+export async function runVerb(
+  id: string,
+  verb: Verb,
+  workload?: string,
+  instance = selectedInstance,
+): Promise<void> {
   const q = workload ? `?workload=${encodeURIComponent(workload)}` : ''
   const path = verb === 'build_start' ? 'build-start' : verb
-  const res = await fetch(`/repos/${encodeURIComponent(id)}/${path}${q}`, { method: 'POST' })
+  const res = await fetch(
+    `/repos/${encodeURIComponent(id)}/${path}${q}`,
+    { method: 'POST' },
+    instance,
+  )
   const body = (await res.json()) as { ok?: boolean; stderr?: string; error?: string }
   if (!res.ok) throw new Error(body.error ?? body.stderr ?? `${verb} ${id} → ${res.status}`)
   if (!body.ok) throw new Error(body.stderr ?? `${verb} failed`)
@@ -196,19 +227,36 @@ export async function runVerb(id: string, verb: Verb, workload?: string): Promis
 
 /** Adopt an externally-managed workload: purge it, then start a managed
  *  `devspace dev` session in its place. */
-export async function adoptRepo(id: string, workload?: string): Promise<void> {
+export async function adoptRepo(
+  id: string,
+  workload?: string,
+  instance = selectedInstance,
+): Promise<void> {
   const q = workload ? `?workload=${encodeURIComponent(workload)}` : ''
-  const res = await fetch(`/repos/${encodeURIComponent(id)}/adopt${q}`, { method: 'POST' })
+  const res = await fetch(
+    `/repos/${encodeURIComponent(id)}/adopt${q}`,
+    { method: 'POST' },
+    instance,
+  )
   if (!res.ok) throw new Error(`adopt ${id} → ${res.status}`)
 }
 
 /** Save (or clear, with an empty string) one pod type's startup command. */
-export async function saveStartup(id: string, podType: string, command: string): Promise<void> {
-  const res = await fetch(`/repos/${encodeURIComponent(id)}/startup`, {
-    method: 'PUT',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ command, workload: podType }),
-  })
+export async function saveStartup(
+  id: string,
+  podType: string,
+  command: string,
+  instance = selectedInstance,
+): Promise<void> {
+  const res = await fetch(
+    `/repos/${encodeURIComponent(id)}/startup`,
+    {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ command, workload: podType }),
+    },
+    instance,
+  )
   if (!res.ok) throw new Error(`save startup ${id} → ${res.status}`)
 }
 
@@ -233,7 +281,10 @@ export interface ReplicaRecord {
   ownImage?: boolean
 }
 
-export async function fetchBranches(id: string, instance = selectedInstance): Promise<BranchInfo[]> {
+export async function fetchBranches(
+  id: string,
+  instance = selectedInstance,
+): Promise<BranchInfo[]> {
   const res = await fetch(`/repos/${encodeURIComponent(id)}/branches`, undefined, instance)
   if (!res.ok) throw new Error(`GET branches ${id} → ${res.status}`)
   return res.json()
@@ -245,11 +296,15 @@ export async function createReplica(
   ownImage = false,
   instance = selectedInstance,
 ): Promise<ReplicaRecord> {
-  const res = await fetch(`/repos/${encodeURIComponent(id)}/replicas`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ branch, ownImage }),
-  }, instance)
+  const res = await fetch(
+    `/repos/${encodeURIComponent(id)}/replicas`,
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ branch, ownImage }),
+    },
+    instance,
+  )
   if (!res.ok) {
     const body = (await res.json().catch(() => null)) as { error?: string } | null
     throw new Error(body?.error ?? `create replica → ${res.status}`)
@@ -257,26 +312,26 @@ export async function createReplica(
   return res.json()
 }
 
-export async function deleteReplica(id: string): Promise<void> {
-  const res = await fetch(`/replicas/${encodeURIComponent(id)}`, { method: 'DELETE' })
+export async function deleteReplica(id: string, instance = selectedInstance): Promise<void> {
+  const res = await fetch(`/replicas/${encodeURIComponent(id)}`, { method: 'DELETE' }, instance)
   if (!res.ok) {
     const body = (await res.json().catch(() => null)) as { error?: string } | null
     throw new Error(body?.error ?? `delete replica → ${res.status}`)
   }
 }
 
-function wsUrl(path: string): string {
+function wsUrl(path: string, instance = selectedInstance): string {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws'
-  return `${proto}://${location.host}${instancePath(path)}`
+  return `${proto}://${location.host}${instancePath(path, instance)}`
 }
 
 export function openEvents(): WebSocket {
   return new WebSocket(wsUrl('/events'))
 }
 
-export function openLogs(id: string, workload?: string): WebSocket {
+export function openLogs(id: string, workload?: string, instance = selectedInstance): WebSocket {
   const q = workload ? `?workload=${encodeURIComponent(workload)}` : ''
-  return new WebSocket(wsUrl(`/repos/${encodeURIComponent(id)}/logs${q}`))
+  return new WebSocket(wsUrl(`/repos/${encodeURIComponent(id)}/logs${q}`, instance))
 }
 
 // ---- terminals ----
@@ -298,23 +353,30 @@ export interface TermInfo {
   attached: number
 }
 
-export async function fetchTerminals(): Promise<TermInfo[]> {
-  const res = await fetch('/terminals')
+export async function fetchTerminals(instance = selectedInstance): Promise<TermInfo[]> {
+  const res = await fetch('/terminals', undefined, instance)
   if (!res.ok) throw new Error(`GET /terminals → ${res.status}`)
   return res.json()
 }
 
 /** Open (or, for kind 'auto', reuse) a registered terminal. */
-export async function createTerminal(opts: {
-  repo?: string
-  workload?: string
-  kind?: 'auto' | 'shell' | 'local'
-}): Promise<TermInfo> {
-  const res = await fetch('/terminals', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(opts),
-  })
+export async function createTerminal(
+  opts: {
+    repo?: string
+    workload?: string
+    kind?: 'auto' | 'shell' | 'local'
+  },
+  instance = selectedInstance,
+): Promise<TermInfo> {
+  const res = await fetch(
+    '/terminals',
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(opts),
+    },
+    instance,
+  )
   if (!res.ok) {
     const body = (await res.json().catch(() => null)) as { error?: string } | null
     throw new Error(body?.error ?? `POST /terminals → ${res.status}`)
@@ -323,8 +385,8 @@ export async function createTerminal(opts: {
 }
 
 /** Close a terminal for ALL clients (the PTY dies, scrollback is dropped). */
-export async function deleteTerminal(tid: string): Promise<void> {
-  const res = await fetch(`/terminals/${encodeURIComponent(tid)}`, { method: 'DELETE' })
+export async function deleteTerminal(tid: string, instance = selectedInstance): Promise<void> {
+  const res = await fetch(`/terminals/${encodeURIComponent(tid)}`, { method: 'DELETE' }, instance)
   if (!res.ok) throw new Error(`DELETE /terminals/${tid} → ${res.status}`)
 }
 
@@ -335,11 +397,15 @@ export function attachTerminal(
   cols?: number,
   rows?: number,
   replay = true,
+  instance = selectedInstance,
 ): WebSocket {
   const size = cols && rows ? `&cols=${cols}&rows=${rows}` : ''
   const replayParam = replay ? '' : '&replay=0'
   return new WebSocket(
-    wsUrl(`/terminals/${encodeURIComponent(tid)}/attach?mode=${mode}${size}${replayParam}`),
+    wsUrl(
+      `/terminals/${encodeURIComponent(tid)}/attach?mode=${mode}${size}${replayParam}`,
+      instance,
+    ),
   )
 }
 

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { openLogs } from './api'
 
-  let { id, workload }: { id: string; workload?: string } = $props()
+  let { id, workload, instance = '' }: { id: string; workload?: string; instance?: string } = $props()
 
   // Hard cap on retained lines — the pane is a recent-history view, not an
   // archive. Old lines are purged as new ones arrive so a long-running session
@@ -30,7 +30,7 @@
       pending = []
       queueMicrotask(() => box?.scrollTo(0, box.scrollHeight))
     }
-    const ws = openLogs(id, workload)
+    const ws = openLogs(id, workload, instance)
     ws.onmessage = (ev) => {
       pending.push({ seq: seq++, text: String(ev.data) })
       if (pending.length > MAX_LINES) pending = pending.slice(-MAX_LINES)

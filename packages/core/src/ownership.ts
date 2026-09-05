@@ -12,6 +12,38 @@ export type OwnershipRunner = (
  * Kubernetes serializes create, so simultaneous claims cannot both succeed.
  * No credentials are stored in the ConfigMap. */
 export class DeploymentOwnership {
+  private snapshots = new Map<string, { expires: number; value: Promise<Record<string, string>> }>()
+
+  /** Read claims without acquiring them. Cache and coalesce namespace reads for UI polling. */
+  owners(namespace: string): Promise<Record<string, string>> {
+    const cached = this.snapshots.get(namespace)
+    if (cached && cached.expires > Date.now()) return cached.value
+    const value = this.runner(
+      'kubectl',
+      [
+        'get',
+        'configmaps',
+        '-n',
+        namespace,
+        '-o',
+        'jsonpath={range .items[*]}{.metadata.name}{"\\t"}{.data.deployment}{"\\t"}{.data.instance}{"\\n"}{end}',
+      ],
+      { timeoutMs: 10_000 },
+    ).then((result) => {
+      if (result.code !== 0) throw new Error('Ownership unavailable')
+      const owners: Record<string, string> = {}
+      for (const line of result.stdout.split('\n')) {
+        const [name, deployment, instance] = line.split('\t')
+        if (!deployment || !instance || !/^[0-9a-f-]{36}$/i.test(instance)) continue
+        const expected = `devdock-owner-${createHash('sha256').update(deployment).digest('hex').slice(0, 32)}`
+        if (name === expected) owners[deployment] = instance
+      }
+      return owners
+    })
+    this.snapshots.set(namespace, { expires: Date.now() + 15_000, value })
+    return value
+  }
+
   constructor(
     private readonly instanceId: string,
     private readonly runner: OwnershipRunner,

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { globalRepos, workloadTarget, instanceEndpoint, instanceSymbol, retainOwners } from './lib/globalRepos'
   import AuthBanner from './lib/AuthBanner.svelte'
   import InstancePanel from './lib/InstancePanel.svelte'
   import ConfirmModal from './lib/ConfirmModal.svelte'
@@ -10,6 +11,7 @@
   import TerminalPanel from './lib/TerminalPanel.svelte'
   import {
     type AuthState,
+    type InstanceView,
     type NamespaceInfo,
     type RepoState,
     type Verb,
@@ -17,13 +19,31 @@
     deleteReplica,
     fetchAuth,
     fetchNamespace,
-    fetchRepos,
+    fetchInstances,
     openEvents,
     runVerb,
     switchNamespace,
   } from './lib/api'
 
-  let repos = $state<RepoState[]>([])
+  let instances = $state<InstanceView[]>([])
+  let preferred = $state(new URLSearchParams(location.search).get('instance') ?? '')
+  const repos = $derived(globalRepos(instances, preferred))
+  const preferredInstance = $derived(instances.find((i) => i.id === preferred))
+  const preferredEndpoint = $derived(preferredInstance ? instanceEndpoint(preferredInstance) : '')
+  function target(id: string, type?: string): string {
+    const workload = workloadTarget(repos.find((r) => r.repo.id === id), type)
+    const machine = instances.find((i) => i.id === workload?.instanceId)
+    if (!machine?.online || workload?.unavailable) throw new Error('Deployment owner unavailable. Reconnect its instance or restore Kubernetes access.')
+    return instanceEndpoint(machine)
+  }
+  function chooseInstance(id: string) {
+    preferred = id
+    const url = new URL(location.href)
+    url.searchParams.set('instance', id)
+    history.replaceState(null, '', url)
+    auth = null; nsInfo = null
+    void refresh()
+  }
   let selectedId = $state<string | null>(new URLSearchParams(location.search).get('repo'))
   // Sentinel selection for the host-machine terminal view (no repo attached).
   const HOST_ID = '@host'
@@ -54,9 +74,14 @@
   let deletingReplicaId = $state<string | null>(null)
   let replicaDeleteBusy = $state(false)
 
+  let refreshing = false
   async function refresh() {
+    if (refreshing) return
+    refreshing = true
     try {
-      repos = await fetchRepos()
+      const next = await fetchInstances()
+      instances = retainOwners(next, instances)
+      if (!instances.some((i) => i.id === preferred)) preferred = instances.find((i) => i.local)?.id ?? instances[0]?.id ?? ''
       connected = true
       if (!selectedId && repos.length) selectedId = repos[0]?.repo.id ?? null
     } catch {
@@ -66,16 +91,21 @@
     // Skipped mid-switch so the poll can't flash the old namespace back.
     if (!nsBusy) {
       try {
-        nsInfo = await fetchNamespace()
+        const id = preferred
+        const next = await fetchNamespace(preferredEndpoint)
+        if (id === preferred) nsInfo = next
       } catch {
         /* older daemon or offline — the picker just stays hidden */
       }
     }
     try {
-      auth = await fetchAuth()
+      const id = preferred
+      const next = await fetchAuth(preferredEndpoint)
+      if (id === preferred) auth = next
     } catch {
       /* older daemon or offline — the banner just stays hidden */
     }
+    refreshing = false
   }
 
   // Switch the kube context's namespace (what `kn <ns>` does), then re-pull
@@ -84,7 +114,7 @@
     if (nsBusy) return
     nsBusy = true
     try {
-      nsInfo = await switchNamespace(ns)
+      nsInfo = await switchNamespace(ns, preferredEndpoint)
       await refresh()
     } catch (e) {
       toast = `namespace switch failed: ${e instanceof Error ? e.message : String(e)}`
@@ -137,6 +167,8 @@
   // The status/pods shown and acted on are the active workload's, not the
   // aggregate the list row shows.
   const view = $derived(active ?? null)
+  const owner = $derived(instances.find((i) => i.id === view?.instanceId))
+  const ownerEndpoint = $derived(owner ? instanceEndpoint(owner) : '')
   const vstatus = $derived(view?.status ?? selected?.status ?? 'STOPPED')
 
   // Memoized primitives for the stream children. `selected` is a fresh object
@@ -161,11 +193,11 @@
 
   // The detail pane acts on the chosen workload (`wl`); a list row acts on the
   // repo's default workload, so it passes its own id and leaves `workload` unset.
-  async function act(verb: Verb, id = selected?.repo.id, workload = id === selected?.repo.id ? wl : undefined) {
+  async function act(verb: Verb, id = selected?.repo.id, workload?: string) {
     if (!id || busy) return
     busy = { id, verb }
     try {
-      await runVerb(id, verb, workload)
+      await runVerb(id, verb, workload, target(id, workload))
       await refresh()
     } catch (e) {
       toast = `${verb} failed: ${e instanceof Error ? e.message : String(e)}`
@@ -182,7 +214,7 @@
     if (!id || adoptBusy) return
     adoptBusy = true
     try {
-      await adoptRepo(id, wl)
+      await adoptRepo(id, wl, target(id, wl))
       await refresh()
       confirmAdopt = false
     } catch (e) {
@@ -212,7 +244,7 @@
     if (!id || replicaDeleteBusy) return
     replicaDeleteBusy = true
     try {
-      await deleteReplica(id)
+      await deleteReplica(id, target(id))
       if (selectedId === id) selectedId = repos.find((r) => r.repo.id === id)?.repo.parentId ?? null
       deletingReplicaId = null
       await refresh()
@@ -227,14 +259,14 @@
 
 <header>
   <h1>dev<b>dock</b></h1>
-  <InstancePanel />
+  <InstancePanel {instances} value={preferred} onchange={chooseInstance} onrefresh={refresh} />
   <span class="conn" class:on={connected}>
     <span class="cdot" class:on={connected}></span>
     {connected ? 'daemon connected' : 'daemon offline'}
   </span>
   <div class="hright">
     {#if auth}
-      <AuthBanner {auth} onchanged={(next) => (auth = next)} />
+      {#key preferred}<AuthBanner {auth} instance={preferredEndpoint} onchanged={(next) => (auth = next)} />{/key}
     {/if}
     {#if nsInfo}
       <NamespacePicker
@@ -253,6 +285,7 @@
       <RepoList
         {repos}
         {selectedId}
+        {instances}
         busyId={busy?.id ?? null}
         busyVerb={busy?.verb ?? null}
         onselect={(id) => (selectedId = id)}
@@ -277,7 +310,7 @@
       <div class="head">
         <div class="title">
           <h2>host</h2>
-          <span class="pill">local machine</span>
+          <span class="pill">{instanceSymbol(preferredInstance)} {preferredInstance?.name ?? 'No instance'}</span>
         </div>
       </div>
       <div class="meta">
@@ -286,7 +319,10 @@
       <div class="streams solo">
         <div class="block">
           <div class="bhead"><h3>Terminal</h3></div>
-          <TerminalPanel />
+          {#key preferred}
+            {#if preferredInstance?.online}<TerminalPanel instance={preferredEndpoint} />
+            {:else}<p class="placeholder">This instance is offline.</p>{/if}
+          {/key}
         </div>
       </div>
     {:else if selected}
@@ -294,6 +330,7 @@
         <div class="title">
           <span class="dot {vstatus}"></span>
           <h2>{selected.repo.id}</h2>
+          <span class="pill" title="Actions, logs and terminals use this instance">{instanceSymbol(owner)} {owner?.name ?? 'Owner not connected'}</span>
           {#if family.length > 1}
             <select
               class="wlselect"
@@ -327,7 +364,7 @@
           <span class="pill {vstatus}">{vstatus.replace('_', ' ').toLowerCase()}</span>
         </div>
         <div class="actions">
-          {#if vstatus === 'RUNNING_EXTERNAL'}
+          {#if vstatus === 'RUNNING_EXTERNAL' && !view?.unavailable}
             <button
               class="adopt"
               title="stop the external devspace dev process and reconnect here (keeps the dev pod)"
@@ -339,7 +376,7 @@
             <button
               class:danger={v === 'destroy'}
               disabled={busy !== null || adoptBusy}
-              onclick={() => act(v)}
+              onclick={() => act(v, sid, wl)}
             >{v === 'build_start' ? 'build + start' : v}</button>
           {/each}
         </div>
@@ -356,30 +393,35 @@
         {#if selected.repo.ports.length}<span>· :{selected.repo.ports.join(' :')}</span>{/if}
       </div>
 
+      {#if view?.unavailable}
+        <div class="placeholder"><p>{owner ? `${owner.name} is unavailable or ownership could not be verified.` : 'Connect the instance that owns this deployment.'} Existing ownership is preserved.</p></div>
+      {:else}
       <div class="streams">
         <div class="block">
           <div class="bhead"><h3>Logs</h3></div>
-          {#key sid + swl + sstatus}
-            <LogViewer id={sid} workload={wl} />
+          {#key ownerEndpoint + sid + swl + sstatus}
+            <LogViewer id={sid} workload={wl} instance={ownerEndpoint} />
           {/key}
         </div>
 
         <div class="block">
           <div class="bhead"><h3>Terminal</h3></div>
-          {#key sid + swl}
-            <TerminalPanel repo={sid} workload={wl} attach={sterm} />
+          {#key ownerEndpoint + sid + swl}
+            <TerminalPanel repo={sid} workload={wl} attach={sterm} instance={ownerEndpoint} />
           {/key}
         </div>
       </div>
+      {/if}
     {:else}
       <div class="placeholder"><p>Select a repo to view its logs and terminal.</p></div>
     {/if}
   </section>
 </main>
 
-{#if customizing}
+{#if customizing && !customizing.workloads.some((w) => w.unavailable)}
   {#key customizing.repo.id}
     <StartupModal
+      instanceFor={(type) => target(customizing.repo.id, customizing.repo.workloads?.length ? type : undefined)}
       repoId={customizing.repo.id}
       podTypes={startupTypes(customizing)}
       initial={customizing.startupCommands ?? {}}
@@ -399,6 +441,7 @@
 {#if replicatingId}
   {#key replicatingId}
     <ReplicaModal
+      {preferred}
       repoId={replicatingId}
       onclose={() => (replicatingId = null)}
       oncreated={async (rec) => {

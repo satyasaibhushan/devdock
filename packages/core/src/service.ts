@@ -322,6 +322,32 @@ export class Service {
     return [...this.states.values()]
   }
 
+  async listWithOwnership() {
+    const namespace = (await this.contextNamespace()) || 'default'
+    return Promise.all(
+      this.list().map(async (state) => {
+        const ns = state.repo.namespace || namespace
+        let owners: Record<string, string> = {}
+        let ownershipKnown = !this.ownership
+        try {
+          owners = (await this.ownership?.owners(ns)) ?? {}
+          ownershipKnown = true
+        } catch {
+          /* Keep visibility when auth or the cluster is unavailable. */
+        }
+        return {
+          ...state,
+          repo: { ...state.repo, namespace: ns },
+          workloads: state.workloads.map((workload) => ({
+            ...workload,
+            ownershipKnown,
+            ownerInstanceId: owners[scopeRepo(state.repo, workload.type).name],
+          })),
+        }
+      }),
+    )
+  }
+
   get(id: string): RepoState | undefined {
     return this.states.get(id)
   }

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { describe, expect, it, vi } from 'vitest'
 import { DeploymentOwnership } from './ownership.js'
 import type { Repo } from './types.js'
@@ -29,6 +30,28 @@ function cluster() {
 }
 
 describe('deployment ownership', () => {
+  it('reads and coalesces claims without writes or unrelated ConfigMap values', async () => {
+    const id = '7d2af2da-9d8f-4790-92a5-46e9b7cf965c'
+    const name = `devdock-owner-${createHash('sha256').update(repo.name).digest('hex').slice(0, 32)}`
+    const runner = vi.fn(async () => ({
+      code: 0,
+      stdout: `${name}\t${repo.name}\t${id}\nother\tother\t${id}\n`,
+      stderr: '',
+    }))
+    const ownership = new DeploymentOwnership(id, runner)
+    const [first, second] = await Promise.all([ownership.owners('sai'), ownership.owners('sai')])
+    expect(first).toEqual({ [repo.name]: id })
+    expect(second).toEqual(first)
+    expect(runner).toHaveBeenCalledTimes(1)
+  })
+  it('does not interpret unavailable ownership as unclaimed', async () => {
+    const ownership = new DeploymentOwnership('mac', async () => ({
+      code: 1,
+      stdout: '',
+      stderr: 'Forbidden',
+    }))
+    await expect(ownership.owners('sai')).rejects.toThrow('Ownership unavailable')
+  })
   it('allows one winner in a concurrent claim and preserves it after restart', async () => {
     const { runner } = cluster()
     const results = await Promise.allSettled([
