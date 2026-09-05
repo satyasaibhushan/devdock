@@ -11,10 +11,17 @@ and MCP. The initiating daemon reconnects every 15 seconds while running.
 Closing a browser does not close the link. An offline laptop remains offline,
 its work is not silently moved elsewhere.
 
-Selecting an instance switches all repo actions, logs, auth, namespace selection
-and terminals to that machine. The directory lists deployments and Kubernetes
-and AWS credential readiness for every connected machine. Replica creation asks
-for a target when the repo exists on multiple connected instances. Branches and
+The header shows connected instances, with a symbol shared by their repo rows.
+The sidebar is one global repository list, not a separate list per machine.
+Deployment actions, logs and terminals follow each workload's ownership claim.
+An offline owner stays visible and blocks actions; selecting another instance
+does not transfer ownership. Claims are read without acquiring them for display.
+
+The selected header instance controls host terminals, authentication, namespace
+selection and the default destination for new work. Its namespace scopes the
+global view when the same repo is available in different namespaces. The instance
+menu shows connection and auth status only, never a second deployment list.
+Replica creation offers an explicit target selector. Branches and
 worktrees come from that target's checkout. No repositories or `.env` files are
 copied by linking. New replica IDs include an instance suffix to avoid collisions.
 

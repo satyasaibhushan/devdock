@@ -326,7 +326,8 @@ function wsUrl(path: string, instance = selectedInstance): string {
 }
 
 export function openEvents(): WebSocket {
-  return new WebSocket(wsUrl('/events'))
+  // Directory refreshes belong to the serving daemon, not the default work target.
+  return new WebSocket(wsUrl('/events', ''))
 }
 
 export function openLogs(id: string, workload?: string, instance = selectedInstance): WebSocket {
