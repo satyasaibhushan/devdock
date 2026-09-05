@@ -287,7 +287,6 @@
       {#key controlEndpoint}<AuthBanner {auth} instance={controlEndpoint} onchanged={(next) => (auth = next)} />{/key}
     {/if}
     {#if nsInfo}
-      <span class="context-machine">{controlInstance?.name}</span>
       <NamespacePicker
         current={nsInfo.current}
         known={nsInfo.known}
@@ -354,11 +353,11 @@
           <span class="dot {vstatus}"></span>
           <h2>{selected.repo.id}</h2>
           {#if view?.ownerInstanceId}
-            <span class="pill" title="Deployment owner">{instanceSymbol(owner)} {owner?.name ?? 'Owner not connected'}</span>
+            <span class="pill" title={`Deployment owner: ${owner?.name ?? 'Owner not connected'}`} aria-label={`Deployment owner: ${owner?.name ?? 'Owner not connected'}`}>{instanceSymbol(owner)}</span>
           {:else}
-            <label class="instance-target">Run on
-              <select class="wlselect" value={owner?.id ?? preferred} onchange={(e) => chooseInstance(e.currentTarget.value)} aria-label="Instance for new work" disabled={busy !== null}>
-                {#each instances.filter((i) => i.repos.some((r) => r.repo.id === sid)) as item (item.id)}<option value={item.id} disabled={!item.online}>{item.name}{item.online ? '' : ' (offline)'}</option>{/each}
+            <label class="instance-target">
+              <select class="wlselect" title={`Run on ${owner?.name ?? 'selected instance'}`} value={owner?.id ?? preferred} onchange={(e) => chooseInstance(e.currentTarget.value)} aria-label="Instance for new work" disabled={busy !== null}>
+                {#each instances.filter((i) => i.repos.some((r) => r.repo.id === sid)) as item (item.id)}<option value={item.id} disabled={!item.online} label={`${instanceSymbol(item)}${item.online ? '' : ' offline'}`}>{item.name}</option>{/each}
               </select>
             </label>
           {/if}
@@ -418,20 +417,20 @@
 
       <div class="meta">
         {#if selected.repo.parentId}
-          <span>· branch {selected.repo.branch}</span>
           <span>· url /{selected.repo.id}/</span>
         {/if}
-        <span>· {view?.pods.length ?? 0} pod{(view?.pods.length ?? 0) === 1 ? '' : 's'}</span>
-        {#if vstatus === 'DEPLOYED'}<span>· deployment present</span>{/if}
+        <span>{view?.pods.length ?? 0} pod{(view?.pods.length ?? 0) === 1 ? '' : 's'}</span>
         {#if selected.repo.ports.length}<span>· :{selected.repo.ports.join(' :')}</span>{/if}
+        {#if !view?.unavailable}
+          {#key ownerEndpoint + sid + swl}
+            <WorkflowPanel repo={sid} workload={wl} instance={ownerEndpoint} onoperation={(operation) => activeOperation = operation} />
+          {/key}
+        {/if}
       </div>
 
       {#if view?.unavailable}
         <div class="placeholder"><p>{owner ? `${owner.name} is unavailable or ownership could not be verified.` : 'Connect the instance that owns this deployment.'} Existing ownership is preserved.</p></div>
       {:else}
-      {#key ownerEndpoint + sid + swl}
-        <WorkflowPanel repo={sid} workload={wl} instance={ownerEndpoint} onoperation={(operation) => activeOperation = operation} />
-      {/key}
       <div class="streams">
         <div class="block">
           <div class="bhead"><h3>Logs</h3></div>
@@ -515,7 +514,6 @@
 
 <style>
   .instance-target { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; }
-  .context-machine { color: var(--muted); font-size: 11px; }
   header {
     display: flex;
     align-items: center;

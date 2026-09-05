@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { beginOperation, fetchCheckout, fetchOperations, runPrerequisites, type Checkout, type CheckResult, type Operation } from './api'
+  import { fetchCheckout, fetchOperations, runPrerequisites, type Checkout, type CheckResult, type Operation } from './api'
   let { repo, workload, instance, onoperation }: { repo: string; workload?: string; instance: string; onoperation: (operation: Operation | null) => void } = $props()
   let checkout = $state<Checkout | null>(null)
   let operation = $state<Operation | null>(null)
@@ -7,6 +7,7 @@
   let busy = $state(false)
   let error = $state('')
   let now = $state(Date.now())
+  let dismissed = $state('')
   $effect(() => {
     const id = repo, type = workload, machine = instance
     let disposed = false
@@ -35,58 +36,60 @@
     catch (e) { error = e instanceof Error ? e.message : 'Checks unavailable' }
     finally { busy = false }
   }
-  async function verify() {
-    busy = true
-    try { operation = await beginOperation(repo, 'verify', workload, instance); onoperation(operation); error = '' }
-    catch (e) { error = e instanceof Error ? e.message : 'Cannot start verification' }
-    finally { busy = false }
-  }
 </script>
 
 <div class="workflow">
-  <div class="checkout" title="Checkout on this machine, not a pod-sync guarantee">
-    <span class="muted">checkout</span>
+  <details class="checkout">
+    <summary title="Checkout details, not a pod-sync guarantee">
     {#if checkout}
-      <span>{checkout.machine}</span><code>{checkout.path}</code>
-      <span>{checkout.branch ?? 'detached / unknown'}</span><code>{checkout.commit ?? 'commit unknown'}</code>
+      <span class="branch">{checkout.branch ?? 'detached / unknown'}</span><span>·</span><code>{checkout.commit?.slice(0, 7) ?? 'unknown'}</code>
       {#if checkout.dirty !== false}<span class="dirty">{checkout.dirty === null ? 'changes unknown' : 'modified'}</span>{/if}
-    {:else}<span class="muted">unavailable</span>{/if}
-  </div>
-  <div class="controls">
+    {:else}<span class="muted">Checkout unavailable</span>{/if}
+    <span aria-hidden="true">⌄</span>
+    </summary>
+    <div class="checkout-detail">
+      {#if checkout}<code>{checkout.path}</code>{/if}
+      {#if error}<p class="error" role="alert">{error}</p>{/if}
+    </div>
+  </details>
+  <details class="checks-menu">
+    <summary>Checks</summary>
+    <div class="checkout-detail">
     <button disabled={busy || operation?.state === 'active'} onclick={check}>{busy ? 'Working…' : 'Check prerequisites'}</button>
-    <button disabled={busy || operation?.state === 'active'} onclick={verify} title="Deploy if stopped, start dev if needed, then check the configured endpoint">Deploy · dev · verify</button>
-    {#if operation}
-      <span class="state" class:failed={operation.state === 'failed' || operation.state === 'interrupted'}>{operation.state === 'active' ? operation.stage : operation.state}</span>
-      <span class="muted">{Math.max(0, Math.floor(((operation.state === 'active' ? now : operation.updatedAt) - operation.createdAt) / 1000))}s</span>
-    {/if}
-  </div>
-  {#if error}<p class="error" role="alert">{error}</p>{/if}
   {#if checks}
     {#if checks.length === 0}<p class="muted">No machine-specific prerequisites configured.</p>{/if}
     {#each checks as check (check.id)}<div class="check"><span class:failed={check.status !== 'passed'}>{check.status}</span> {check.label} <span class="muted">{check.detail}</span></div>{/each}
   {/if}
-  {#if operation}
-    <details>
-      <summary>Operation <code>{operation.id.slice(0, 8)}</code></summary>
+    </div>
+  </details>
+  {#if operation && (operation.state === 'active' || ((operation.state === 'failed' || operation.state === 'interrupted') && dismissed !== operation.id))}
+    <details class="operation">
+      <summary class:failed={operation.state !== 'active'}>{operation.state === 'active' ? 'Activity' : operation.state} · {Math.max(0, Math.floor(((operation.state === 'active' ? now : operation.updatedAt) - operation.createdAt) / 1000))}s</summary>
+      <div class="checkout-detail">
       <code class="muted">{operation.id} · {operation.namespace}</code>
       {#each operation.checks as check (check.id)}<div class="check"><span class:failed={check.status !== 'passed'}>{check.status}</span> {check.label} <span class="muted">{check.detail}</span></div>{/each}
       {#each operation.logs as line}<div class="log"><time>{new Date(line.at).toLocaleTimeString()}</time> {line.message}</div>{/each}
+      </div>
     </details>
+    {#if operation.state !== 'active'}<button class="dismiss" aria-label="Dismiss operation failure" onclick={() => dismissed = operation!.id}>×</button>{/if}
   {/if}
 </div>
 
 <style>
-  .workflow { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; font-size: 12px; }
-  .checkout, .controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-  .checkout { margin-bottom: 8px; }
+  .workflow { display: flex; gap: 16px; align-items: center; min-width: 0; font-size: 12px; }
+  .checkout { min-width: 0; }
+  .checkout summary { display: flex; gap: 8px; align-items: center; }
+  .branch { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 240px; }
+  .checkout-detail { position: absolute; z-index: 20; top: 100%; left: 0; margin-top: 8px; padding: 12px; width: max-content; max-width: min(520px, 75vw); max-height: 320px; overflow: auto; background: var(--panel, #161d25); border: 1px solid var(--line); border-radius: 6px; box-shadow: 0 8px 24px #0006; }
   code { overflow-wrap: anywhere; }
   .muted, time { color: var(--muted); }
   .dirty { color: #e0b962; }
   .failed, .error { color: #f87171; }
-  .state { color: var(--accent); }
   button { font: inherit; color: var(--ink); background: var(--surface, #18202a); border: 1px solid var(--line); border-radius: 5px; padding: 5px 8px; cursor: pointer; }
   button:disabled { opacity: .5; cursor: default; }
-  details { margin-top: 8px; }
+  details { position: relative; }
   summary { cursor: pointer; color: var(--muted); }
+  summary:hover { color: var(--ink); }
+  .dismiss { border: 0; background: transparent; padding: 0 4px; color: var(--muted); }
   .check, .log { margin-top: 6px; overflow-wrap: anywhere; }
 </style>
