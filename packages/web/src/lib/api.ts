@@ -77,6 +77,73 @@ export interface RepoState {
 }
 
 export type Verb = 'start' | 'build' | 'build_start' | 'restart' | 'destroy'
+export interface Operation {
+  id: string
+  repo: string
+  workload: string
+  namespace: string
+  action: Verb | 'verify'
+  state: 'active' | 'succeeded' | 'failed' | 'interrupted'
+  stage: 'checking' | 'deploying' | 'starting' | 'stopping' | 'waiting' | 'verifying'
+  createdAt: number
+  updatedAt: number
+  checks: CheckResult[]
+  logs: { at: number; message: string }[]
+}
+export interface CheckResult {
+  id: string
+  label: string
+  status: 'passed' | 'failed' | 'unknown'
+  detail: string
+}
+export interface Checkout {
+  machine: string
+  path: string
+  branch: string | null
+  commit: string | null
+  dirty: boolean | null
+  checkedAt: number
+}
+async function workflowRequest<T>(path: string, instance: string, body?: object): Promise<T> {
+  const response = await fetch(
+    path,
+    body
+      ? {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body),
+        }
+      : undefined,
+    instance,
+  )
+  if (!response.ok) {
+    const error = (await response.json()) as { error?: string }
+    throw new Error(error.error ?? 'Workflow request failed')
+  }
+  return response.json()
+}
+export const beginOperation = (
+  repo: string,
+  action: Verb | 'verify',
+  workload: string | undefined,
+  instance: string,
+) =>
+  workflowRequest<Operation>(`/repos/${encodeURIComponent(repo)}/operations`, instance, {
+    action,
+    workload,
+  })
+export const fetchOperations = (repo: string, instance: string) =>
+  workflowRequest<Operation[]>(`/operations?repo=${encodeURIComponent(repo)}`, instance)
+export const fetchCheckout = (repo: string, workload: string | undefined, instance: string) =>
+  workflowRequest<Checkout>(
+    `/repos/${encodeURIComponent(repo)}/checkout${workload ? `?workload=${encodeURIComponent(workload)}` : ''}`,
+    instance,
+  )
+export const runPrerequisites = (repo: string, workload: string | undefined, instance: string) =>
+  workflowRequest<CheckResult[]>(`/repos/${encodeURIComponent(repo)}/prerequisites`, instance, {
+    action: 'verify',
+    workload,
+  })
 
 /** The global namespace view — the kube context's current namespace plus every
  *  namespace devdock has learned (cluster-wide listing is RBAC-forbidden). */

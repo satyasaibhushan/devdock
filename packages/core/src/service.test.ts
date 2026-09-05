@@ -14,6 +14,7 @@ import type { AuthManager } from './auth.js'
 import type { AwsCreds } from './awsCreds.js'
 import { type RunResult, loginShell } from './exec.js'
 import type { SpawnFn } from './logTailer.js'
+import { Operations } from './operations.js'
 import { PtyBroker } from './ptyBroker.js'
 import { Service } from './service.js'
 import { StateStore } from './stateStore.js'
@@ -29,7 +30,10 @@ beforeEach(() => {
     'name: svc-a\nnamespace: ns\ndeployments:\n  app: {}\n',
   )
 })
-afterEach(() => rmSync(root, { recursive: true, force: true }))
+afterEach(() => {
+  rmSync(root, { recursive: true, force: true })
+  vi.unstubAllGlobals()
+})
 
 /** A runner that returns canned results based on the command. */
 function cannedRunner(podsJson: string, sessionExists: boolean, deploymentsJson = '{"items":[]}') {
@@ -59,6 +63,170 @@ function fakeStreamSpawner() {
 }
 
 describe('Service', () => {
+  it('completes the deploy-dev-verify workflow only after readiness and a matching HTTP response', async () => {
+    writeFileSync(
+      join(root, 'workflow.json'),
+      JSON.stringify({
+        verification: { 'svc-a': { url: 'https://example.invalid/health', contains: 'healthy' } },
+      }),
+    )
+    const svc = new Service(
+      { roots: [root], stateFile },
+      { runner: cannedRunner('{"items":[]}', false) },
+    )
+    svc.rescan()
+    const stopped = await svc.reconcileOne('svc-a')
+    const ready = {
+      ...stopped,
+      workloads: stopped.workloads.map((w) => ({
+        ...w,
+        status: 'RUNNING_MANAGED' as const,
+        hasSession: true,
+        pods: [{ name: 'svc-a-devspace', phase: 'Running', ready: true, restartCount: 0 }],
+      })),
+    }
+    vi.spyOn(svc, 'reconcileOne').mockResolvedValueOnce(stopped).mockResolvedValue(ready)
+    const lifecycle = vi
+      .spyOn(svc, 'lifecycle')
+      .mockResolvedValue({ code: 0, stdout: '', stderr: '' })
+    const fetch = vi.fn(async () => new Response('healthy', { status: 200 }))
+    vi.stubGlobal('fetch', fetch)
+    const op = await svc.beginOperation('svc-a', 'verify')
+    await vi.waitFor(() => expect(svc.getOperation(op.id).state).toBe('succeeded'))
+    expect(lifecycle).toHaveBeenCalledWith('svc-a', 'build_start', undefined, op.id)
+    expect(svc.getOperation(op.id).logs.map((l) => l.message)).toContain('verifying')
+    expect(fetch).toHaveBeenCalledTimes(1)
+  })
+  it('marks an uncertain deployment interrupted after restart without replaying it', async () => {
+    const receipts = new Operations(`${stateFile}.operations`)
+    const op = receipts.create('svc-a', '', 'ns', 'build')
+    receipts.update(op.id, { stage: 'deploying' })
+    const svc = new Service(
+      { roots: [root], stateFile },
+      { runner: cannedRunner('{"items":[]}', false), streamSpawner: fakeStreamSpawner().spawner },
+    )
+    const build = vi.spyOn(svc, 'build')
+    const start = vi.spyOn(svc, 'start')
+    await svc.startLoop()
+    try {
+      expect(svc.getOperation(op.id).state).toBe('interrupted')
+      expect(build).not.toHaveBeenCalled()
+      expect(start).not.toHaveBeenCalled()
+    } finally {
+      svc.stopLoop()
+    }
+  })
+  it('does not crash recovery when an operation checkout has been removed', async () => {
+    const receipts = new Operations(`${stateFile}.operations`)
+    const op = receipts.create('removed-repo', '', 'ns', 'start')
+    receipts.update(op.id, { stage: 'waiting' })
+    const svc = new Service(
+      { roots: [root], stateFile },
+      { runner: cannedRunner('{"items":[]}', false), streamSpawner: fakeStreamSpawner().spawner },
+    )
+    await svc.startLoop()
+    try {
+      expect(svc.getOperation(op.id).state).toBe('interrupted')
+    } finally {
+      svc.stopLoop()
+    }
+  })
+  it('resumes observation of a verified surviving session without starting it again', async () => {
+    const receipts = new Operations(`${stateFile}.operations`)
+    const op = receipts.create('svc-a', '', 'ns', 'start')
+    receipts.update(op.id, { stage: 'waiting' })
+    new StateStore(stateFile).setSessionNamespace('svc-a', 'ns')
+    const pods = JSON.stringify({
+      items: [
+        {
+          metadata: { name: 'svc-a-devspace-1' },
+          status: { phase: 'Running', containerStatuses: [{ ready: true, restartCount: 0 }] },
+        },
+      ],
+    })
+    const svc = new Service(
+      { roots: [root], stateFile },
+      { runner: cannedRunner(pods, true), streamSpawner: fakeStreamSpawner().spawner },
+    )
+    const start = vi.spyOn(svc, 'start')
+    await svc.startLoop()
+    try {
+      await vi.waitFor(() => expect(svc.getOperation(op.id).state).toBe('succeeded'))
+      expect(svc.getOperation(op.id).logs.some((l) => l.message.includes('Reconnected'))).toBe(true)
+      expect(start).not.toHaveBeenCalled()
+    } finally {
+      svc.stopLoop()
+    }
+  })
+  it('returns one operation ID for concurrent requests and keeps completed receipts', async () => {
+    const svc = new Service(
+      { roots: [root], stateFile },
+      { runner: cannedRunner('{"items":[]}', false) },
+    )
+    svc.rescan()
+    let complete!: (result: RunResult) => void
+    const lifecycle = vi.spyOn(svc, 'lifecycle').mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          complete = resolve
+        }),
+    )
+    const [a, b] = await Promise.all([
+      svc.beginOperation('svc-a', 'build'),
+      svc.beginOperation('svc-a', 'build'),
+    ])
+    expect(a.id).toBe(b.id)
+    await vi.waitFor(() => expect(lifecycle).toHaveBeenCalledTimes(1))
+    await expect(svc.beginOperation('svc-a', 'destroy')).rejects.toThrow('active operation')
+    complete({ code: 0, stdout: '', stderr: '' })
+    await vi.waitFor(() => expect(svc.getOperation(a.id).state).toBe('succeeded'))
+    const restarted = new Service(
+      { roots: [root], stateFile },
+      { runner: cannedRunner('{"items":[]}', false) },
+    )
+    expect(restarted.getOperation(a.id).logs.at(-1)?.message).toBe('Completed')
+  })
+  it('blocks an operation and direct start before auth or deployment when a prerequisite is unknown', async () => {
+    writeFileSync(
+      join(root, 'workflow.json'),
+      JSON.stringify({ prerequisites: [{ id: 'vpn', label: 'VPN', command: ['probe-vpn'] }] }),
+    )
+    const base = cannedRunner('{"items":[]}', false)
+    const runner = vi.fn(async (cmd: string, args: string[]) =>
+      cmd === 'probe-vpn' ? { code: 2, stdout: 'hidden', stderr: 'hidden' } : base(cmd, args),
+    )
+    const svc = new Service({ roots: [root], stateFile }, { runner })
+    svc.rescan()
+    const lifecycle = vi.spyOn(svc, 'lifecycle')
+    const operation = await svc.beginOperation('svc-a', 'build')
+    await vi.waitFor(() => expect(svc.getOperation(operation.id).state).toBe('failed'))
+    expect(svc.getOperation(operation.id).checks[0]?.status).toBe('unknown')
+    expect(lifecycle).not.toHaveBeenCalled()
+    expect((await svc.start('svc-a')).code).toBe(2)
+    expect(JSON.stringify(svc.getOperation(operation.id))).not.toContain('hidden')
+    expect(base.mock.calls.some(([cmd]) => cmd === 'tmux')).toBe(false)
+  })
+  it('reports checkout metadata without reading or returning file contents', async () => {
+    const runner = vi.fn(async (_cmd: string, args: string[]) => ({
+      code: 0,
+      stderr: '',
+      stdout:
+        args[0] === 'symbolic-ref'
+          ? 'main\n'
+          : args[0] === 'rev-parse'
+            ? 'abcdef012345\n'
+            : ' M app.php\n',
+    }))
+    const svc = new Service({ roots: [root], stateFile }, { runner })
+    svc.rescan()
+    expect(await svc.checkout('svc-a')).toMatchObject({
+      path: join(root, 'svc-a'),
+      branch: 'main',
+      commit: 'abcdef012345',
+      dirty: true,
+    })
+    expect(runner.mock.calls.every(([cmd]) => cmd === 'git')).toBe(true)
+  })
   it('opens normal repo terminals on the host and retains their panel scope', async () => {
     const spawn = vi.fn(() => ({ onData() {}, onExit() {}, write() {}, resize() {}, kill() {} }))
     const broker = new PtyBroker(spawn)

@@ -9,6 +9,8 @@
   import RepoList from './lib/RepoList.svelte'
   import StartupModal from './lib/StartupModal.svelte'
   import TerminalPanel from './lib/TerminalPanel.svelte'
+  import WorkflowPanel from './lib/WorkflowPanel.svelte'
+  import { beginOperation, type Operation } from './lib/api'
   import {
     type AuthState,
     type InstanceView,
@@ -21,7 +23,6 @@
     fetchNamespace,
     fetchInstances,
     openEvents,
-    runVerb,
     switchNamespace,
     stopSession,
   } from './lib/api'
@@ -60,6 +61,7 @@
   let pickedType = $state<string | null>(null)
   let connected = $state(false)
   let busy = $state<{ id: string; verb: Verb } | null>(null)
+  let activeOperation = $state<Operation | null>(null)
   let toast = $state<string | null>(null)
   // The kube context's namespace + the selectable list (null until first fetch).
   let nsInfo = $state<NamespaceInfo | null>(null)
@@ -213,7 +215,7 @@
     if (!id || busy) return
     busy = { id, verb }
     try {
-      await runVerb(id, verb, workload, target(id, workload))
+      await beginOperation(id, verb, workload, target(id, workload))
       await refresh()
     } catch (e) {
       toast = `${verb} failed: ${e instanceof Error ? e.message : String(e)}`
@@ -318,7 +320,7 @@
       title="shells on this machine — shared with agents"
       onclick={() => (selectedId = HOST_ID)}
     >
-      <span class="hicon">❯_</span> host terminals
+      <span class="hicon">❯_</span> all terminals
     </button>
   </aside>
 
@@ -326,7 +328,7 @@
     {#if selectedId === HOST_ID}
       <div class="head">
         <div class="title">
-          <h2>host</h2>
+          <h2>All terminals</h2>
           <label class="instance-target">On
             <select class="wlselect" value={preferred} onchange={(e) => chooseInstance(e.currentTarget.value)} aria-label="Host terminal machine">
               {#each instances as item (item.id)}<option value={item.id}>{item.name}{item.online ? '' : ' (offline)'}</option>{/each}
@@ -335,13 +337,13 @@
         </div>
       </div>
       <div class="meta">
-        <span>login shells on this machine — the same host:t1/t2/… terminals agents use</span>
+        <span>Every live DevDock terminal on this machine, including agent-created sessions</span>
       </div>
       <div class="streams solo">
         <div class="block">
           <div class="bhead"><h3>Terminal</h3></div>
           {#key preferred}
-            {#if preferredInstance?.online}<TerminalPanel instance={preferredEndpoint} />
+            {#if preferredInstance?.online}<TerminalPanel instance={preferredEndpoint} machine={preferredInstance.name} all />
             {:else}<p class="placeholder">This instance is offline.</p>{/if}
           {/key}
         </div>
@@ -390,7 +392,7 @@
           {:else if workloadLabel}
             <span class="tag">{workloadLabel}</span>
           {/if}
-          <span class="pill {vstatus}">{vstatus.replace('_', ' ').toLowerCase()}</span>
+          <span class="pill {vstatus}">{activeOperation?.repo === sid ? activeOperation.stage : vstatus === 'BUILDING' ? 'starting' : vstatus.replace('_', ' ').toLowerCase()}</span>
         </div>
         <div class="actions">
           {#if view?.hasSession && !view.unavailable}
@@ -407,7 +409,7 @@
           {#each verbs as v (v)}
             <button
               class:danger={v === 'destroy'}
-              disabled={busy !== null || adoptBusy || stoppingSession}
+              disabled={busy !== null || adoptBusy || stoppingSession || activeOperation !== null}
               onclick={() => act(v, sid, wl)}
             >{v === 'build_start' ? 'build + start' : v}</button>
           {/each}
@@ -415,7 +417,6 @@
       </div>
 
       <div class="meta">
-        <code>{selected.repo.path}</code>
         {#if selected.repo.parentId}
           <span>· branch {selected.repo.branch}</span>
           <span>· url /{selected.repo.id}/</span>
@@ -428,6 +429,9 @@
       {#if view?.unavailable}
         <div class="placeholder"><p>{owner ? `${owner.name} is unavailable or ownership could not be verified.` : 'Connect the instance that owns this deployment.'} Existing ownership is preserved.</p></div>
       {:else}
+      {#key ownerEndpoint + sid + swl}
+        <WorkflowPanel repo={sid} workload={wl} instance={ownerEndpoint} onoperation={(operation) => activeOperation = operation} />
+      {/key}
       <div class="streams">
         <div class="block">
           <div class="bhead"><h3>Logs</h3></div>
@@ -439,7 +443,7 @@
         <div class="block">
           <div class="bhead"><h3>Terminal</h3></div>
           {#key ownerEndpoint + sid + swl}
-            <TerminalPanel repo={sid} workload={wl} attach={sterm} instance={ownerEndpoint} />
+            <TerminalPanel repo={sid} workload={wl} attach={sterm} instance={ownerEndpoint} machine={owner?.name ?? 'machine'} />
           {/key}
         </div>
       </div>
@@ -717,9 +721,6 @@
     flex-wrap: wrap;
     font-size: 12px;
     color: var(--muted);
-  }
-  .meta code {
-    font-size: 12px;
   }
 
   .streams {

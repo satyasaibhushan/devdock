@@ -6,14 +6,17 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type {
   AuthState,
+  CheckResult,
   LogQueryResult,
   LogSource,
   NamespaceInfo,
+  Operation,
   ReplicaRecord,
   RepoState,
   RunOutcome,
   TermInfo,
   WaitResult,
+  WorkflowAction,
   WorkloadRunResult,
 } from '@devdock/core'
 
@@ -64,6 +67,11 @@ export interface WaitOpts {
 
 /** The subset of the daemon HTTP contract the MCP tools call. */
 export interface DaemonClient {
+  beginOperation?(repo: string, action: WorkflowAction, workload?: string): Promise<Operation>
+  operations?(repo?: string): Promise<Operation[]>
+  operation?(id: string): Promise<Operation>
+  prerequisites?(repo: string, action: WorkflowAction, workload?: string): Promise<CheckResult[]>
+  checkout?(repo: string, workload?: string): Promise<unknown>
   instances?(): Promise<unknown[]>
   forInstance?(id: string): DaemonClient
   linkInstance?(host: string, endpoint: string, terminals?: boolean): Promise<unknown>
@@ -180,6 +188,13 @@ export function httpClient(
   })
 
   return {
+    beginOperation: (repo, action, workload) =>
+      post(`/repos/${id(repo)}/operations`, { action, workload }),
+    operations: (repo) => request(`/operations${repo ? `?repo=${id(repo)}` : ''}`),
+    operation: (operation) => request(`/operations/${id(operation)}`),
+    prerequisites: (repo, action, workload) =>
+      post(`/repos/${id(repo)}/prerequisites`, { action, workload }),
+    checkout: (repo, workload) => request(`/repos/${id(repo)}/checkout${wl(workload)}`),
     instances: () => request<unknown[]>('/instances'),
     forInstance: (instance) =>
       httpClient(

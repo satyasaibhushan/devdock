@@ -1,6 +1,7 @@
 <script lang="ts">
   import { createTerminal, deleteTerminal, fetchTerminals, type TermInfo } from './api'
   import Terminal from './Terminal.svelte'
+  import { terminalVisible, terminalLabel } from './terminalContext'
 
   // Tabs mirror the daemon's terminal registry — the same scope-qualified
   // sessions (`repo:t1`, `repo.workload:t1`, `host:t1`) agents open over MCP
@@ -21,7 +22,9 @@
     repo,
     workload,
     attach = 'none',
-  }: { instance?: string; repo?: string; workload?: string; attach?: 'tmux' | 'pod' | 'none' } = $props()
+    machine = 'machine',
+    all = false,
+  }: { instance?: string; repo?: string; workload?: string; attach?: 'tmux' | 'pod' | 'none'; machine?: string; all?: boolean } = $props()
 
   let terms = $state<TermInfo[]>([])
   let activeTid = $state<string | null>(null)
@@ -63,16 +66,11 @@
   // window (or an agent) can be writing to the same terminal regardless.
   let viewer = $state<Record<string, 'ro' | 'rw'>>({})
 
-  const mine = (t: TermInfo): boolean =>
-    repo
-      ? t.repo === repo && (t.workload ?? '') === (workload ?? '')
-      : t.kind === 'local'
-
   async function refresh() {
     try {
-      const all = await fetchTerminals(instance)
-      terms = all
-        .filter((t) => t.alive && mine(t))
+      const registered = await fetchTerminals(instance)
+      terms = registered
+        .filter((t) => terminalVisible(t, all, repo, workload))
         .sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id))
       if (!terms.some((t) => t.id === activeTid)) activeTid = terms.at(-1)?.id ?? null
     } catch {
@@ -144,8 +142,7 @@
   }
 
   function label(t: TermInfo): string {
-    if (t.kind === 'auto') return t.attach === 'tmux' ? 'devspace dev' : 'pod shell'
-    return t.kind === 'shell' ? 'devspace shell' : 'normal shell'
+    return terminalLabel(t, machine)
   }
 
   // Badge shows just the per-scope number — the panel already names the scope.
@@ -195,6 +192,7 @@
         onkeydown={(event) => { if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) openMenu(event) }}
         onclick={() => add()}>+</button
       >
+      <button class="add" title="Terminal options" aria-label="Terminal options" aria-haspopup="menu" aria-expanded={menuOpen} onclick={openMenu}>⌄</button>
     </div>
 
     <div class="tools">

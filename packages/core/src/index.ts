@@ -2,6 +2,8 @@
 // Everything else (daemon HTTP/WS, MCP) is a thin caller of these.
 
 export * from './types.js'
+export * from './workflow.js'
+export { Operations, type Operation, type OperationStage } from './operations.js'
 export { DeploymentOwnership } from './ownership.js'
 export {
   lifecycleActions,

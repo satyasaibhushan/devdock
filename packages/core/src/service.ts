@@ -2,6 +2,7 @@
 // transport-free verbs that the daemon (HTTP/WS) and MCP both call.
 import { EventEmitter } from 'node:events'
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
+import { hostname } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { AuthManager, type AuthState } from './auth.js'
 import { type AwsCredential, AwsCreds } from './awsCreds.js'
@@ -10,6 +11,7 @@ import { type RunResult, run, runStream, spawnStream } from './exec.js'
 import { type LifecycleAction, lifecyclePlan } from './lifecycle.js'
 import { decodeCursor, encodeCursor, readFileSlice } from './logQuery.js'
 import { LogHub, LogTailer, type SpawnFn, cleanLine } from './logTailer.js'
+import { type Operation, type OperationStage, Operations } from './operations.js'
 import { DeploymentOwnership } from './ownership.js'
 import { PtyBroker } from './ptyBroker.js'
 import { type ClusterCache, Reconciler, newClusterCache } from './reconciler.js'
@@ -24,6 +26,13 @@ import { type ReplicaRecord, StateStore } from './stateStore.js'
 import { type SessionState, type StreamRunner, Supervisor, verbLabel } from './supervisor.js'
 import { type RunOutcome, type TermInfo, type TermKind, TermRegistry } from './termRegistry.js'
 import type { Repo, RepoState, RepoStatus, TermMode } from './types.js'
+import {
+  type CheckResult,
+  type WorkflowAction,
+  checkPrerequisites,
+  loadWorkflowConfig,
+  verifyEndpoint,
+} from './workflow.js'
 import {
   assembleState,
   resolveWorkload,
@@ -230,6 +239,9 @@ export class Service {
   private readonly awsCreds: AwsCreds
   /** All terminals: id → live PTY session + scrollback (spec §8). */
   private readonly terms = new TermRegistry()
+  private readonly operations: Operations
+  private readonly operationTasks = new Map<string, Promise<void>>()
+  private stopped = false
   /** In-flight `auto` terminal opens by workload key — concurrent requests
    *  (two browser tabs, an agent and the UI) share one open instead of racing
    *  the tmux write-lock. */
@@ -293,6 +305,198 @@ export class Service {
     this.runner = baseRunner
     this.streamSpawner = deps.streamSpawner ?? spawnStream
     this.store = new StateStore(this.opts.stateFile)
+    this.operations = new Operations(`${this.opts.stateFile}.operations`)
+  }
+
+  async checkout(id: string, workload?: string) {
+    const { repo } = this.scoped(id, workload)
+    const options = { cwd: repo.path, timeoutMs: 5000, maxOutputBytes: 16384 }
+    const [branch, commit, dirty] = await Promise.all([
+      this.runner('git', ['symbolic-ref', '--short', '-q', 'HEAD'], options),
+      this.runner('git', ['rev-parse', '--short=12', 'HEAD'], options),
+      this.runner('git', ['status', '--porcelain', '--untracked-files=normal'], options),
+    ])
+    return {
+      machine: hostname(),
+      path: repo.path,
+      branch: branch.code === 0 ? branch.stdout.trim() : null,
+      commit: commit.code === 0 ? commit.stdout.trim() : null,
+      dirty: dirty.code === 0 ? !!dirty.stdout.trim() : null,
+      checkedAt: Date.now(),
+    }
+  }
+
+  private workflowConfig() {
+    return loadWorkflowConfig(join(dirname(this.opts.stateFile), 'workflow.json'))
+  }
+
+  async prerequisites(
+    id: string,
+    action: WorkflowAction,
+    workload?: string,
+  ): Promise<CheckResult[]> {
+    const { repo, type } = this.scoped(id, workload)
+    try {
+      const config = this.workflowConfig()
+      if (!config.prerequisites.length) return []
+      return await checkPrerequisites(
+        config.prerequisites,
+        action,
+        repo.path,
+        {
+          ...process.env,
+          DEVDOCK_REPO: id,
+          DEVDOCK_WORKLOAD: type ?? '',
+          DEVDOCK_NAMESPACE: repo.namespace ?? (await this.contextNamespace()) ?? 'default',
+        },
+        this.runner,
+      )
+    } catch {
+      return [
+        {
+          id: 'configuration',
+          label: 'Machine prerequisites',
+          status: 'unknown',
+          detail: 'Cannot read valid workflow.json',
+        },
+      ]
+    }
+  }
+
+  listOperations(repo?: string): Operation[] {
+    return this.operations.list(repo)
+  }
+  getOperation(id: string): Operation {
+    return this.operations.get(id)
+  }
+
+  async beginOperation(id: string, action: WorkflowAction, workload?: string): Promise<Operation> {
+    const { repo, type, key } = this.scoped(id, workload)
+    const namespace = repo.namespace || (await this.contextNamespace()) || 'default'
+    const prior = this.operations.active(id, type ?? '')
+    if (prior) {
+      if (prior.action !== action || prior.namespace !== namespace)
+        throw new Error(`Workload already has active operation ${prior.id}`)
+      return prior
+    }
+    if (action === 'verify' && !this.workflowConfig().verification[id])
+      throw new Error('Configure a verification URL for this repo first')
+    const record = this.operations.create(id, type ?? '', namespace, action)
+    // Pin all later steps, including recovery, to the namespace this request selected.
+    this.store.setSessionNamespace(key, namespace)
+    this.trackOperation(record, false)
+    return record
+  }
+
+  private trackOperation(record: Operation, resume: boolean): void {
+    const task = this.executeOperation(record, resume)
+      .catch((error: unknown) => {
+        if (!this.stopped && this.operations.get(record.id).state === 'active')
+          this.operations.update(
+            record.id,
+            { state: 'failed' },
+            error instanceof Error ? error.message : 'Operation failed',
+          )
+      })
+      .finally(() => this.operationTasks.delete(record.id))
+    this.operationTasks.set(record.id, task)
+    void task.catch(() => undefined)
+  }
+
+  private operationStage(id: string, workload: string | undefined, stage: OperationStage): void {
+    const op = this.operations.active(id, this.scoped(id, workload).type ?? '')
+    if (op) this.operations.update(op.id, { stage }, stage)
+  }
+
+  private async executeOperation(op: Operation, resume: boolean): Promise<void> {
+    const workload = op.workload || undefined
+    if (!resume) {
+      const checks = await this.prerequisites(op.repo, op.action, workload)
+      this.operations.update(op.id, { checks }, 'Machine prerequisites checked')
+      if (checks.some((c) => c.status !== 'passed')) throw new Error('Prerequisites did not pass')
+      if (this.stopped || this.operations.get(op.id).state !== 'active') return
+      let action = op.action
+      if (action === 'verify') {
+        const state = await this.reconcileOne(op.repo)
+        const selected = state.workloads.find((w) => w.type === op.workload)
+        if (selected?.unreachable) throw new Error('Cannot determine workload state')
+        const status = selected?.status ?? state.status
+        action = status === 'STOPPED' ? 'build_start' : status === 'DEPLOYED' ? 'start' : 'verify'
+        if (action === 'verify' && status !== 'RUNNING_MANAGED')
+          throw new Error('Workload is not ready for verification')
+      }
+      if (action !== 'verify') {
+        const result = await this.lifecycle(op.repo, action, workload, op.id)
+        if (result.code !== 0) throw new Error(result.stderr || `Operation exited ${result.code}`)
+      }
+    }
+    if (this.stopped || this.operations.get(op.id).state !== 'active') return
+    if (!['build', 'destroy'].includes(op.action)) {
+      this.operationStage(op.repo, workload, 'waiting')
+      let ready = false
+      while (
+        !this.stopped &&
+        this.operations.get(op.id).state === 'active' &&
+        Date.now() - op.createdAt < 30 * 60_000
+      ) {
+        const state = await this.reconcileOne(op.repo)
+        const selected = state.workloads.find((w) => w.type === op.workload)
+        if (selected && !selected.unreachable) {
+          if (
+            selected.hasSession &&
+            selected.pods.length > 0 &&
+            selected.pods.every((p) => p.ready)
+          ) {
+            ready = true
+            break
+          }
+          if (selected.status === 'CRASHED' || !selected.hasSession)
+            throw new Error('Dev session stopped before readiness')
+        }
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, 2000)
+          timer.unref?.()
+        })
+      }
+      if (this.stopped || this.operations.get(op.id).state !== 'active') return
+      if (!ready) throw new Error('Readiness timed out after 30 minutes')
+    }
+    if (op.action === 'verify') {
+      const check = this.workflowConfig().verification[op.repo]
+      if (!check) throw new Error('Verification configuration no longer exists')
+      this.operationStage(op.repo, workload, 'verifying')
+      await verifyEndpoint(check)
+    }
+    if (!this.stopped && this.operations.get(op.id).state === 'active')
+      this.operations.update(op.id, { state: 'succeeded' }, 'Completed')
+  }
+
+  private recoverOperations(): void {
+    for (const op of this.operations.list().filter((r) => r.state === 'active')) {
+      const state = this.states.get(op.repo)?.workloads.find((w) => w.type === op.workload)
+      let namespace: string | undefined
+      try {
+        namespace = this.store.getSessionNamespace(
+          this.scoped(op.repo, op.workload || undefined).key,
+        )
+      } catch {
+        /* checkout was removed */
+      }
+      if (
+        ['waiting', 'starting', 'verifying'].includes(op.stage) &&
+        state?.hasSession &&
+        !state.unreachable &&
+        namespace === op.namespace
+      ) {
+        this.operations.update(op.id, {}, 'Reconnected to surviving dev session')
+        this.trackOperation(op, true)
+      } else
+        this.operations.update(
+          op.id,
+          { state: 'interrupted' },
+          'Daemon restarted; surviving work could not be verified. Nothing was replayed.',
+        )
+    }
   }
 
   /** (Re)discover repos from the filesystem, then materialize replicas from
@@ -401,8 +605,25 @@ export class Service {
 
   /** Execute one state-checked lifecycle action. Every transport uses this
    *  interface so invalid actions cannot bypass the UI's buttons. */
-  async lifecycle(id: string, action: LifecycleAction, workload?: string): Promise<RunResult> {
+  async lifecycle(
+    id: string,
+    action: LifecycleAction,
+    workload?: string,
+    operationId?: string,
+  ): Promise<RunResult> {
     const { type } = this.scoped(id, workload)
+    const operation = this.operations.active(id, type ?? '')
+    if (operation && operation.id !== operationId)
+      return {
+        code: 2,
+        stdout: '',
+        stderr: `Workload already has active operation ${operation.id}`,
+      }
+    if (!operationId) {
+      const checks = await this.prerequisites(id, action, workload)
+      if (checks.some((c) => c.status !== 'passed'))
+        return { code: 2, stdout: '', stderr: 'Machine prerequisites did not pass' }
+    }
     const state = this.states.get(id) ?? (await this.reconcileOne(id))
     const selected = state.workloads.find((candidate) => candidate.type === (type ?? ''))
     if (selected?.unreachable) {
@@ -474,7 +695,11 @@ export class Service {
     const cancelled = () =>
       this.pausedSessions.has(key) || generation !== (this.sessionGenerations.get(key) ?? 0)
     const cancellation = { code: 1, stdout: '', stderr: 'Dev session start cancelled' }
+    const checks = await this.prerequisites(id, 'start', workload)
+    if (checks.some((c) => c.status !== 'passed'))
+      return { code: 2, stdout: '', stderr: 'Machine prerequisites did not pass' }
     if (cancelled()) return cancellation
+    this.operationStage(id, workload, 'starting')
     const denied = (await this.ensureAuth(key)) ?? (await this.ensureAwsCreds(key))
     if (denied) return denied
     let repo = scopedRepo
@@ -524,6 +749,10 @@ export class Service {
 
   async build(id: string, workload?: string): Promise<RunResult> {
     const { repo, key } = this.scoped(id, workload)
+    const checks = await this.prerequisites(id, 'build', workload)
+    if (checks.some((c) => c.status !== 'passed'))
+      return { code: 2, stdout: '', stderr: 'Machine prerequisites did not pass' }
+    this.operationStage(id, workload, 'deploying')
     const denied = (await this.ensureAuth(key)) ?? (await this.ensureAwsCreds(key))
     if (denied) return denied
     await this.claimOwnership(repo)
@@ -537,7 +766,20 @@ export class Service {
   /** Stop synchronization and forwarding only. Keep Kubernetes workloads and ownership. */
   async stopSession(id: string, workload?: string): Promise<RunResult> {
     const { repo, key } = this.scoped(id, workload)
+    const activeOperation = this.operations.active(id, this.scoped(id, workload).type ?? '')
+    if (activeOperation && ['deploying', 'stopping'].includes(activeOperation.stage))
+      return {
+        code: 2,
+        stdout: '',
+        stderr: 'Wait for deployment changes to finish before stopping the session',
+      }
     await this.claimOwnership(repo)
+    if (activeOperation)
+      this.operations.update(
+        activeOperation.id,
+        { state: 'interrupted' },
+        'Dev session stopped by request',
+      )
     this.pausedSessions.add(key)
     this.sessionGenerations.set(key, (this.sessionGenerations.get(key) ?? 0) + 1)
     this.reconnects.delete(key)
@@ -556,6 +798,7 @@ export class Service {
 
   async stop(id: string, workload?: string): Promise<RunResult> {
     const { repo, key } = this.scoped(id, workload)
+    this.operationStage(id, workload, 'stopping')
     const denied = await this.ensureAuth(key)
     if (denied) return denied
     await this.claimOwnership(repo)
@@ -577,6 +820,8 @@ export class Service {
    *  session lock without purge or rebuild (image/deployment stay as deployed). */
   async clear(id: string, workload?: string): Promise<RunResult> {
     const { repo, key } = this.scoped(id, workload)
+    if (this.operations.active(id, this.scoped(id, workload).type ?? ''))
+      return { code: 2, stdout: '', stderr: 'A workflow operation is active' }
     const denied = await this.ensureAuth(key)
     if (denied) return denied
     await this.claimOwnership(repo)
@@ -630,6 +875,8 @@ export class Service {
    *  of flickering as the sub-steps reconcile. */
   async adopt(id: string, workload?: string): Promise<RunResult> {
     const { repo, key } = this.scoped(id, workload)
+    if (this.operations.active(id, this.scoped(id, workload).type ?? ''))
+      return { code: 2, stdout: '', stderr: 'A workflow operation is active' }
     const denied = await this.ensureAuth(key)
     if (denied) return denied
     await this.claimOwnership(repo)
@@ -1889,6 +2136,8 @@ export class Service {
     await this.auth.init().catch(() => undefined)
     this.rescan()
     await this.reconcileAll()
+    this.stopped = false
+    this.recoverOperations()
     // Record ownership for already-running managed sessions after discovery.
     for (const state of this.list()) {
       for (const workload of state.workloads) {
@@ -1917,6 +2166,7 @@ export class Service {
   }
 
   stopLoop(): void {
+    this.stopped = true
     if (this.timer) clearInterval(this.timer)
     this.timer = undefined
     if (this.authTimer) clearInterval(this.authTimer)

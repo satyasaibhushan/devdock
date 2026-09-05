@@ -44,6 +44,36 @@ function makeService(start = vi.fn(), instanceId?: string) {
 }
 
 describe('daemon routes', () => {
+  it('returns an operation receipt without waiting for deployment and exposes the same ID on reads', async () => {
+    const { svc } = makeService()
+    let finish!: (result: RunResult) => void
+    vi.spyOn(svc, 'lifecycle').mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve
+        }),
+    )
+    const app = buildApp(svc)
+    const response = await app.inject({
+      method: 'POST',
+      url: '/repos/svc-a/operations',
+      payload: { action: 'build' },
+    })
+    expect(response.statusCode).toBe(202)
+    const receipt = response.json()
+    expect((await app.inject(`/operations/${receipt.id}`)).json().id).toBe(receipt.id)
+    const duplicate = await app.inject({
+      method: 'POST',
+      url: '/repos/svc-a/operations',
+      payload: { action: 'build' },
+    })
+    expect(duplicate.json().id).toBe(receipt.id)
+    await vi.waitFor(() => expect(finish).toBeTypeOf('function'))
+    finish({ code: 0, stdout: '', stderr: '' })
+    await vi.waitFor(() => expect(svc.getOperation(receipt.id).state).toBe('succeeded'))
+    expect((await app.inject('/operations?repo=svc-a')).json()).toHaveLength(1)
+    await app.close()
+  })
   it('routes stop-session separately from destructive stop', async () => {
     const { svc } = makeService()
     const stopSession = vi

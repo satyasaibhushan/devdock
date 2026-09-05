@@ -2,7 +2,7 @@
 import { existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import type { LifecycleAction, Service } from '@devdock/core'
+import type { LifecycleAction, Service, WorkflowAction } from '@devdock/core'
 import fastifyStatic from '@fastify/static'
 import Fastify, { type FastifyInstance } from 'fastify'
 import type { AccessGate } from './accessGate.js'
@@ -190,6 +190,56 @@ export function buildApp(
   })
 
   app.get('/repos', async () => service.listWithOwnership())
+
+  app.get<{ Params: { id: string }; Querystring: { workload?: string } }>(
+    '/repos/:id/checkout',
+    async (req) => service.checkout(req.params.id, req.query.workload),
+  )
+  const workflowActions = new Set(['build', 'build_start', 'start', 'restart', 'destroy', 'verify'])
+  app.post<{ Params: { id: string }; Body: { action?: string; workload?: string } }>(
+    '/repos/:id/prerequisites',
+    async (req, reply) => {
+      if (!workflowActions.has(req.body?.action ?? ''))
+        return reply.code(400).send({ error: 'Invalid workflow action' })
+      return service.prerequisites(
+        req.params.id,
+        req.body.action as WorkflowAction,
+        req.body.workload,
+      )
+    },
+  )
+  app.get<{ Querystring: { repo?: string } }>('/operations', async (req) =>
+    service.listOperations(req.query.repo),
+  )
+  app.get<{ Params: { id: string } }>('/operations/:id', async (req, reply) => {
+    try {
+      return service.getOperation(req.params.id)
+    } catch {
+      return reply.code(404).send({ error: 'Unknown operation' })
+    }
+  })
+  app.post<{ Params: { id: string }; Body: { action?: string; workload?: string } }>(
+    '/repos/:id/operations',
+    async (req, reply) => {
+      if (!workflowActions.has(req.body?.action ?? ''))
+        return reply.code(400).send({ error: 'Invalid workflow action' })
+      try {
+        return reply
+          .code(202)
+          .send(
+            await service.beginOperation(
+              req.params.id,
+              req.body.action as WorkflowAction,
+              req.body.workload,
+            ),
+          )
+      } catch (error) {
+        return reply
+          .code(409)
+          .send({ error: error instanceof Error ? error.message : 'Cannot start operation' })
+      }
+    },
+  )
 
   app.get<{ Params: { id: string } }>('/repos/:id', async (req, reply) => {
     const state = service.get(req.params.id)

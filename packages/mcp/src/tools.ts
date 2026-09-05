@@ -2,7 +2,7 @@
 // (verbs, exec, namespace/auth mutation, terminals) only when the server runs
 // with rw scope — this is the "ro/rw via token scope" gate. Each tool is a
 // thin call into the daemon client.
-import type { LogSource, RepoState } from '@devdock/core'
+import type { LogSource, RepoState, WorkflowAction } from '@devdock/core'
 import { z } from 'zod'
 import type { DaemonClient, RepoVerb, VerbResult } from './client.js'
 
@@ -72,6 +72,83 @@ const VERBS: Array<{ verb: RepoVerb; description: string }> = [
 /** All tool definitions, regardless of scope. */
 export function allTools(client: DaemonClient): ToolDef[] {
   return [
+    {
+      name: 'devdock_operation_start',
+      scope: 'rw',
+      description:
+        'Start durable background work and return its operation ID immediately. Repeated active requests reuse the operation. Poll devdock_operation_status. verify deploys if stopped, starts dev if needed, waits for readiness, then checks the machine-configured URL. Never replay interrupted work automatically.',
+      inputSchema: {
+        ...repoArg,
+        ...workloadArg,
+        action: z.enum(['build', 'build_start', 'start', 'restart', 'destroy', 'verify']),
+      },
+      handler: async (a) => {
+        if (!client.beginOperation) throw new Error('Daemon client does not support operations')
+        return JSON.stringify(
+          await client.beginOperation(
+            a.repo as string,
+            a.action as WorkflowAction,
+            a.workload as string | undefined,
+          ),
+        )
+      },
+    },
+    {
+      name: 'devdock_operation_status',
+      scope: 'ro',
+      description:
+        'Read a durable operation, its stage, prerequisite results and activity log. No deployment is started.',
+      inputSchema: { operation: z.string() },
+      handler: async (a) => {
+        if (!client.operation) throw new Error('Operations unsupported')
+        return JSON.stringify(await client.operation(a.operation as string))
+      },
+    },
+    {
+      name: 'devdock_operations',
+      scope: 'ro',
+      description:
+        'List active and recent operations on this instance; recover IDs after an agent disconnect.',
+      inputSchema: { repo: z.string().optional() },
+      handler: async (a) => {
+        if (!client.operations) throw new Error('Operations unsupported')
+        return JSON.stringify(await client.operations(a.repo as string | undefined))
+      },
+    },
+    {
+      name: 'devdock_prerequisites',
+      scope: 'rw',
+      description:
+        'Run only the prerequisite commands configured locally by this machine owner. Commands and their output are not exposed; returns passed, failed or unknown. Does not deploy or repair infrastructure.',
+      inputSchema: {
+        ...repoArg,
+        ...workloadArg,
+        action: z.enum(['build', 'build_start', 'start', 'restart', 'destroy', 'verify']),
+      },
+      handler: async (a) => {
+        if (!client.prerequisites) throw new Error('Prerequisites unsupported')
+        return JSON.stringify(
+          await client.prerequisites(
+            a.repo as string,
+            a.action as WorkflowAction,
+            a.workload as string | undefined,
+          ),
+        )
+      },
+    },
+    {
+      name: 'devdock_checkout',
+      scope: 'ro',
+      description:
+        'Read machine, checkout path, branch, commit and dirty status. Checkout metadata is not proof of pod sync.',
+      inputSchema: { ...repoArg, ...workloadArg },
+      handler: async (a) => {
+        if (!client.checkout) throw new Error('Checkout metadata unsupported')
+        return JSON.stringify(
+          await client.checkout(a.repo as string, a.workload as string | undefined),
+        )
+      },
+    },
     {
       name: 'devdock_list',
       description:
@@ -235,15 +312,26 @@ export function allTools(client: DaemonClient): ToolDef[] {
     ...VERBS.map(
       ({ verb, description }): ToolDef => ({
         name: `devdock_${verb.replace('-', '_')}`,
-        description,
+        description: ['adopt', 'clear'].includes(verb)
+          ? description
+          : `${description} Returns a durable operation ID immediately. Poll devdock_operation_status; a receipt is not completion.`,
         scope: 'rw',
         inputSchema: { ...repoArg, ...workloadArg },
-        handler: async (a) =>
-          verbText(
+        handler: async (a) => {
+          if (client.beginOperation && !['adopt', 'clear'].includes(verb))
+            return JSON.stringify(
+              await client.beginOperation(
+                a.repo as string,
+                verb.replace('-', '_') as WorkflowAction,
+                a.workload as string | undefined,
+              ),
+            )
+          return verbText(
             verb,
             a.repo as string,
             await client.verb(verb, a.repo as string, a.workload as string | undefined),
-          ),
+          )
+        },
       }),
     ),
     {
