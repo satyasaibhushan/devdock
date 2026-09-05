@@ -113,6 +113,22 @@ export async function fetchInstances(): Promise<InstanceView[]> {
   return response.json()
 }
 
+export async function stopSession(
+  id: string,
+  workload: string | undefined,
+  instance: string,
+): Promise<void> {
+  const q = workload ? `?workload=${encodeURIComponent(workload)}` : ''
+  const response = await fetch(
+    `/repos/${encodeURIComponent(id)}/stop-session${q}`,
+    { method: 'POST' },
+    instance,
+  )
+  const result = (await response.json()) as { ok?: boolean; error?: string; stderr?: string }
+  if (!response.ok || !result.ok)
+    throw new Error(result.error ?? result.stderr ?? 'Could not stop session')
+}
+
 export async function linkInstance(
   host: string,
   endpoint: string,

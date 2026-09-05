@@ -1,7 +1,7 @@
 <script lang="ts">
   import { linkInstance, unlinkInstance, type InstanceView } from './api'
   import { instanceSymbol } from './globalRepos'
-  let { instances, value, onchange, onrefresh }: { instances: InstanceView[]; value: string; onchange: (id: string) => void; onrefresh: () => Promise<void> } = $props()
+  let { instances, onrefresh }: { instances: InstanceView[]; onrefresh: () => Promise<void> } = $props()
   let expanded = $state(false)
   let linking = $state(false)
   let host = $state('')
@@ -23,11 +23,10 @@
 </script>
 
 <div class="instances">
-  <div class="strip" aria-label="Default instance for new work">
+  <div class="strip" aria-label="Connected machines">
     {#each instances as item (item.id)}
-      <button class="chip" class:chosen={item.id === value} aria-pressed={item.id === value}
-        title="{item.name}: {item.online ? 'online' : 'offline'}. Select for host terminal and new replicas."
-        onclick={() => onchange(item.id)}>
+      <button class="chip" title="{item.name}: {item.online ? 'online' : 'offline'}. Connection details."
+        onclick={() => expanded = !expanded} aria-expanded={expanded}>
         <span class="symbol">{instanceSymbol(item)}</span>
         {item.name.replace('.local', '').replace('-mark-one', '')}
         <span class="dot" class:online={item.online}></span>
@@ -41,10 +40,10 @@
       {#each instances as item (item.id)}
         <article>
           <div class="row">
-            <button class="name" onclick={() => { onchange(item.id); expanded = false }}>
+            <div class="name">
               <span class="symbol">{instanceSymbol(item)}</span><span class="dot" class:online={item.online}></span>{item.name}
               <small>{item.local ? 'this machine' : 'SSH'}</small>
-            </button>
+            </div>
             {#if !item.local}<button class="unlink" onclick={() => unlink(item.id)}>Unlink</button>{/if}
           </div>
           <div class="meta">{item.online ? `Kubernetes: ${item.auth?.phase ?? 'unknown'} · AWS: ${item.aws?.fresh ? 'ready' : item.aws?.configured ? 'refresh on demand' : 'not configured'}` : 'Offline. Deployment ownership retained.'}</div>
@@ -71,7 +70,6 @@
   .strip, .chip, .row, .name, .heading { display: flex; align-items: center; gap: 8px; }
   .strip { gap: 2px; padding: 3px; border: 1px solid var(--line); border-radius: 7px; }
   .chip, .manage { border-color: transparent; }
-  .chip.chosen { background: var(--accent-dim, #182a29); border-color: var(--accent); }
   .symbol { color: var(--accent); font-size: 15px; }
   small, .meta { color: var(--muted); font-size: 11px; }
   .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }

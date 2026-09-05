@@ -44,6 +44,22 @@ function makeService(start = vi.fn(), instanceId?: string) {
 }
 
 describe('daemon routes', () => {
+  it('routes stop-session separately from destructive stop', async () => {
+    const { svc } = makeService()
+    const stopSession = vi
+      .spyOn(svc, 'stopSession')
+      .mockResolvedValue({ code: 0, stdout: '', stderr: '' })
+    const stop = vi.spyOn(svc, 'stop')
+    const app = buildApp(svc)
+    const result = await app.inject({
+      method: 'POST',
+      url: '/repos/svc-a/stop-session?workload=api',
+    })
+    expect(result.statusCode).toBe(200)
+    expect(stopSession).toHaveBeenCalledWith('svc-a', 'api')
+    expect(stop).not.toHaveBeenCalled()
+    await app.close()
+  })
   it('rejects lifecycle work owned by another instance before starting a process', async () => {
     const { svc, start } = makeService(vi.fn(), 'this-machine')
     for (const action of ['start', 'build', 'stop', 'clear', 'adopt'] as const) {

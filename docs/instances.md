@@ -17,13 +17,19 @@ Deployment actions, logs and terminals follow each workload's ownership claim.
 An offline owner stays visible and blocks actions; selecting another instance
 does not transfer ownership. Claims are read without acquiring them for display.
 
-The selected header instance controls host terminals, authentication, namespace
-selection and the default destination for new work. Its namespace scopes the
-global view when the same repo is available in different namespaces. The instance
-menu shows connection and auth status only, never a second deployment list.
+The header lists connected machines without selecting a global workspace.
+Unclaimed work has a `Run on` picker beside its actions. Host terminals have
+their own machine picker; replicas choose their target in the creation dialog.
+Authentication and namespace controls identify the current action target or
+deployment owner. The instance menu shows connection and auth status only.
 Replica creation offers an explicit target selector. Branches and
 worktrees come from that target's checkout. No repositories or `.env` files are
 copied by linking. New replica IDs include an instance suffix to avoid collisions.
+
+`Stop session` is available while a managed dev session exists, including while
+waiting for a pod in BUILDING. It stops that instance's tmux dev session and
+automatic reconnection, keeping the deployment, pods and ownership claim.
+It does not run purge, reset pods, deploy or rebuild. `Destroy` remains separate.
 
 ## Authentication and authority
 

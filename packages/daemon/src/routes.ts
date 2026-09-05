@@ -505,6 +505,22 @@ export function buildApp(
     )
   }
 
+  app.post<{ Params: { id: string }; Querystring: { workload?: string } }>(
+    '/repos/:id/stop-session',
+    async (req, reply) => {
+      try {
+        const result = await service.stopSession(req.params.id, req.query.workload)
+        return reply
+          .code(result.code === 0 ? 200 : 409)
+          .send({ ok: result.code === 0, stderr: result.stderr })
+      } catch (error) {
+        return reply
+          .code(409)
+          .send({ error: error instanceof Error ? error.message : String(error) })
+      }
+    },
+  )
+
   // Recovery and ownership transfer are not lifecycle states. Keep them as
   // explicit expert operations instead of advertising them as normal actions.
   for (const verb of ['adopt', 'clear'] as const) {

@@ -219,6 +219,8 @@ export class Service {
   private readonly noPodsSince = new Map<string, number>()
   /** Auto-reconnect bookkeeping for dead sessions whose pod still runs. */
   private readonly reconnects = new Map<string, { attempts: number; lastAt: number }>()
+  private readonly pausedSessions = new Set<string>()
+  private readonly sessionGenerations = new Map<string, number>()
   private timer?: NodeJS.Timeout
   private authTimer?: NodeJS.Timeout
   private gcTimer?: NodeJS.Timeout
@@ -465,8 +467,14 @@ export class Service {
     return { code: 1, stdout: '', stderr: `aws auth: ${detail}` }
   }
 
-  async start(id: string, workload?: string): Promise<RunResult> {
+  async start(id: string, workload?: string, automatic = false): Promise<RunResult> {
     const { base, repo: scopedRepo, type, key } = this.scoped(id, workload)
+    if (!automatic) this.pausedSessions.delete(key)
+    const generation = this.sessionGenerations.get(key) ?? 0
+    const cancelled = () =>
+      this.pausedSessions.has(key) || generation !== (this.sessionGenerations.get(key) ?? 0)
+    const cancellation = { code: 1, stdout: '', stderr: 'Dev session start cancelled' }
+    if (cancelled()) return cancellation
     const denied = (await this.ensureAuth(key)) ?? (await this.ensureAwsCreds(key))
     if (denied) return denied
     let repo = scopedRepo
@@ -481,6 +489,7 @@ export class Service {
     }
     if (this.ownership)
       await this.ownership.claim({ ...repo, namespace: repo.namespace || 'default' })
+    if (cancelled()) return cancellation
     const hub = this.hubFor(key)
     const pipeFile = this.devLogPath(key)
     mkdirSync(dirname(pipeFile), { recursive: true })
@@ -488,6 +497,10 @@ export class Service {
     this.logGens.set(key, (this.logGens.get(key) ?? 0) + 1) // invalidate old f: cursors
     hub.push(`$ ${verbLabel(repo, 'dev')}`)
     const r = await this.supervisor.start(repo, pipeFile)
+    if (cancelled()) {
+      await this.supervisor.stopSession(repo)
+      return cancellation
+    }
     if (r.code === 0) {
       if (pin) {
         this.store.setSessionNamespace(key, pin)
@@ -519,6 +532,26 @@ export class Service {
     )
     await this.reconcileOne(id)
     return r
+  }
+
+  /** Stop synchronization and forwarding only. Keep Kubernetes workloads and ownership. */
+  async stopSession(id: string, workload?: string): Promise<RunResult> {
+    const { repo, key } = this.scoped(id, workload)
+    await this.claimOwnership(repo)
+    this.pausedSessions.add(key)
+    this.sessionGenerations.set(key, (this.sessionGenerations.get(key) ?? 0) + 1)
+    this.reconnects.delete(key)
+    this.noPodsSince.delete(key)
+    this.store.setPendingStartup(key, undefined)
+    const result = await this.supervisor.stopSession(repo)
+    if (result.code !== 0) return result
+    this.tailers.get(key)?.stop()
+    this.tailers.delete(key)
+    this.piped.delete(key)
+    this.transitions.delete(key)
+    this.hubFor(key).push('✓ dev session stopped; deployment kept.')
+    await this.reconcileOne(id)
+    return result
   }
 
   async stop(id: string, workload?: string): Promise<RunResult> {
@@ -1371,6 +1404,7 @@ export class Service {
    *  Returns true when one was started (the caller shows RESTARTING); paced by
    *  a cooldown and capped so a crash-looping dev settles into CRASHED. */
   private scheduleReconnect(id: string, workload: string | undefined, key: string): boolean {
+    if (this.pausedSessions.has(key)) return false
     const now = Date.now()
     const prior = this.reconnects.get(key) ?? { attempts: 0, lastAt: 0 }
     if (prior.attempts >= MAX_RECONNECT_ATTEMPTS || now - prior.lastAt < RECONNECT_COOLDOWN_MS) {
@@ -1396,7 +1430,7 @@ export class Service {
       const { repo } = this.scoped(id, workload)
       await this.supervisor.retireSession(repo)
       this.piped.delete(key)
-      const r = await this.start(id, workload)
+      const r = await this.start(id, workload, true)
       hub.push(r.code === 0 ? '✓ dev session reconnected' : `✗ reconnect failed (exit ${r.code})`)
     } catch (err) {
       hub.push(`✗ reconnect failed: ${err instanceof Error ? err.message : String(err)}`)

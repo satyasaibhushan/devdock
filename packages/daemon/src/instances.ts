@@ -84,7 +84,7 @@ export function peerPathAllowed(path: string, terminals: boolean): boolean {
   )
     return true
   if (
-    /^\/repos\/[a-zA-Z0-9_.-]+(?:\/(?:pods|logs(?:\/query)?|branches|replicas|run|wait|exec|startup|start|build|build-start|restart|destroy|adopt|clear))?$/.test(
+    /^\/repos\/[a-zA-Z0-9_.-]+(?:\/(?:pods|logs(?:\/query)?|branches|replicas|run|wait|exec|startup|start|build|build-start|restart|destroy|adopt|clear|stop-session))?$/.test(
       pathname,
     )
   )

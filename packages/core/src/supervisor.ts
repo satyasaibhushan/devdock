@@ -206,6 +206,13 @@ export class Supervisor {
     await this.releaseSessionLock(repo)
   }
 
+  async stopSession(repo: Repo): Promise<RunResult> {
+    const result = await this.runner('tmux', ['kill-session', '-t', exactTarget(repo.session)])
+    if (result.code !== 0) return result
+    await this.releaseSessionLock(repo)
+    return result
+  }
+
   /** Remove this project's entry from the `devspace-dependencies` ConfigMap so
    *  a future `devspace dev` is not blocked by a stale session lock. Best-effort. */
   private async releaseSessionLock(repo: Repo): Promise<void> {

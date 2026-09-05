@@ -59,6 +59,70 @@ function fakeStreamSpawner() {
 }
 
 describe('Service', () => {
+  it('stops a pending dev session without deleting the deployment or reconnecting', async () => {
+    const pods = JSON.stringify({
+      items: [{ metadata: { name: 'svc-a-devspace-1' }, status: { phase: 'Pending' } }],
+    })
+    let alive = true
+    const runner = vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
+      if (cmd === 'tmux' && args[0] === 'kill-session') alive = false
+      if (cmd === 'kubectl' && args[1] === 'configmap')
+        return { code: 0, stdout: '{"data":{}}', stderr: '' }
+      return cannedRunner(
+        pods,
+        alive,
+        '{"items":[{"metadata":{"name":"svc-a"},"spec":{"replicas":1}}]}',
+      )(cmd, args)
+    })
+    const svc = new Service(
+      { roots: [root], stateFile },
+      { runner, streamSpawner: fakeStreamSpawner().spawner },
+    )
+    svc.rescan()
+    await svc.reconcileAll()
+    expect(svc.get('svc-a')?.hasSession).toBe(true)
+    expect((await svc.stopSession('svc-a')).code).toBe(0)
+    await svc.reconcileAll()
+    expect(svc.get('svc-a')?.hasSession).toBe(false)
+    expect(svc.get('svc-a')?.pods).toHaveLength(1)
+    expect(
+      runner.mock.calls.some(([cmd, args]) => cmd === 'tmux' && args[0] === 'new-session'),
+    ).toBe(false)
+    expect(
+      runner.mock.calls.some(([, args]) =>
+        args.some((arg) => /purge|reset pods|delete deployment/.test(arg)),
+      ),
+    ).toBe(false)
+  })
+
+  it('cancels a start already in flight when the session is stopped', async () => {
+    let release: (value: RunResult) => void = () => {}
+    const pending = new Promise<RunResult>((resolve) => {
+      release = resolve
+    })
+    const fallback = cannedRunner('{"items":[]}', false)
+    const runner = vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
+      if (cmd === 'tmux' && args[0] === 'new-session') return pending
+      if (cmd === 'kubectl' && args[1] === 'configmap')
+        return { code: 0, stdout: '{"data":{}}', stderr: '' }
+      return fallback(cmd, args)
+    })
+    const svc = new Service(
+      { roots: [root], stateFile },
+      { runner, streamSpawner: fakeStreamSpawner().spawner },
+    )
+    svc.rescan()
+    const starting = svc.start('svc-a')
+    await vi.waitFor(() =>
+      expect(runner.mock.calls.some(([, args]) => args[0] === 'new-session')).toBe(true),
+    )
+    await svc.stopSession('svc-a')
+    release({ code: 0, stdout: '', stderr: '' })
+    expect((await starting).stderr).toBe('Dev session start cancelled')
+    expect(runner.mock.calls.filter(([, args]) => args[0] === 'kill-session')).toHaveLength(2)
+    const stopped = await svc.start('svc-a', undefined, true)
+    expect(stopped.stderr).toBe('Dev session start cancelled')
+  })
   it('scans repos and reconciles to a status', async () => {
     const podsJson = JSON.stringify({
       items: [

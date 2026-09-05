@@ -23,6 +23,7 @@
     openEvents,
     runVerb,
     switchNamespace,
+    stopSession,
   } from './lib/api'
 
   let instances = $state<InstanceView[]>([])
@@ -73,6 +74,18 @@
   // The replica pending delete confirmation, or null.
   let deletingReplicaId = $state<string | null>(null)
   let replicaDeleteBusy = $state(false)
+  let stoppingSession = $state(false)
+  async function stopDevSession() {
+    if (!selected || stoppingSession) return
+    stoppingSession = true
+    try {
+      await stopSession(sid, wl, target(sid, wl))
+      await refresh()
+    } catch (error) {
+      toast = error instanceof Error ? error.message : String(error)
+      setTimeout(() => toast = null, 5000)
+    } finally { stoppingSession = false }
+  }
 
   let refreshing = false
   async function refresh() {
@@ -91,17 +104,17 @@
     // Skipped mid-switch so the poll can't flash the old namespace back.
     if (!nsBusy) {
       try {
-        const id = preferred
-        const next = await fetchNamespace(preferredEndpoint)
-        if (id === preferred) nsInfo = next
+        const id = controlEndpoint
+        const next = await fetchNamespace(id)
+        if (id === controlEndpoint) nsInfo = next
       } catch {
         /* older daemon or offline — the picker just stays hidden */
       }
     }
     try {
-      const id = preferred
-      const next = await fetchAuth(preferredEndpoint)
-      if (id === preferred) auth = next
+      const id = controlEndpoint
+      const next = await fetchAuth(id)
+      if (id === controlEndpoint) auth = next
     } catch {
       /* older daemon or offline — the banner just stays hidden */
     }
@@ -114,7 +127,7 @@
     if (nsBusy) return
     nsBusy = true
     try {
-      nsInfo = await switchNamespace(ns, preferredEndpoint)
+      nsInfo = await switchNamespace(ns, controlEndpoint)
       await refresh()
     } catch (e) {
       toast = `namespace switch failed: ${e instanceof Error ? e.message : String(e)}`
@@ -169,6 +182,9 @@
   const view = $derived(active ?? null)
   const owner = $derived(instances.find((i) => i.id === view?.instanceId))
   const ownerEndpoint = $derived(owner ? instanceEndpoint(owner) : '')
+  const controlInstance = $derived(selectedId === HOST_ID ? preferredInstance : owner ?? preferredInstance)
+  const controlEndpoint = $derived(controlInstance ? instanceEndpoint(controlInstance) : '')
+  $effect(() => { void controlEndpoint; auth = null; nsInfo = null; void refresh() })
   const vstatus = $derived(view?.status ?? selected?.status ?? 'STOPPED')
 
   // Memoized primitives for the stream children. `selected` is a fresh object
@@ -259,16 +275,17 @@
 
 <header>
   <h1>dev<b>dock</b></h1>
-  <InstancePanel {instances} value={preferred} onchange={chooseInstance} onrefresh={refresh} />
+  <InstancePanel {instances} onrefresh={refresh} />
   <span class="conn" class:on={connected}>
     <span class="cdot" class:on={connected}></span>
     {connected ? 'daemon connected' : 'daemon offline'}
   </span>
   <div class="hright">
     {#if auth}
-      {#key preferred}<AuthBanner {auth} instance={preferredEndpoint} onchanged={(next) => (auth = next)} />{/key}
+      {#key controlEndpoint}<AuthBanner {auth} instance={controlEndpoint} onchanged={(next) => (auth = next)} />{/key}
     {/if}
     {#if nsInfo}
+      <span class="context-machine">{controlInstance?.name}</span>
       <NamespacePicker
         current={nsInfo.current}
         known={nsInfo.known}
@@ -310,7 +327,11 @@
       <div class="head">
         <div class="title">
           <h2>host</h2>
-          <span class="pill">{instanceSymbol(preferredInstance)} {preferredInstance?.name ?? 'No instance'}</span>
+          <label class="instance-target">On
+            <select class="wlselect" value={preferred} onchange={(e) => chooseInstance(e.currentTarget.value)} aria-label="Host terminal machine">
+              {#each instances as item (item.id)}<option value={item.id}>{item.name}{item.online ? '' : ' (offline)'}</option>{/each}
+            </select>
+          </label>
         </div>
       </div>
       <div class="meta">
@@ -333,7 +354,11 @@
           {#if view?.ownerInstanceId}
             <span class="pill" title="Deployment owner">{instanceSymbol(owner)} {owner?.name ?? 'Owner not connected'}</span>
           {:else}
-            <span class="pill" title="No confirmed deployment owner. This is the action target only.">target: {owner?.name ?? 'Unavailable'}</span>
+            <label class="instance-target">Run on
+              <select class="wlselect" value={owner?.id ?? preferred} onchange={(e) => chooseInstance(e.currentTarget.value)} aria-label="Instance for new work" disabled={busy !== null}>
+                {#each instances.filter((i) => i.repos.some((r) => r.repo.id === sid)) as item (item.id)}<option value={item.id} disabled={!item.online}>{item.name}{item.online ? '' : ' (offline)'}</option>{/each}
+              </select>
+            </label>
           {/if}
           {#if family.length > 1}
             <select
@@ -368,18 +393,21 @@
           <span class="pill {vstatus}">{vstatus.replace('_', ' ').toLowerCase()}</span>
         </div>
         <div class="actions">
+          {#if view?.hasSession && !view.unavailable}
+            <button title="Stop the dev session and automatic reconnect. Keep the deployment." disabled={stoppingSession} onclick={stopDevSession}>{stoppingSession ? 'Stopping…' : 'Stop session'}</button>
+          {/if}
           {#if vstatus === 'RUNNING_EXTERNAL' && !view?.unavailable}
             <button
               class="adopt"
               title="stop the external devspace dev process and reconnect here (keeps the dev pod)"
-              disabled={busy !== null || adoptBusy}
+              disabled={busy !== null || adoptBusy || stoppingSession}
               onclick={() => (confirmAdopt = true)}
             >move here</button>
           {/if}
           {#each verbs as v (v)}
             <button
               class:danger={v === 'destroy'}
-              disabled={busy !== null || adoptBusy}
+              disabled={busy !== null || adoptBusy || stoppingSession}
               onclick={() => act(v, sid, wl)}
             >{v === 'build_start' ? 'build + start' : v}</button>
           {/each}
@@ -482,6 +510,8 @@
 {#if toast}<div class="toast">{toast}</div>{/if}
 
 <style>
+  .instance-target { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; }
+  .context-machine { color: var(--muted); font-size: 11px; }
   header {
     display: flex;
     align-items: center;
