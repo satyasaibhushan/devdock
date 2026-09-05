@@ -196,6 +196,36 @@ describe('AwsCreds', () => {
     expect(JSON.parse(readFileSync(tokenFile, 'utf8')).refreshToken).toBe('rt-1')
   })
 
+  it.each([401, 403, 429, 500, 502, 503])(
+    'preserves refresh tokens after HTTP %i and recovers silently',
+    async (status) => {
+      writeFileSync(tokenFile, JSON.stringify({ refreshToken: 'rt-1' }))
+      let failing = true
+      const { fetchFn } = fakeFetch({
+        token: () =>
+          failing ? json({ error: 'temporarily_unavailable' }, status) : json({ id_token: 'id-1' }),
+      })
+      const runner = vi.fn(async () => ok())
+      const creds = make(fetchFn, runner, { failCooldownMs: 0, loginTimeoutMs: 20 })
+      expect((await creds.warm()).ok).toBe(false)
+      expect(JSON.parse(readFileSync(tokenFile, 'utf8')).refreshToken).toBe('rt-1')
+      expect(runner).not.toHaveBeenCalled()
+      failing = false
+      expect(await creds.warm()).toEqual({ ok: true })
+      expect(runner).not.toHaveBeenCalled()
+    },
+  )
+
+  it('preserves a rotated refresh token when the response is missing an ID token', async () => {
+    writeFileSync(tokenFile, JSON.stringify({ refreshToken: 'rt-1' }))
+    const { fetchFn } = fakeFetch({ token: () => json({ refresh_token: 'rt-2' }) })
+    const runner = vi.fn(async () => ok())
+    const creds = make(fetchFn, runner, { loginTimeoutMs: 20 })
+    expect((await creds.warm()).ok).toBe(false)
+    expect(runner).not.toHaveBeenCalled()
+    expect(JSON.parse(readFileSync(tokenFile, 'utf8')).refreshToken).toBe('rt-2')
+  })
+
   it('single-flights concurrent warms', async () => {
     writeFileSync(tokenFile, JSON.stringify({ refreshToken: 'rt-1' }))
     let release: (r: Response) => void = () => {}

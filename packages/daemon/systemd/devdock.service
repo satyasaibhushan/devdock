@@ -4,13 +4,12 @@ After=network.target docker.service
 
 [Service]
 Type=simple
-ExecStart=%h/.local/share/devdock/node %h/.local/share/devdock/current/packages/daemon/dist/index.js
+ExecStart=%h/.local/share/devdock/node --use-env-proxy %h/.local/share/devdock/current/packages/daemon/dist/index.js
 WorkingDirectory=%h/.local/share/devdock/current
-Environment=PATH=%h/.local/bin:%h/.local/share/devdock/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=%h/.local/share/devspace-setup/browser:%h/.local/bin:%h/.local/share/devdock/bin:/usr/local/bin:/usr/bin:/bin
 Environment=SHELL=/bin/bash
 Environment=DEVDOCK_ROOTS=/srv/Code/backend
 Environment=DEVDOCK_SOCKET=%t/devdock/control.sock
-Environment=DEVDOCK_AWS_AUTH=external
 Environment=DOCKER_HOST=unix://%t/docker.sock
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus
 Environment=HTTPS_PROXY=http://127.0.0.1:18080

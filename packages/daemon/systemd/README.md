@@ -10,9 +10,20 @@ systemd creates the private runtime directory and removes it when the service
 stops. Do not expose the socket through an unauthenticated TCP proxy on a shared
 host: the daemon includes local terminal and credential operations.
 
-`DEVDOCK_AWS_AUTH=external` keeps the existing AWS profile and its credential
-provider responsible for login. Without it, DevDock owns AWS login as before.
-Kubernetes authentication still uses the existing kubeconfig and token cache.
+DevDock owns AWS login and refresh. Do not set `DEVDOCK_AWS_AUTH=external` when
+using `aws-cli-oidc`: that helper caches AWS credentials but discards the refresh
+token. Configure the `devspace` profile's `credential_process` to invoke the
+installed `packages/daemon/dist/awsCred.js` using the installed Node executable,
+with `DEVDOCK_SOCKET=/run/user/1000/devdock/control.sock` in its environment.
+Use the actual daemon user's runtime directory on other machines.
+
+The unit requires Node with `--use-env-proxy` support. Its browser helper records
+the initial login URL; forward localhost port 8010 to the devbox for the human
+sign-in. The refresh token lives in `~/.devdock/aws-oidc.json`, mode `0600`, under
+the private daemon account's `0700` directory. Never grant agents that account's
+shell or expose the credential socket. Renewal no longer depends on unlocking
+the desktop keyring. Provider expiry and revocation still require sign-in.
+Kubernetes authentication retains its separate kubeconfig and token cache.
 
 The unit uses the devbox's rootless Docker socket and allowlisted VPN proxy.
 Adjust those paths and `DEVDOCK_ROOTS` for another machine. Install the unit in

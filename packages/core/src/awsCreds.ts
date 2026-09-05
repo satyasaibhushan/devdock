@@ -9,7 +9,7 @@
 //
 //  - silent path: Cognito refresh_token grant → sts:AssumeRoleWithWebIdentity
 //    (an UNSIGNED STS call, so no prior credential is needed) — no browser,
-//    works from any network;
+//    requires access to the identity provider and STS;
 //  - interactive path (first login, or the refresh token expired): ONE
 //    single-flight PKCE authorization-code flow on the registered localhost
 //    port, same cure AuthManager applies to kubelogin/8040;
@@ -92,7 +92,14 @@ interface TokenResponse {
 
 /** An OAuth error response from the token endpoint (bad/expired grant) — as
  *  opposed to transport trouble, which must NOT burn the refresh token. */
-class TokenEndpointError extends Error {}
+class TokenEndpointError extends Error {
+  constructor(
+    message: string,
+    readonly invalidGrant: boolean,
+  ) {
+    super(message)
+  }
+}
 
 export class AwsCreds {
   private readonly runner: AuthRunner
@@ -205,9 +212,12 @@ export class AwsCreds {
           refresh_token: refreshToken,
         })
         if (t.refresh_token) this.saveRefreshToken(t.refresh_token) // rotation, if enabled
+        if (typeof t.id_token !== 'string' || !t.id_token) {
+          throw new Error('OIDC refresh response is missing an ID token')
+        }
         idToken = t.id_token
       } catch (err) {
-        if (!(err instanceof TokenEndpointError)) throw err
+        if (!(err instanceof TokenEndpointError) || !err.invalidGrant) throw err
         // The grant is dead (expired/revoked) — only then fall to the browser.
         rmSync(this.tokenFile, { force: true })
       }
@@ -341,7 +351,8 @@ export class AwsCreds {
     }
     if (!res.ok) {
       throw new TokenEndpointError(
-        `OIDC token grant failed: ${body.error_description ?? body.error ?? `status ${res.status}`}`,
+        `OIDC token grant failed: HTTP ${res.status}`,
+        res.status === 400 && body.error === 'invalid_grant',
       )
     }
     return body
