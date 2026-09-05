@@ -340,7 +340,6 @@
       </div>
       <div class="streams solo">
         <div class="block">
-          <div class="bhead"><h3>Terminal</h3></div>
           {#key preferred}
             {#if preferredInstance?.online}<TerminalPanel instance={preferredEndpoint} machine={preferredInstance.name} all />
             {:else}<p class="placeholder">This instance is offline.</p>{/if}
@@ -357,7 +356,7 @@
           {:else}
             <label class="instance-target">
               <select class="wlselect" title={`Run on ${owner?.name ?? 'selected instance'}`} value={owner?.id ?? preferred} onchange={(e) => chooseInstance(e.currentTarget.value)} aria-label="Instance for new work" disabled={busy !== null}>
-                {#each instances.filter((i) => i.repos.some((r) => r.repo.id === sid)) as item (item.id)}<option value={item.id} disabled={!item.online} label={`${instanceSymbol(item)}${item.online ? '' : ' offline'}`}>{item.name}</option>{/each}
+                {#each instances.filter((i) => i.repos.some((r) => r.repo.id === sid)) as item (item.id)}<option value={item.id} disabled={!item.online}>{item.name}{item.online ? '' : ' (offline)'}</option>{/each}
               </select>
             </label>
           {/if}
@@ -433,14 +432,12 @@
       {:else}
       <div class="streams">
         <div class="block">
-          <div class="bhead"><h3>Logs</h3></div>
           {#key ownerEndpoint + sid + swl + sstatus}
             <LogViewer id={sid} workload={wl} instance={ownerEndpoint} />
           {/key}
         </div>
 
         <div class="block">
-          <div class="bhead"><h3>Terminal</h3></div>
           {#key ownerEndpoint + sid + swl}
             <TerminalPanel repo={sid} workload={wl} attach={sterm} instance={ownerEndpoint} machine={owner?.name ?? 'machine'} />
           {/key}
@@ -733,18 +730,6 @@
     display: flex;
     flex-direction: column;
     gap: 6px;
-  }
-  .bhead {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-  }
-  h3 {
-    font-size: 12px;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: var(--muted);
-    margin: 0;
   }
 
   .placeholder {

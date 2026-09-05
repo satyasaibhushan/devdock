@@ -45,7 +45,6 @@
       <span class="branch">{checkout.branch ?? 'detached / unknown'}</span><span>·</span><code>{checkout.commit?.slice(0, 7) ?? 'unknown'}</code>
       {#if checkout.dirty !== false}<span class="dirty">{checkout.dirty === null ? 'changes unknown' : 'modified'}</span>{/if}
     {:else}<span class="muted">Checkout unavailable</span>{/if}
-    <span aria-hidden="true">⌄</span>
     </summary>
     <div class="checkout-detail">
       {#if checkout}<code>{checkout.path}</code>{/if}
@@ -88,7 +87,10 @@
   button { font: inherit; color: var(--ink); background: var(--surface, #18202a); border: 1px solid var(--line); border-radius: 5px; padding: 5px 8px; cursor: pointer; }
   button:disabled { opacity: .5; cursor: default; }
   details { position: relative; }
-  summary { cursor: pointer; color: var(--muted); }
+  summary { cursor: pointer; color: var(--muted); list-style: none; border-radius: 3px; }
+  summary::-webkit-details-marker { display: none; }
+  summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+  details[open] > summary { color: var(--ink); }
   summary:hover { color: var(--ink); }
   .dismiss { border: 0; background: transparent; padding: 0 4px; color: var(--muted); }
   .check, .log { margin-top: 6px; overflow-wrap: anywhere; }

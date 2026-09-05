@@ -214,12 +214,10 @@
         {#if createError}
           <p class="err">{createError}</p>
         {:else}
-          <p>No terminal open.</p>
+          <p>{canAdd ? 'No terminal open.' : 'Start the workload to open a DevSpace terminal.'}</p>
         {/if}
         {#if canAdd}
           <button onclick={() => add()}>+ open a shell</button>
-        {:else}
-          <p class="hint">Nothing running — start the workload first.</p>
         {/if}
       </div>
     {:else}
@@ -418,10 +416,6 @@
     color: var(--muted);
     border: 1px dashed var(--line);
     border-radius: 10px;
-  }
-  .empty .hint {
-    font-size: 12px;
-    margin: 0;
   }
   .empty .err {
     font-size: 12px;
