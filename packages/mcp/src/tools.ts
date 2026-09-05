@@ -433,5 +433,79 @@ export function allTools(client: DaemonClient): ToolDef[] {
 
 /** Tools visible at the given scope: ro hides the write verbs. */
 export function toolsForScope(client: DaemonClient, scope: Scope): ToolDef[] {
-  return allTools(client).filter((t) => scope === 'rw' || t.scope === 'ro')
+  const tools = allTools(client).map(
+    (tool): ToolDef => ({
+      ...tool,
+      inputSchema: {
+        ...tool.inputSchema,
+        instance: z
+          .string()
+          .optional()
+          .describe(
+            'Connected instance UUID. Omit for this machine. Use devdock_instances to discover targets.',
+          ),
+      },
+      handler: async (args) => {
+        if (
+          tool.name === 'devdock_replica_create' &&
+          typeof args.instance !== 'string' &&
+          client.instances
+        ) {
+          const online = (await client.instances()).filter(
+            (item) =>
+              typeof item === 'object' && item !== null && 'online' in item && item.online === true,
+          )
+          if (online.length > 1)
+            throw new Error(
+              'Choose an explicit instance UUID from devdock_instances before creating a replica',
+            )
+        }
+        if (typeof args.instance !== 'string') return tool.handler(args)
+        if (!client.forInstance) throw new Error('Instance routing unavailable')
+        const target = allTools(client.forInstance(args.instance)).find(
+          (candidate) => candidate.name === tool.name,
+        )
+        if (!target) throw new Error('Unknown instance operation')
+        return target.handler(args)
+      },
+    }),
+  )
+  if (client.instances)
+    tools.push({
+      name: 'devdock_instances',
+      description:
+        'List this daemon and linked instances, authentication status and deployments. Offline instances retain their identity.',
+      scope: 'ro',
+      inputSchema: {},
+      handler: async () => JSON.stringify(await client.instances?.()),
+    })
+  if (client.linkInstance)
+    tools.push({
+      name: 'devdock_instance_link',
+      description:
+        'Link an existing DevDock daemon through an authenticated SSH alias. Terminal access grants the remote OS account authority; disabled by default.',
+      scope: 'rw',
+      inputSchema: { host: z.string(), endpoint: z.string(), terminals: z.boolean().optional() },
+      handler: async (args) =>
+        JSON.stringify(
+          await client.linkInstance?.(
+            args.host as string,
+            args.endpoint as string,
+            args.terminals === true,
+          ),
+        ),
+    })
+  if (client.unlinkInstance)
+    tools.push({
+      name: 'devdock_instance_unlink',
+      description:
+        'Disconnect an instance without stopping its deployments or releasing ownership.',
+      scope: 'rw',
+      inputSchema: { instance: z.string() },
+      handler: async (args) => {
+        await client.unlinkInstance?.(args.instance as string)
+        return 'Instance unlinked; deployments unchanged'
+      },
+    })
+  return tools.filter((t) => scope === 'rw' || t.scope === 'ro')
 }

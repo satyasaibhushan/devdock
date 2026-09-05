@@ -10,6 +10,7 @@ import { type RunResult, run, runStream, spawnStream } from './exec.js'
 import { type LifecycleAction, lifecyclePlan } from './lifecycle.js'
 import { decodeCursor, encodeCursor, readFileSlice } from './logQuery.js'
 import { LogHub, LogTailer, type SpawnFn, cleanLine } from './logTailer.js'
+import { DeploymentOwnership } from './ownership.js'
 import { PtyBroker } from './ptyBroker.js'
 import { type ClusterCache, Reconciler, newClusterCache } from './reconciler.js'
 import { parseDevspaceConfig, scanRepos, sessionName } from './registry.js'
@@ -36,6 +37,7 @@ export interface ServiceOptions {
   roots?: string[]
   stateFile?: string
   reconcileMs?: number
+  instanceId?: string
 }
 
 /** Grace after the dev pod reports ready before sending the startup command —
@@ -183,7 +185,9 @@ export interface ServiceDeps {
 
 export class Service {
   readonly events = new EventEmitter()
-  private readonly opts: Required<ServiceOptions>
+  private readonly opts: Required<Omit<ServiceOptions, 'instanceId'>>
+  private readonly ownership?: DeploymentOwnership
+  private readonly replicaInstanceSuffix: string
   private readonly supervisor: Supervisor
   private readonly reconciler: Reconciler
   private readonly broker: PtyBroker
@@ -230,6 +234,7 @@ export class Service {
   private readonly pendingTermOpens = new Map<string, Promise<TermInfo>>()
 
   constructor(opts: ServiceOptions = {}, deps: ServiceDeps = {}) {
+    this.replicaInstanceSuffix = opts.instanceId ? `-${opts.instanceId.slice(0, 8)}` : ''
     this.opts = {
       roots: opts.roots ?? [],
       stateFile: opts.stateFile ?? join(process.cwd(), '.devdock', 'state.json'),
@@ -277,6 +282,7 @@ export class Service {
       ? (c, a, o) => baseRunner(c, a, o)
       : (c, a, o, onLine) => runStream(c, a, o, onLine)
     this.kubectl = gatedRunner
+    if (opts.instanceId) this.ownership = new DeploymentOwnership(opts.instanceId, gatedRunner)
     this.supervisor = deps.supervisor ?? new Supervisor(gatedRunner, streamRunner)
     this.reconciler = deps.reconciler ?? new Reconciler(gatedRunner)
     this.broker = deps.broker ?? new PtyBroker()
@@ -447,6 +453,8 @@ export class Service {
       pin = (await this.contextNamespace()) || undefined
       if (pin) repo = { ...repo, namespace: pin }
     }
+    if (this.ownership)
+      await this.ownership.claim({ ...repo, namespace: repo.namespace || 'default' })
     const hub = this.hubFor(key)
     const pipeFile = this.devLogPath(key)
     mkdirSync(dirname(pipeFile), { recursive: true })
@@ -479,6 +487,7 @@ export class Service {
     const { repo, key } = this.scoped(id, workload)
     const denied = (await this.ensureAuth(key)) ?? (await this.ensureAwsCreds(key))
     if (denied) return denied
+    await this.claimOwnership(repo)
     const r = await this.narrate(key, verbLabel(repo, 'deploy'), (onLine) =>
       this.supervisor.build(repo, onLine),
     )
@@ -490,6 +499,7 @@ export class Service {
     const { repo, key } = this.scoped(id, workload)
     const denied = await this.ensureAuth(key)
     if (denied) return denied
+    await this.claimOwnership(repo)
     this.noPodsSince.delete(key)
     this.reconnects.delete(key)
     this.tailers.get(key)?.stop()
@@ -510,6 +520,7 @@ export class Service {
     const { repo, key } = this.scoped(id, workload)
     const denied = await this.ensureAuth(key)
     if (denied) return denied
+    await this.claimOwnership(repo)
     this.noPodsSince.delete(key)
     this.reconnects.delete(key)
     this.tailers.get(key)?.stop()
@@ -562,6 +573,7 @@ export class Service {
     const { repo, key } = this.scoped(id, workload)
     const denied = await this.ensureAuth(key)
     if (denied) return denied
+    await this.claimOwnership(repo)
     this.transitions.set(key, 'RESTARTING')
     await this.reconcileOne(id) // reflect RESTARTING immediately
     const hub = this.hubFor(key)
@@ -597,10 +609,23 @@ export class Service {
     return r
   }
 
+  private async claimOwnership(repo: Repo): Promise<void> {
+    if (!this.ownership) return
+    await this.ownership.claim({
+      ...repo,
+      namespace: repo.namespace || (await this.contextNamespace()) || 'default',
+    })
+  }
+
+  awsAuthState(): { configured: boolean; fresh: boolean } {
+    return { configured: this.awsCreds.configured(), fresh: this.awsCreds.fresh() }
+  }
+
   /** Send a one-off command into the workload's dev session (spec §8).
    *  `tmux send-keys` under the hood: keystrokes only, no output capture —
    *  callers that need the output should use a registered terminal instead. */
   async exec(id: string, command: string, workload?: string): Promise<RunResult> {
+    await this.claimOwnership(this.scoped(id, workload).repo)
     return this.supervisor.exec(this.scoped(id, workload).repo, command)
   }
 
@@ -689,7 +714,7 @@ export class Service {
     // a new replica can never collide with leftovers GC hasn't swept yet.
     const replicasDir = join(parent.path, '.agents', 'replicas')
     const id = nextReplicaId(
-      parentId,
+      `${parentId}${this.replicaInstanceSuffix}`,
       (cand) =>
         this.repos.has(cand) ||
         !!this.store.getReplica(cand) ||
@@ -810,6 +835,11 @@ export class Service {
     const rec = this.store.getReplica(id)
     if (!rec) throw new Error(`unknown replica: ${id}`)
     const repo = this.repos.get(id)
+    if (repo) {
+      for (const type of workloadTypes(repo)) await this.claimOwnership(scopeRepo(repo, type))
+    } else if (this.ownership) {
+      throw new Error('Cannot verify ownership of a missing replica checkout')
+    }
     if (repo) {
       for (const type of workloadTypes(repo)) {
         await this.stop(id, type).catch(() => undefined)
@@ -1416,6 +1446,7 @@ export class Service {
     opts: { workload?: string; timeoutMs?: number } = {},
   ): Promise<WorkloadRunResult> {
     const { repo, type, key } = this.scoped(id, opts.workload)
+    await this.claimOwnership(repo)
     const fail = (infraError: string, pod?: string): WorkloadRunResult => ({
       ok: false,
       exitCode: -1,
@@ -1706,6 +1737,7 @@ export class Service {
     }
     const repoId = opts.repo
     if (!repoId) throw new Error(`repo required for a ${kind} terminal`)
+    await this.claimOwnership(this.scoped(repoId, opts.workload).repo)
     // Store the RESOLVED workload type so every client (UI picking 'api',
     // an agent omitting the default) lands on the same terminal identity.
     const { type, key } = this.scoped(repoId, opts.workload)
@@ -1793,6 +1825,20 @@ export class Service {
     await this.auth.init().catch(() => undefined)
     this.rescan()
     await this.reconcileAll()
+    // Record ownership for already-running managed sessions after discovery.
+    for (const state of this.list()) {
+      for (const workload of state.workloads) {
+        if (workload.hasSession) {
+          await this.claimOwnership(
+            this.scoped(state.repo.id, workload.type || undefined).repo,
+          ).catch((error: unknown) => {
+            this.hubFor(state.repo.id).push(
+              error instanceof Error ? error.message : 'Ownership verification unavailable',
+            )
+          })
+        }
+      }
+    }
     this.timer = setInterval(() => {
       void this.reconcileAll().catch(() => undefined)
       this.terms.sweep() // reap idle/dead agent terminals alongside each pass

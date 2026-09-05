@@ -9,6 +9,7 @@ import {
   pathShadowWarnings,
 } from '@devdock/core'
 import { AccessGate } from './accessGate.js'
+import { Instances } from './instances.js'
 import { listen } from './listener.js'
 import { buildApp } from './routes.js'
 import { attachWs } from './wsServer.js'
@@ -29,8 +30,17 @@ async function main() {
     .catch(() => undefined)
 
   const roots = (process.env.DEVDOCK_ROOTS ?? join(homedir(), 'Code')).split(':').filter(Boolean)
+  const instances = new Instances(
+    join(homedir(), '.devdock'),
+    undefined,
+    SOCKET ?? `127.0.0.1:${PORT}`,
+  )
   const service = new Service(
-    { roots, stateFile: join(homedir(), '.devdock', 'state.json') },
+    {
+      roots,
+      stateFile: join(homedir(), '.devdock', 'state.json'),
+      instanceId: instances.identity.id,
+    },
     process.env.DEVDOCK_AWS_AUTH === 'external'
       ? { awsCreds: new AwsCreds({ oidcConfigPath: null }) }
       : {},
@@ -40,14 +50,16 @@ async function main() {
     process.env.DEVDOCK_CONTROL_TOKEN_FILE ?? join(homedir(), '.devdock', 'control-token'),
     Boolean(SOCKET),
   )
-  const app = buildApp(service, gate)
+  const app = buildApp(service, gate, instances)
   const address = await listen(app, { port: PORT, host: HOST, socket: SOCKET })
-  const streams = attachWs(app.server, service, gate)
+  const streams = attachWs(app.server, service, gate, instances)
+  instances.start()
 
   await service.startLoop()
   console.log(`devdock daemon listening on ${address}, roots: ${roots.join(', ')}`)
 
   const shutdown = () => {
+    instances.close()
     service.stopLoop()
     for (const client of streams.clients) client.terminate()
     streams.close()

@@ -1,5 +1,6 @@
 <script lang="ts">
   import AuthBanner from './lib/AuthBanner.svelte'
+  import InstancePanel from './lib/InstancePanel.svelte'
   import ConfirmModal from './lib/ConfirmModal.svelte'
   import LogViewer from './lib/LogViewer.svelte'
   import NamespacePicker from './lib/NamespacePicker.svelte'
@@ -23,7 +24,7 @@
   } from './lib/api'
 
   let repos = $state<RepoState[]>([])
-  let selectedId = $state<string | null>(null)
+  let selectedId = $state<string | null>(new URLSearchParams(location.search).get('repo'))
   // Sentinel selection for the host-machine terminal view (no repo attached).
   const HOST_ID = '@host'
   // The repo whose startup-script modal is open, or null when none.
@@ -226,6 +227,7 @@
 
 <header>
   <h1>dev<b>dock</b></h1>
+  <InstancePanel />
   <span class="conn" class:on={connected}>
     <span class="cdot" class:on={connected}></span>
     {connected ? 'daemon connected' : 'daemon offline'}

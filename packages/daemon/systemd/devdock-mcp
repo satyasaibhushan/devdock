@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export DEVDOCK_SOCKET="${DEVDOCK_SOCKET:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/devdock/control.sock}"
+exec "$HOME/.local/share/devdock/node" "$HOME/.local/share/devdock/current/packages/mcp/dist/index.js" "$@"

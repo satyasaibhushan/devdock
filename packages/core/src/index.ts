@@ -2,6 +2,7 @@
 // Everything else (daemon HTTP/WS, MCP) is a thin caller of these.
 
 export * from './types.js'
+export { DeploymentOwnership } from './ownership.js'
 export {
   lifecycleActions,
   lifecyclePlan,

@@ -6,13 +6,18 @@ import type { LifecycleAction, Service } from '@devdock/core'
 import fastifyStatic from '@fastify/static'
 import Fastify, { type FastifyInstance } from 'fastify'
 import type { AccessGate } from './accessGate.js'
+import { type Instances, peerPathAllowed } from './instances.js'
 
 /** The built web UI (`packages/web/dist`), relative to this module at
  *  `packages/daemon/dist/routes.js`. Bundled into the daemon so port 7717
  *  serves the UI too — there's no separate dev server to keep alive. */
 const WEB_DIST = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'web', 'dist')
 
-export function buildApp(service: Service, gate?: AccessGate): FastifyInstance {
+export function buildApp(
+  service: Service,
+  gate?: AccessGate,
+  instances?: Instances,
+): FastifyInstance {
   const app = Fastify({ logger: false })
 
   if (gate) {
@@ -28,6 +33,111 @@ export function buildApp(service: Service, gate?: AccessGate): FastifyInstance {
         return reply.code(403).send({ error: 'forbidden' })
       }
     })
+  }
+
+  if (instances) {
+    app.post<{ Body: { id?: string } }>('/instance/return-link/prepare', async (req, reply) => {
+      try {
+        return { socket: instances.prepareReturn(req.body?.id ?? '') }
+      } catch {
+        return reply.code(400).send({ error: 'Cannot prepare return connection' })
+      }
+    })
+    app.post<{ Body: { id?: string; terminals?: boolean } }>(
+      '/instance/return-link',
+      async (req, reply) => {
+        try {
+          return await instances.acceptReturn(req.body?.id ?? '', req.body?.terminals === true)
+        } catch {
+          return reply.code(400).send({ error: 'Cannot verify return connection' })
+        }
+      },
+    )
+    app.get('/instance', async () => ({
+      ...instances.identity,
+      auth: service.authState(),
+      aws: service.awsAuthState(),
+    }))
+    app.get('/instances', async () => [
+      {
+        ...instances.identity,
+        local: true,
+        online: true,
+        auth: service.authState(),
+        aws: service.awsAuthState(),
+        repos: service.list(),
+      },
+      ...(await Promise.all(
+        instances.list().map(async (link) => {
+          try {
+            const [meta, repos] = await Promise.all([
+              instances.request(link.id, 'GET', '/instance'),
+              instances.request(link.id, 'GET', '/repos'),
+            ])
+            if (meta.status !== 200 || repos.status !== 200) throw new Error('Peer unavailable')
+            return {
+              ...link,
+              ...JSON.parse(meta.body.toString()),
+              local: false,
+              online: true,
+              repos: JSON.parse(repos.body.toString()),
+            }
+          } catch {
+            return { ...link, local: false, online: false, repos: [] }
+          }
+        }),
+      )),
+    ])
+    app.post<{ Body: { host?: string; endpoint?: string; terminals?: boolean } }>(
+      '/instances',
+      async (req, reply) => {
+        if (typeof req.body?.host !== 'string' || typeof req.body?.endpoint !== 'string')
+          return reply.code(400).send({ error: 'SSH host and endpoint required' })
+        try {
+          return await instances.link(req.body.host, req.body.endpoint, req.body.terminals === true)
+        } catch (error) {
+          return reply
+            .code(400)
+            .send({ error: error instanceof Error ? error.message : 'Link failed' })
+        }
+      },
+    )
+    app.delete<{ Params: { instance: string } }>('/instances/:instance', async (req) => {
+      instances.unlink(req.params.instance)
+      return { ok: true }
+    })
+    app.all<{ Params: { instance: string; '*': string } }>(
+      '/instances/:instance/api/*',
+      async (req, reply) => {
+        const suffix = req.raw.url?.includes('?') ? req.raw.url.slice(req.raw.url.indexOf('?')) : ''
+        const path = `/${req.params['*']}${suffix}`
+        try {
+          if (req.params.instance === instances.identity.id) {
+            if (!peerPathAllowed(path, true))
+              return reply
+                .code(403)
+                .send({ error: 'Operation not allowed through instance routing' })
+            if (!['GET', 'POST', 'PUT', 'DELETE', 'HEAD', 'OPTIONS'].includes(req.method))
+              return reply.code(405).send({ error: 'Unsupported method' })
+            const result = await app.inject({
+              method: req.method as 'GET' | 'POST' | 'PUT' | 'DELETE' | 'HEAD' | 'OPTIONS',
+              url: path,
+              payload: req.body as Record<string, unknown> | undefined,
+            })
+            return reply
+              .code(result.statusCode)
+              .type(String(result.headers['content-type'] ?? 'application/json'))
+              .send(result.rawPayload)
+          }
+          const result = await instances.request(req.params.instance, req.method, path, req.body)
+          return reply.code(result.status).type(result.contentType).send(result.body)
+        } catch (error) {
+          return reply
+            .code(502)
+            .send({ error: error instanceof Error ? error.message : 'Peer unavailable' })
+        }
+      },
+    )
   }
 
   // Serve the web UI off the same origin as the API, so its relative fetches and
@@ -384,7 +494,9 @@ export function buildApp(service: Service, gate?: AccessGate): FastifyInstance {
           const message = err instanceof Error ? err.message : String(err)
           const code = message.includes('unknown repo')
             ? 404
-            : message.includes('not valid') || message.includes('unknown workload')
+            : message.includes('not valid') ||
+                message.includes('unknown workload') ||
+                message.includes('owned by instance')
               ? 409
               : 500
           return reply.code(code).send({ error: message })
@@ -409,7 +521,7 @@ export function buildApp(service: Service, gate?: AccessGate): FastifyInstance {
             .code(
               message.includes('unknown repo')
                 ? 404
-                : message.includes('unknown workload')
+                : message.includes('unknown workload') || message.includes('owned by instance')
                   ? 409
                   : 500,
             )

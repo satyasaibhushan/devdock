@@ -1,6 +1,7 @@
 // The MCP server is a thin client of the one brain — the daemon's HTTP API
 // (spec §19.1). It never spins its own Service, so it can never diverge.
 import { readFileSync } from 'node:fs'
+import { request as httpRequest } from 'node:http'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type {
@@ -63,6 +64,10 @@ export interface WaitOpts {
 
 /** The subset of the daemon HTTP contract the MCP tools call. */
 export interface DaemonClient {
+  instances?(): Promise<unknown[]>
+  forInstance?(id: string): DaemonClient
+  linkInstance?(host: string, endpoint: string, terminals?: boolean): Promise<unknown>
+  unlinkInstance?(id: string): Promise<void>
   list(): Promise<RepoState[]>
   status(id: string): Promise<RepoState>
   verb(verb: RepoVerb, id: string, workload?: string): Promise<VerbResult>
@@ -97,6 +102,7 @@ export function httpClient(
   baseUrl: string,
   tokenFile = process.env.DEVDOCK_CONTROL_TOKEN_FILE ??
     join(homedir(), '.devdock', 'control-token'),
+  socketPath = process.env.DEVDOCK_SOCKET,
 ): DaemonClient {
   const url = (path: string) => `${baseUrl.replace(/\/$/, '')}${path}`
   const id = (s: string) => encodeURIComponent(s)
@@ -111,7 +117,46 @@ export function httpClient(
   async function request<T>(path: string, init?: RequestInit): Promise<T> {
     const headers = new Headers(init?.headers)
     if (token) headers.set('authorization', `Bearer ${token}`)
-    const res = await fetch(url(path), { ...init, headers })
+    const res = socketPath
+      ? await new Promise<Response>((resolve, reject) => {
+          const target = new URL(url(path))
+          const req = httpRequest(
+            {
+              socketPath,
+              path: `${target.pathname}${target.search}`,
+              method: init?.method ?? 'GET',
+              headers: Object.fromEntries(headers.entries()),
+            },
+            (response) => {
+              const chunks: Buffer[] = []
+              let size = 0
+              response.on('data', (chunk: Buffer) => {
+                size += chunk.length
+                if (size > 8 * 1024 * 1024) {
+                  response.destroy(new Error('Response too large'))
+                  return
+                }
+                chunks.push(chunk)
+              })
+              response.on('error', reject)
+              response.on('end', () =>
+                resolve(
+                  new Response(Buffer.concat(chunks).toString(), {
+                    status: response.statusCode ?? 502,
+                  }),
+                ),
+              )
+            },
+          )
+          const timer = setTimeout(
+            () => req.destroy(new Error('Daemon request timed out; check status before retrying')),
+            180_000,
+          )
+          req.on('close', () => clearTimeout(timer))
+          req.on('error', reject)
+          req.end(typeof init?.body === 'string' ? init.body : undefined)
+        })
+      : await fetch(url(path), { ...init, headers, signal: AbortSignal.timeout(180_000) })
     const data = (await res.json().catch(() => ({}))) as T & { error?: string; stderr?: string }
     if (!res.ok) {
       throw new Error(
@@ -135,6 +180,18 @@ export function httpClient(
   })
 
   return {
+    instances: () => request<unknown[]>('/instances'),
+    forInstance: (instance) =>
+      httpClient(
+        `${baseUrl.replace(/\/$/, '')}/instances/${id(instance)}/api`,
+        tokenFile,
+        socketPath,
+      ),
+    linkInstance: (host, endpoint, terminals = false) =>
+      post('/instances', { host, endpoint, terminals }),
+    unlinkInstance: async (instance) => {
+      await request(`/instances/${id(instance)}`, { method: 'DELETE' })
+    },
     list: () => request<RepoState[]>('/repos'),
     status: (i) => request<RepoState>(`/repos/${id(i)}`),
     verb: async (verb, i, workload) =>

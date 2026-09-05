@@ -5,6 +5,28 @@ import { allTools, renderList, toolsForScope } from './tools.js'
 
 const ok: VerbResult = { ok: true, code: 0, stderr: '' }
 
+it('routes concurrent MCP calls to their explicit instances without changing the default', async () => {
+  const local = vi.fn(async () => [])
+  const remote = vi.fn(async () => [])
+  const client = fakeClient({
+    list: local,
+    instances: async () => [],
+    forInstance: (id) => {
+      if (id !== 'devbox') throw new Error('unknown')
+      return fakeClient({ list: remote })
+    },
+  })
+  const tool = toolsForScope(client, 'ro').find((item) => item.name === 'devdock_list')
+  expect(tool).toBeDefined()
+  await Promise.all([tool?.handler({}), tool?.handler({ instance: 'devbox' })])
+  expect(local).toHaveBeenCalledTimes(1)
+  expect(remote).toHaveBeenCalledTimes(1)
+  expect(toolsForScope(client, 'ro').some((item) => item.name === 'devdock_instances')).toBe(true)
+  expect(toolsForScope(client, 'ro').some((item) => item.name === 'devdock_instance_link')).toBe(
+    false,
+  )
+})
+
 function repoState(over: Partial<RepoState> = {}): RepoState {
   return {
     repo: {

@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { type RunResult, Service } from '@devdock/core'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { AccessGate } from './accessGate.js'
+import { Instances } from './instances.js'
 import { buildApp } from './routes.js'
 
 let root: string
@@ -14,7 +15,7 @@ beforeEach(() => {
 })
 afterEach(() => rmSync(root, { recursive: true, force: true }))
 
-function makeService(start = vi.fn()) {
+function makeService(start = vi.fn(), instanceId?: string) {
   const runner = vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
     if (cmd === 'tmux' && args[0] === 'has-session') return { code: 1, stdout: '', stderr: '' }
     if (cmd === 'tmux' && args[0] === 'new-session') {
@@ -25,15 +26,48 @@ function makeService(start = vi.fn()) {
       // `config view` reads the context namespace; `set-context` switches it
       return { code: 0, stdout: args[1] === 'view' ? 'testns' : '', stderr: '' }
     }
+    if (cmd === 'kubectl' && args.includes('configmap'))
+      return {
+        code: 0,
+        stdout: JSON.stringify({ data: { instance: 'other-machine', deployment: 'svc-a' } }),
+        stderr: '',
+      }
     if (cmd === 'kubectl') return { code: 0, stdout: '{"items":[]}', stderr: '' }
     return { code: 0, stdout: '', stderr: '' }
   })
-  const svc = new Service({ roots: [root], stateFile: join(root, 'state.json') }, { runner })
+  const svc = new Service(
+    { roots: [root], stateFile: join(root, 'state.json'), instanceId },
+    { runner },
+  )
   svc.rescan()
   return { svc, start }
 }
 
 describe('daemon routes', () => {
+  it('rejects lifecycle work owned by another instance before starting a process', async () => {
+    const { svc, start } = makeService(vi.fn(), 'this-machine')
+    for (const action of ['start', 'build', 'stop', 'clear', 'adopt'] as const) {
+      await expect(svc[action]('svc-a')).rejects.toThrow('owned by instance other-machine')
+    }
+    expect(start).not.toHaveBeenCalled()
+  })
+  it('routes an explicit local instance and denies credential forwarding', async () => {
+    const { svc } = makeService()
+    const instances = new Instances(join(root, 'identity'))
+    const app = buildApp(svc, new AccessGate('secret'), instances)
+    const result = await app.inject({
+      method: 'GET',
+      url: `/instances/${instances.identity.id}/api/namespace`,
+    })
+    expect(result.statusCode).toBe(200)
+    expect(result.json().current).toBe('testns')
+    const denied = await app.inject({
+      method: 'GET',
+      url: `/instances/${instances.identity.id}/api/aws/credential`,
+    })
+    expect(denied.statusCode).toBe(403)
+    await app.close()
+  })
   it('GET /health', async () => {
     const { svc } = makeService()
     const app = buildApp(svc)

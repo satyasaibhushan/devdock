@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { type BranchInfo, type ReplicaRecord, createReplica, fetchBranches } from './api'
+  import { type BranchInfo, type ReplicaRecord, type InstanceView, createReplica, fetchBranches, fetchInstances, selectedInstance, selectInstance } from './api'
 
   let {
     repoId,
@@ -17,15 +17,25 @@
   let picked = $state<string | null>(null)
   let creating = $state(false)
   let error = $state<string | null>(null)
-  let initialized = false
+  let instances = $state<InstanceView[]>([])
+  let target = $state<string | null>(null)
+  $effect(() => {
+    void fetchInstances().then((items) => {
+      instances = items.filter((item) => item.online && item.repos.some((repo) => repo.repo.id === repoId))
+      if (instances.length === 1) target = instances[0]?.local ? '' : instances[0]?.id ?? null
+      loading = false
+    }).catch(() => { error = 'Cannot load target instances'; loading = false })
+  })
 
   $effect(() => {
-    if (initialized) return
-    initialized = true
-    fetchBranches(repoId)
-      .then((b) => (branches = b))
-      .catch((e) => (error = e instanceof Error ? e.message : String(e)))
-      .finally(() => (loading = false))
+    if (target === null) return
+    let cancelled = false
+    loading = true; picked = null; branches = []
+    void fetchBranches(repoId, target)
+      .then((b) => { if (!cancelled) branches = b })
+      .catch((e) => { if (!cancelled) error = e instanceof Error ? e.message : String(e) })
+      .finally(() => { if (!cancelled) loading = false })
+    return () => { cancelled = true }
   })
 
   // The daemon already sorts by most-recent commit; the filter narrows in place.
@@ -43,11 +53,12 @@
   }
 
   async function create() {
-    if (!picked || creating) return
+    if (!picked || creating || target === null) return
     creating = true
     error = null
     try {
-      const rec = await createReplica(repoId, picked)
+      const rec = await createReplica(repoId, picked, false, target)
+      if (target !== selectedInstance) { selectInstance(target, rec.id); return }
       oncreated(rec)
       onclose()
     } catch (e) {
@@ -81,6 +92,12 @@
     </div>
     <code>{repoId}</code>
   </header>
+  <label>Run on
+    <select bind:value={target} disabled={creating}>
+      <option value={null} disabled>Choose an instance</option>
+      {#each instances as item (item.id)}<option value={item.local ? '' : item.id}>{item.name}</option>{/each}
+    </select>
+  </label>
   <p class="hint">
     Deploys the picked branch side-by-side with <b>{repoId}</b> — its own pods and
     <b>/{repoId}-rN/</b> URL, the original checkout untouched. Auto-deleted after 2 days.

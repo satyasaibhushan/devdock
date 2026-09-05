@@ -81,6 +81,53 @@ export interface NamespaceInfo {
   known: string[]
 }
 
+export const selectedInstance = new URLSearchParams(globalThis.location?.search ?? '').get('instance') ?? ''
+
+export function instancePath(path: string, instance = selectedInstance): string {
+  return instance ? `/instances/${encodeURIComponent(instance)}/api${path}` : path
+}
+
+function fetch(path: string, init?: RequestInit, instance = selectedInstance): Promise<Response> {
+  return globalThis.fetch(instancePath(path, instance), init)
+}
+
+export interface InstanceView {
+  id: string
+  name: string
+  local: boolean
+  online: boolean
+  terminals?: boolean
+  auth?: AuthState
+  aws?: { configured: boolean; fresh: boolean }
+  repos: RepoState[]
+}
+
+export async function fetchInstances(): Promise<InstanceView[]> {
+  const response = await globalThis.fetch('/instances')
+  if (!response.ok) throw new Error('Cannot load instances')
+  return response.json()
+}
+
+export async function linkInstance(host: string, endpoint: string, terminals: boolean): Promise<void> {
+  const response = await globalThis.fetch('/instances', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ host, endpoint, terminals }) })
+  if (!response.ok) throw new Error(((await response.json()) as { error: string }).error)
+}
+
+export async function unlinkInstance(id: string): Promise<void> {
+  const response = await globalThis.fetch(`/instances/${encodeURIComponent(id)}`, { method: 'DELETE' })
+  if (!response.ok) throw new Error('Cannot unlink instance')
+}
+
+export function selectInstance(id: string, repo?: string): void {
+  const url = new URL(location.href)
+  if (id) url.searchParams.set('instance', id)
+  else url.searchParams.delete('instance')
+  if (repo) url.searchParams.set('repo', repo)
+  else url.searchParams.delete('repo')
+  // A full navigation disposes every old terminal and pending request together.
+  location.assign(url.toString())
+}
+
 export async function fetchNamespace(): Promise<NamespaceInfo> {
   const res = await fetch('/namespace')
   if (!res.ok) throw new Error(`GET /namespace → ${res.status}`)
@@ -142,8 +189,8 @@ export async function runVerb(id: string, verb: Verb, workload?: string): Promis
   const q = workload ? `?workload=${encodeURIComponent(workload)}` : ''
   const path = verb === 'build_start' ? 'build-start' : verb
   const res = await fetch(`/repos/${encodeURIComponent(id)}/${path}${q}`, { method: 'POST' })
-  const body = (await res.json()) as { ok?: boolean; stderr?: string }
-  if (!res.ok) throw new Error(body.stderr ?? `${verb} ${id} → ${res.status}`)
+  const body = (await res.json()) as { ok?: boolean; stderr?: string; error?: string }
+  if (!res.ok) throw new Error(body.error ?? body.stderr ?? `${verb} ${id} → ${res.status}`)
   if (!body.ok) throw new Error(body.stderr ?? `${verb} failed`)
 }
 
@@ -186,8 +233,8 @@ export interface ReplicaRecord {
   ownImage?: boolean
 }
 
-export async function fetchBranches(id: string): Promise<BranchInfo[]> {
-  const res = await fetch(`/repos/${encodeURIComponent(id)}/branches`)
+export async function fetchBranches(id: string, instance = selectedInstance): Promise<BranchInfo[]> {
+  const res = await fetch(`/repos/${encodeURIComponent(id)}/branches`, undefined, instance)
   if (!res.ok) throw new Error(`GET branches ${id} → ${res.status}`)
   return res.json()
 }
@@ -196,12 +243,13 @@ export async function createReplica(
   id: string,
   branch: string,
   ownImage = false,
+  instance = selectedInstance,
 ): Promise<ReplicaRecord> {
   const res = await fetch(`/repos/${encodeURIComponent(id)}/replicas`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ branch, ownImage }),
-  })
+  }, instance)
   if (!res.ok) {
     const body = (await res.json().catch(() => null)) as { error?: string } | null
     throw new Error(body?.error ?? `create replica → ${res.status}`)
@@ -219,7 +267,7 @@ export async function deleteReplica(id: string): Promise<void> {
 
 function wsUrl(path: string): string {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws'
-  return `${proto}://${location.host}${path}`
+  return `${proto}://${location.host}${instancePath(path)}`
 }
 
 export function openEvents(): WebSocket {

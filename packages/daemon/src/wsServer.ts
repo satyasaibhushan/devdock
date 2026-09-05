@@ -3,9 +3,15 @@ import type { Server } from 'node:http'
 import type { CrashEvent, RepoState, Service, TermMode } from '@devdock/core'
 import { WebSocket, WebSocketServer } from 'ws'
 import type { AccessGate } from './accessGate.js'
+import type { Instances } from './instances.js'
 
 /** Attach devdock's websocket endpoints to an existing HTTP server. */
-export function attachWs(server: Server, service: Service, gate?: AccessGate): WebSocketServer {
+export function attachWs(
+  server: Server,
+  service: Service,
+  gate?: AccessGate,
+  instances?: Instances,
+): WebSocketServer {
   const wss = new WebSocketServer({ noServer: true })
 
   server.on('upgrade', (req, socket, head) => {
@@ -23,6 +29,50 @@ export function attachWs(server: Server, service: Service, gate?: AccessGate): W
       return
     }
     const url = new URL(req.url ?? '/', 'http://localhost')
+    const peer = url.pathname.match(/^\/instances\/([a-f0-9-]+)\/api(\/.*)$/)
+    if (peer && instances) {
+      if (!peer[1] || !peer[2] || !matchRoute(peer[2])) {
+        socket.destroy()
+        return
+      }
+      void instances
+        .stream(peer[1], `${peer[2]}${url.search}`)
+        .then((remote) => {
+          const fail = () => {
+            remote.terminate()
+            socket.destroy()
+          }
+          remote.once('error', fail)
+          socket.once('close', () => remote.terminate())
+          remote.once('open', () => {
+            if (socket.destroyed) {
+              remote.terminate()
+              return
+            }
+            wss.handleUpgrade(req, socket, head, (local) => {
+              const send = (
+                target: WebSocket,
+                data: Buffer | ArrayBuffer | Buffer[],
+                binary: boolean,
+              ) => {
+                if (target.bufferedAmount > 1024 * 1024) {
+                  local.terminate()
+                  remote.terminate()
+                  return
+                }
+                if (target.readyState === WebSocket.OPEN) target.send(data, { binary })
+              }
+              remote.on('message', (data, binary) => send(local, data, binary))
+              local.on('message', (data, binary) => send(remote, data, binary))
+              local.on('close', () => remote.close())
+              remote.on('close', () => local.close())
+              local.on('error', () => remote.terminate())
+            })
+          })
+        })
+        .catch(() => socket.destroy())
+      return
+    }
     const route = matchRoute(url.pathname)
     if (!route) {
       socket.destroy()

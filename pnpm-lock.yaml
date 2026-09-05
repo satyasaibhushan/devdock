@@ -56,15 +56,16 @@ importers:
 
   packages/mcp:
     dependencies:
-      '@devdock/core':
-        specifier: workspace:*
-        version: link:../core
       '@modelcontextprotocol/sdk':
         specifier: ^1.29.0
         version: 1.29.0(zod@3.25.76)
       zod:
         specifier: ^3.24.1
         version: 3.25.76
+    devDependencies:
+      '@devdock/core':
+        specifier: workspace:*
+        version: link:../core
 
   packages/tray:
     devDependencies:

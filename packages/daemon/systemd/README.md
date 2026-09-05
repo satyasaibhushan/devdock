@@ -39,3 +39,11 @@ journalctl --user -u devdock -f
 
 Deployment output is available through DevDock's workload log stream, separate
 from the daemon journal. The macOS daemon and clients remain unchanged.
+# Linked instances and MCP
+
+The instance selector links another daemon through an existing SSH alias. See
+[linked instances](../../../docs/instances.md) for the protocol and ownership rules.
+The portable release can include `packages/mcp` alongside `packages/daemon`.
+Install the adjacent `devdock-mcp` wrapper into the owner's `~/.local/bin` to use
+that MCP over the private control socket. Do not grant this owner socket or
+wrapper to a restricted agent account.
