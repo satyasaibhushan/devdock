@@ -12,9 +12,43 @@ import type { DeploymentInfo, PodInfo, Repo } from './types.js'
 
 const ready: PodInfo = { name: 'p', phase: 'Running', ready: true, restartCount: 0 }
 const pending: PodInfo = { name: 'p', phase: 'Pending', ready: false, restartCount: 0 }
-const crashy: PodInfo = { name: 'p', phase: 'Running', ready: false, restartCount: 3 }
+const crashy: PodInfo = {
+  name: 'p',
+  phase: 'Running',
+  ready: false,
+  restartCount: 3,
+  crashing: true,
+}
 
 describe('deriveStatus (spec §6 table)', () => {
+  it('does not treat past restarts as a current failure', () => {
+    expect(deriveStatus([{ ...ready, restartCount: 5 }], true)).toBe('RUNNING_MANAGED')
+    expect(deriveStatus([{ ...ready, restartCount: 5 }], false)).toBe('RUNNING_EXTERNAL')
+  })
+  it.each([
+    [{ running: {} }, true, 'RUNNING_MANAGED'],
+    [{ running: {} }, false, 'BUILDING'],
+    [{ waiting: { reason: 'CrashLoopBackOff' } }, false, 'CRASHED'],
+    [{ waiting: { reason: 'ImagePullBackOff' } }, false, 'CRASHED'],
+    [{ terminated: { exitCode: 1 } }, false, 'CRASHED'],
+  ])('uses current container state %j, not last termination', (state, ready, expected) => {
+    const pods = parsePods(
+      JSON.stringify({
+        items: [
+          {
+            metadata: { name: 'worker' },
+            status: {
+              phase: 'Running',
+              containerStatuses: [
+                { ready, restartCount: 5, state, lastState: { terminated: { exitCode: 1 } } },
+              ],
+            },
+          },
+        ],
+      }),
+    )
+    expect(deriveStatus(pods, true)).toBe(expected)
+  })
   it('ready pod + session → RUNNING_MANAGED', () => {
     expect(deriveStatus([ready], true)).toBe('RUNNING_MANAGED')
   })
@@ -30,7 +64,7 @@ describe('deriveStatus (spec §6 table)', () => {
     expect(deriveStatus([{ ...pending, name: 'svc-devspace-abc' }], false, true)).toBe('DEPLOYED')
     expect(deriveStatus([pending], true, true)).toBe('BUILDING')
   })
-  it('restartCount>0 → CRASHED (takes precedence)', () => {
+  it('current container failure → CRASHED (takes precedence)', () => {
     expect(deriveStatus([crashy], true)).toBe('CRASHED')
   })
   it('no pod, no session → STOPPED', () => {

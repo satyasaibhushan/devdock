@@ -160,7 +160,7 @@ export class PtyBroker {
 
   /**
    * Attach the repo's tmux dev session. This is one shared screen, so a
-   * read-write attach takes (and holds) the repo's single-writer lock — two
+   * read-write attach takes (and holds) the session's single-writer lock — two
    * writers on the same session would fight over the keyboard.
    */
   open(repo: Repo, mode: TermMode, cols = 80, rows = 24): Promise<TermSession> {
@@ -229,9 +229,10 @@ export class PtyBroker {
     opts: { lock: boolean },
   ): Promise<TermSession> {
     let token: symbol | null = null
+    const lockKey = repo.session
     if (mode === 'rw' && opts.lock) {
-      token = this.locks.acquire(repo.id)
-      if (!token) throw new Error(`write-lock held for ${repo.id}`)
+      token = this.locks.acquire(lockKey)
+      if (!token) throw new Error(`write-lock held for ${lockKey}`)
     }
 
     let pty: PtyLike
@@ -239,7 +240,7 @@ export class PtyBroker {
       const spawn = await this.resolveSpawn()
       pty = spawn(file, args, { cols, rows, cwd })
     } catch (error) {
-      if (token) this.locks.release(repo.id, token)
+      if (token) this.locks.release(lockKey, token)
       throw error
     }
 
@@ -265,7 +266,7 @@ export class PtyBroker {
       if (closed) return
       closed = true
       // Release the write-lock immediately so a new rw terminal isn't blocked.
-      if (token) this.locks.release(repo.id, token)
+      if (token) this.locks.release(lockKey, token)
       // Defer the fd teardown past the spawn tick. node-pty cannot release the
       // master /dev/ptmx fd if the pty is killed in the same event-loop turn it
       // was spawned (libuv's PTY wiring hasn't settled) — it leaks the slot. The

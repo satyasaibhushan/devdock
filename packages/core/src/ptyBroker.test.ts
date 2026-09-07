@@ -11,6 +11,7 @@ import {
   ensureExecutable,
 } from './ptyBroker.js'
 import type { Repo } from './types.js'
+import { scopeRepo } from './workloads.js'
 
 const repo: Repo = {
   id: 'svc',
@@ -76,6 +77,19 @@ function fakePty(): PtyLike & { written: string[]; exit: () => void } {
 }
 
 describe('PtyBroker', () => {
+  it('allows separate workload writers but keeps each tmux session single-writer', async () => {
+    const broker = new PtyBroker(() => fakePty())
+    const api = scopeRepo(repo, 'api')
+    const worker = scopeRepo(repo, 'worker')
+    const a = await broker.open(api, 'rw')
+    const w = await broker.open(worker, 'rw')
+    await expect(broker.open(api, 'rw')).rejects.toThrow(/write-lock/)
+    a.close()
+    await expect(broker.open(worker, 'rw')).rejects.toThrow(/write-lock/)
+    const next = await broker.open(api, 'rw')
+    next.close()
+    w.close()
+  })
   const spawnOf =
     (pty: PtyLike): PtySpawn =>
     () =>
@@ -87,7 +101,7 @@ describe('PtyBroker', () => {
     const term = await broker.open(repo, 'ro')
     term.write('rm -rf /')
     expect(pty.written).toEqual([])
-    expect(broker.locks.isHeld('svc')).toBe(false)
+    expect(broker.locks.isHeld(repo.session)).toBe(false)
   })
 
   it('read-only sessions let mouse-wheel reports through (scrolling), nothing else', async () => {
@@ -106,10 +120,10 @@ describe('PtyBroker', () => {
   it('read-write holds the lock until close, blocking a second rw', async () => {
     const broker = new PtyBroker(spawnOf(fakePty()))
     const term = await broker.open(repo, 'rw')
-    expect(broker.locks.isHeld('svc')).toBe(true)
+    expect(broker.locks.isHeld(repo.session)).toBe(true)
     await expect(broker.open(repo, 'rw')).rejects.toThrow(/write-lock/)
     term.close()
-    expect(broker.locks.isHeld('svc')).toBe(false)
+    expect(broker.locks.isHeld(repo.session)).toBe(false)
   })
 
   it('releases the write-lock when spawning the terminal fails', async () => {
@@ -118,7 +132,7 @@ describe('PtyBroker', () => {
     })
 
     await expect(broker.open(repo, 'rw')).rejects.toThrow('PTY spawn failed')
-    expect(broker.locks.isHeld('svc')).toBe(false)
+    expect(broker.locks.isHeld(repo.session)).toBe(false)
   })
 
   it('openShell runs `devspace enter` in the repo directory', async () => {
@@ -190,19 +204,19 @@ describe('PtyBroker', () => {
     // Each `devspace enter` is its own exec into the pod, so any number can run
     // read-write at once (VS Code-style multiple terminals into one pod).
     await broker.openShell(repo, 'rw')
-    expect(broker.locks.isHeld('svc')).toBe(false)
+    expect(broker.locks.isHeld(repo.session)).toBe(false)
     await expect(broker.openShell(repo, 'rw')).resolves.toBeTruthy()
     // The shared tmux session still locks, independently of the pod shells.
     await broker.open(repo, 'rw')
-    expect(broker.locks.isHeld('svc')).toBe(true)
+    expect(broker.locks.isHeld(repo.session)).toBe(true)
   })
 
   it('releases the lock when the pty exits', async () => {
     const pty = fakePty()
     const broker = new PtyBroker(spawnOf(pty))
     await broker.open(repo, 'rw')
-    expect(broker.locks.isHeld('svc')).toBe(true)
+    expect(broker.locks.isHeld(repo.session)).toBe(true)
     pty.exit()
-    expect(broker.locks.isHeld('svc')).toBe(false)
+    expect(broker.locks.isHeld(repo.session)).toBe(false)
   })
 })

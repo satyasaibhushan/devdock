@@ -28,7 +28,7 @@ export function deriveStatus(
   // RUNNING_EXTERNAL just because `devspace dev` is no longer running.
   if (sessionDead) return 'CRASHED'
 
-  const crashed = pods.some((p) => p.restartCount > 0 || p.phase === 'Failed')
+  const crashed = pods.some((p) => p.crashing || p.phase === 'Failed')
   if (crashed) return 'CRASHED'
 
   const anyReady = pods.some((p) => p.ready)
@@ -101,8 +101,26 @@ export function parsePods(json: string): PodInfo[] {
   for (const item of items) {
     const meta = (item as { metadata?: { name?: string } }).metadata
     const status = (item as { status?: Record<string, unknown> }).status ?? {}
-    const containers =
-      (status.containerStatuses as { ready?: boolean; restartCount?: number }[] | undefined) ?? []
+    type ContainerStatus = {
+      ready?: boolean
+      restartCount?: number
+      state?: { waiting?: { reason?: string }; terminated?: { exitCode?: number } }
+    }
+    const containers = (status.containerStatuses as ContainerStatus[] | undefined) ?? []
+    const initContainers = (status.initContainerStatuses as ContainerStatus[] | undefined) ?? []
+    const crashing = [...containers, ...initContainers].some(
+      (c) =>
+        !c.ready &&
+        ([
+          'CrashLoopBackOff',
+          'RunContainerError',
+          'CreateContainerError',
+          'ImagePullBackOff',
+          'ErrImagePull',
+          'CreateContainerConfigError',
+        ].includes(c.state?.waiting?.reason ?? '') ||
+          (typeof c.state?.terminated?.exitCode === 'number' && c.state.terminated.exitCode !== 0)),
+    )
     const restartCount = containers.reduce((sum, c) => sum + (c.restartCount ?? 0), 0)
     const ready = containers.length > 0 && containers.every((c) => c.ready === true)
     pods.push({
@@ -110,6 +128,7 @@ export function parsePods(json: string): PodInfo[] {
       phase: typeof status.phase === 'string' ? status.phase : 'Unknown',
       ready,
       restartCount,
+      ...(crashing ? { crashing: true } : {}),
     })
   }
   return pods
