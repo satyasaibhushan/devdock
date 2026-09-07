@@ -8,6 +8,11 @@ export function createServer(client: DaemonClient, scope: Scope): McpServer {
   const server = new McpServer({ name: 'devdock', version: '0.0.0' })
 
   for (const tool of toolsForScope(client, scope)) {
+    if (
+      process.env.DEVDOCK_MCP_DEVELOPMENT_ONLY === '1' &&
+      /^devdock_(term_|instance)/.test(tool.name)
+    )
+      continue
     server.registerTool(
       tool.name,
       { description: tool.description, inputSchema: tool.inputSchema },

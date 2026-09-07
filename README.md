@@ -44,3 +44,17 @@ TypeScript end-to-end — Fastify (HTTP/WS), node-pty ↔ xterm.js for terminals
 ## Status
 
 Design spec. See [`devdock.html`](devdock.html) for the full architecture document.
+
+## Restricted development connection
+
+Outgoing instance links do not create a return tunnel. A workstation can open
+remote terminals without exposing its own terminal service to the remote host.
+
+Set `DEVDOCK_AGENT_SOCKET` on the daemon to expose repository and pod operations
+through a separate Unix socket. Its parent must be daemon-owned, setgid, and have
+no group write or other access, for example mode `2750`. The socket uses `0660`,
+so membership in its group grants development access. Host terminals, credential
+routes, and instance routing are rejected by this listener.
+
+Development clients use `DEVDOCK_SOCKET` pointing to that socket and
+`DEVDOCK_MCP_DEVELOPMENT_ONLY=1` to omit unavailable host and instance tools.

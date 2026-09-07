@@ -277,6 +277,10 @@ export class Instances {
     if (existsSync(file)) {
       for (const link of JSON.parse(readFileSync(file, 'utf8')) as InstanceLink[]) {
         validateLink(link.host, link.endpoint)
+        if (!localEndpoint) {
+          delete link.returnId
+          delete link.returnEndpoint
+        }
         this.links.set(
           link.id,
           link.returnId && localEndpoint ? { ...link, returnEndpoint: localEndpoint } : link,

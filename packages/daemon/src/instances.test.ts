@@ -52,6 +52,29 @@ describe('instance directory', () => {
     await expect(instances.request('missing', 'GET', '/repos')).rejects.toThrow('Unknown instance')
     instances.close()
   })
+  it('drops persisted return forwarding when the local daemon is not exported', () => {
+    const root = directory()
+    writeFileSync(
+      join(root, 'instances.json'),
+      JSON.stringify([
+        {
+          id: '12345678-1234-1234-1234-123456789012',
+          name: 'devbox',
+          protocol: 1,
+          host: 'devbox',
+          endpoint: '/run/user/1000/devdock/control.sock',
+          terminals: true,
+          returnId: 'bbbbbbbb-1234-1234-1234-123456789012',
+          returnEndpoint: '127.0.0.1:7717',
+        },
+      ]),
+    )
+    const instances = new Instances(root)
+    expect(instances.list()[0]?.terminals).toBe(true)
+    expect(instances.list()[0]).not.toHaveProperty('returnId')
+    expect(instances.list()[0]).not.toHaveProperty('returnEndpoint')
+    instances.close()
+  })
   it('pins peer identity, routes requests, persists links, and blocks credentials', async () => {
     const root = directory()
     const socket = join(root, 'peer.sock')

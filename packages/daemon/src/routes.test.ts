@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { type RunResult, Service } from '@devdock/core'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { AccessGate } from './accessGate.js'
+import { buildAgentApp } from './agentAccess.js'
 import { Instances } from './instances.js'
 import { buildApp } from './routes.js'
 
@@ -42,6 +43,35 @@ function makeService(start = vi.fn(), instanceId?: string) {
   svc.rescan()
   return { svc, start }
 }
+
+it('development socket allows repository operations but denies host shells and peer access', async () => {
+  const { svc } = makeService()
+  const app = buildAgentApp(svc)
+  try {
+    expect((await app.inject({ method: 'GET', url: '/repos' })).statusCode).toBe(200)
+    const exec = vi
+      .spyOn(svc, 'exec')
+      .mockResolvedValue({ code: 0, stdout: 'verified', stderr: '' })
+    const result = await app.inject({
+      method: 'POST',
+      url: '/repos/svc-a/exec',
+      payload: { command: 'echo verified' },
+    })
+    expect(result.statusCode).toBe(200)
+    expect(exec).toHaveBeenCalled()
+    for (const url of [
+      '/terminals',
+      '/terminals/host:1/run',
+      '/instances',
+      '/instances/mac/api/terminals',
+      '/aws/credential',
+    ]) {
+      expect((await app.inject({ method: 'POST', url, payload: {} })).statusCode).toBe(403)
+    }
+  } finally {
+    await app.close()
+  }
+})
 
 describe('daemon routes', () => {
   it('returns an operation receipt without waiting for deployment and exposes the same ID on reads', async () => {

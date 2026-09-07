@@ -9,6 +9,7 @@ import {
   pathShadowWarnings,
 } from '@devdock/core'
 import { AccessGate } from './accessGate.js'
+import { listenAgent } from './agentAccess.js'
 import { Instances } from './instances.js'
 import { listen } from './listener.js'
 import { buildApp } from './routes.js'
@@ -30,11 +31,8 @@ async function main() {
     .catch(() => undefined)
 
   const roots = (process.env.DEVDOCK_ROOTS ?? join(homedir(), 'Code')).split(':').filter(Boolean)
-  const instances = new Instances(
-    join(homedir(), '.devdock'),
-    undefined,
-    SOCKET ?? `127.0.0.1:${PORT}`,
-  )
+  // Outgoing links must not expose this daemon through a reverse SSH tunnel.
+  const instances = new Instances(join(homedir(), '.devdock'))
   const service = new Service(
     {
       roots,
@@ -52,6 +50,9 @@ async function main() {
   )
   const app = buildApp(service, gate, instances)
   const address = await listen(app, { port: PORT, host: HOST, socket: SOCKET })
+  const agentApp = process.env.DEVDOCK_AGENT_SOCKET
+    ? await listenAgent(service, process.env.DEVDOCK_AGENT_SOCKET)
+    : undefined
   const streams = attachWs(app.server, service, gate, instances)
   instances.start()
 
@@ -63,7 +64,7 @@ async function main() {
     service.stopLoop()
     for (const client of streams.clients) client.terminate()
     streams.close()
-    void app.close().then(() => process.exit(0))
+    void Promise.all([app.close(), agentApp?.close()]).then(() => process.exit(0))
   }
   process.on('SIGINT', shutdown)
   process.on('SIGTERM', shutdown)
