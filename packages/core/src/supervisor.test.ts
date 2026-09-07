@@ -3,6 +3,7 @@ import { type RunResult, loginShell, loginShellArgs } from './exec.js'
 import { sessionName } from './registry.js'
 import { Supervisor, devspaceArgs, devspaceCommand, shellQuote, verbLabel } from './supervisor.js'
 import type { Repo } from './types.js'
+import { scopeRepo } from './workloads.js'
 
 const repo: Repo = {
   id: 'svc-a',
@@ -27,6 +28,23 @@ const wrapped: Repo = {
 function ok(stdout = ''): RunResult {
   return { code: 0, stdout, stderr: '' }
 }
+
+it('isolates API and worker project locks while preserving template names', () => {
+  const api = scopeRepo(repo, 'api')
+  const worker = scopeRepo(repo, 'worker')
+  expect(devspaceArgs(api)).toEqual([
+    '--var',
+    'WORKLOAD_TYPE=api',
+    '--override-name',
+    'svc-a-api',
+    '--var',
+    'DEVSPACE_NAME=svc-a',
+    '--var',
+    'devspace.name=svc-a',
+  ])
+  expect(devspaceArgs(worker)).toContain('svc-a-worker')
+  expect(devspaceCommand(api, 'dev')).not.toEqual(devspaceCommand(worker, 'dev'))
+})
 
 describe('Supervisor', () => {
   it('starts devspace dev inside a named tmux session, via a login shell', async () => {

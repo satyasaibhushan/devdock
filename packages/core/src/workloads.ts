@@ -92,6 +92,7 @@ export function scopeRepo(repo: Repo, type?: string): Repo {
   return {
     ...repo,
     name: `${repo.name}-${type}`,
+    devspaceTemplateName: repo.name,
     session: `${repo.session}-${type}`,
     varDefaults: { ...repo.varDefaults, WORKLOAD_TYPE: type },
     // The clone represents a single workload — it must not recurse into itself.

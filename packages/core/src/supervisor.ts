@@ -3,6 +3,7 @@
 // daemon restarts and the daemon never blocks on it (spec §5).
 import { type RunResult, loginShell, loginShellArgs, run, runStream } from './exec.js'
 import type { Repo } from './types.js'
+import { prepareWorkloadConfig, workloadConfigPath } from './workloadConfig.js'
 
 /** Injectable command runner — defaults to the real `run`; swapped in tests. */
 export type Runner = (cmd: string, args: string[], opts?: { cwd?: string }) => Promise<RunResult>
@@ -32,6 +33,16 @@ export function devspaceArgs(repo: Repo): string[] {
   const args: string[] = []
   for (const [key, value] of Object.entries(repo.varDefaults ?? {})) {
     args.push('--var', `${key}=${value}`)
+  }
+  if (repo.devspaceTemplateName) {
+    args.push(
+      '--override-name',
+      repo.name,
+      '--var',
+      `DEVSPACE_NAME=${repo.devspaceTemplateName}`,
+      '--var',
+      `devspace.name=${repo.devspaceTemplateName}`,
+    )
   }
   if (repo.namespace) args.push('-n', repo.namespace)
   return args
@@ -63,7 +74,10 @@ export function devspaceCommand(repo: Repo, verb: string): string {
   const extra = devspaceArgs(repo)
     .map((a) => (a.startsWith('-') ? a : shellQuote(a)))
     .join(' ')
-  const cmd = `cd ${shellQuote(repo.path)} && devspace ${verb}${extra ? ` ${extra}` : ''}`
+  const config = repo.devspaceTemplateName
+    ? `DEVSPACE_CONFIG=${shellQuote(workloadConfigPath(repo))} `
+    : ''
+  const cmd = `cd ${shellQuote(repo.path)} && ${config}devspace ${verb}${extra ? ` ${extra}` : ''}`
   return repo.root ? `export DEVSPACE_BINARY_DIR=${shellQuote(repo.root)} && ${cmd}` : cmd
 }
 
@@ -91,6 +105,7 @@ export class Supervisor {
    *  With `pipeFile`, the pane is mirrored there via `tmux pipe-pane` so the
    *  daemon can tail the same output you'd see running `devspace dev` yourself. */
   async start(repo: Repo, pipeFile?: string): Promise<RunResult> {
+    prepareWorkloadConfig(repo)
     // Run the dev command through a login shell inside the session so it gets
     // the same PATH/env the user has in a terminal (docker/kubectl resolve), and
     // honors the wrapper's DEVSPACE_BINARY_DIR — matching build/kill exactly.
@@ -160,6 +175,7 @@ export class Supervisor {
   /** Build & deploy without entering dev mode: `devspace deploy`, through a
    *  login shell so docker/kubectl resolve (see devspaceCommand). */
   build(repo: Repo, onLine?: LineSink): Promise<RunResult> {
+    prepareWorkloadConfig(repo)
     const args = [loginShellArgs, devspaceCommand(repo, 'deploy')]
     if (!onLine) return this.runner(loginShell, args)
     return this.streamRunner(loginShell, args, {}, onLine)
@@ -170,6 +186,7 @@ export class Supervisor {
    *  under a live session fails on that lock — release the lock, then
    *  `devspace purge` through a login shell. */
   async kill(repo: Repo, onLine?: LineSink): Promise<RunResult> {
+    prepareWorkloadConfig(repo)
     await this.runner('tmux', ['kill-session', '-t', exactTarget(repo.session)]).catch(
       () => undefined,
     )
@@ -185,6 +202,7 @@ export class Supervisor {
    *  namespace session lock, then runs `devspace reset pods` to remove the
    *  replaced dev pod and restore the original deployment. No purge, no rebuild. */
   async clear(repo: Repo, onLine?: LineSink): Promise<RunResult> {
+    prepareWorkloadConfig(repo)
     await this.runner('tmux', ['kill-session', '-t', exactTarget(repo.session)]).catch(
       () => undefined,
     )

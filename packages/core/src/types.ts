@@ -34,6 +34,8 @@ export interface Repo {
   root?: string
   /** Path to the discovered devspace.yaml. */
   configPath: string
+  /** Original template name when a shared config has a workload-specific project lock. */
+  devspaceTemplateName?: string
   /** Kubernetes namespace, if declared in the config. */
   namespace?: string
   /** Primary workload / deployment name, if declared. */
