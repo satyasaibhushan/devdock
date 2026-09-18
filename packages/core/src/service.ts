@@ -1016,6 +1016,26 @@ export class Service {
     const denied = (await this.ensureAuth(parentId)) ?? (await this.ensureAwsCreds(parentId))
     if (denied) throw new Error(denied.stderr || 'auth required')
 
+    // Replica generation may only write inside the new worktree. Keep an
+    // exact snapshot of every parent config so a worktree/sync regression
+    // cannot silently turn the primary checkout into the replica project.
+    const parentConfigs = new Map(
+      (parent.members?.map((member) => member.configPath) ?? [parent.configPath]).map((path) => [
+        path,
+        readFileSync(path, 'utf8'),
+      ]),
+    )
+    const assertParentConfigsUnchanged = (): void => {
+      const changed = [...parentConfigs].filter(
+        ([path, original]) => readFileSync(path, 'utf8') !== original,
+      )
+      if (!changed.length) return
+      for (const [path, original] of changed) writeFileSync(path, original)
+      throw new Error(
+        `Replica creation changed parent DevSpace config; restored ${changed.map(([path]) => path).join(', ')}`,
+      )
+    }
+
     // Orphan dirs from a crashed create still occupy their id (existsSync), so
     // a new replica can never collide with leftovers GC hasn't swept yet.
     const replicasDir = join(parent.path, '.agents', 'replicas')
@@ -1044,6 +1064,7 @@ export class Service {
       throw new Error(added.stderr.trim() || `git worktree add exited ${added.code}`)
     }
     try {
+      assertParentConfigsUnchanged()
       let namespace = parent.namespace
       if (!namespace) namespace = (await this.contextNamespace()) || undefined
       // Own image: pin `<ns>-${WORKLOAD_NAME}` — the guidelines' default tag
@@ -1088,6 +1109,7 @@ export class Service {
         writeFileSync(configPath, generated)
         configPaths.push(configPath)
       }
+      assertParentConfigsUnchanged()
       this.store.copyStartup(parentId, id) // inherit `python main.py` etc.
       const record: ReplicaRecord = {
         id,

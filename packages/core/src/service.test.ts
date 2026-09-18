@@ -1471,6 +1471,8 @@ describe('Service replicas', () => {
 
   it('creates a replica of a single-config repo from its root devspace.yaml', async () => {
     const { svc, runner } = newService()
+    const parentConfig = join(root, 'svc-a', 'devspace.yaml')
+    const originalParentConfig = readFileSync(parentConfig, 'utf8')
     const rec = await svc.createReplica('svc-a', 'feature-x')
     expect(rec.id).toBe('svc-a-r1')
     const wt = join(root, 'svc-a', '.agents', 'replicas', 'svc-a-r1')
@@ -1489,6 +1491,7 @@ describe('Service replicas', () => {
     expect(generated.name).toBe('svc-a-r1')
     expect(generated.vars.INGRESS_PATH).toBe('svc-a-r1')
     expect(generated.vars.IMAGE_TAG).toBe('ns-svc-a-${WORKLOAD_TYPE}')
+    expect(readFileSync(parentConfig, 'utf8')).toBe(originalParentConfig)
     expect(rec.releases).toEqual(['svc-a-r1', 'svc-a-r1-api'])
 
     const repo = svc.listRepos().find((r) => r.id === 'svc-a-r1')
@@ -1514,6 +1517,34 @@ describe('Service replicas', () => {
       'remove',
       '--force',
       wt,
+    ])
+    expect(svc.listReplicas()).toEqual([])
+  })
+
+  it('restores the primary config and aborts if worktree creation changes it', async () => {
+    const parentConfig = join(root, 'svc-a', 'devspace.yaml')
+    const originalParentConfig = readFileSync(parentConfig, 'utf8')
+    const baseRunner = cannedRunner('{"items":[]}', false)
+    const runner = vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
+      const result = await baseRunner(cmd, args)
+      if (cmd === 'git' && args.includes('add')) {
+        writeFileSync(parentConfig, 'name: svc-a-r1\nnamespace: ns\n')
+      }
+      return result
+    })
+    const { svc } = newService(runner)
+
+    await expect(svc.createReplica('svc-a', 'feature-x')).rejects.toThrow(
+      /changed parent DevSpace config; restored/,
+    )
+    expect(readFileSync(parentConfig, 'utf8')).toBe(originalParentConfig)
+    expect(runner).toHaveBeenCalledWith('git', [
+      '-C',
+      join(root, 'svc-a'),
+      'worktree',
+      'remove',
+      '--force',
+      join(root, 'svc-a', '.agents', 'replicas', 'svc-a-r1'),
     ])
     expect(svc.listReplicas()).toEqual([])
   })
