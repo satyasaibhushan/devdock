@@ -90,6 +90,28 @@ describe('generateReplicaConfig', () => {
     const untagged = parseYaml(generateReplicaConfig(MEMBER_CONFIG, { replicaId: 'svc-r1' }))
     expect(untagged.vars.IMAGE_TAG).toBeUndefined()
   })
+
+  it('retargets hardcoded dev selectors and containers to the replica', () => {
+    const generated = parseYaml(
+      generateReplicaConfig(
+        `name: career-service-ui
+dev:
+  common:
+    labelSelector:
+      svc: career-service-ui
+      tier: frontend
+    container: career-service-ui
+`,
+        { replicaId: 'career-service-ui-r1' },
+      ),
+    )
+
+    expect(generated.dev.common.labelSelector).toEqual({
+      svc: 'career-service-ui-r1',
+      tier: 'frontend',
+    })
+    expect(generated.dev.common.container).toBe('career-service-ui-r1')
+  })
 })
 
 describe('ingressPathOf', () => {

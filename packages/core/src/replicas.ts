@@ -3,7 +3,7 @@
 // configs (renamed workloads, own URL path, pinned image tag) so it deploys
 // beside the parent in the same namespace without touching tracked files.
 import { dirname, join } from 'node:path'
-import { parseDocument } from 'yaml'
+import { isMap, isScalar, parseDocument } from 'yaml'
 
 /** Keep replica worktrees beside the parent checkout, not inside it. A nested
  * worktree falls under the parent's DevSpace sync root and recursively syncs
@@ -37,9 +37,30 @@ export function generateReplicaConfig(
   opts: { replicaId: string; workloadType?: string; imageTag?: string },
 ): string {
   const doc = parseDocument(parentYaml)
-  doc.setIn(['name'], opts.workloadType ? `${opts.replicaId}-${opts.workloadType}` : opts.replicaId)
+  const parentName = doc.get('name')
+  const replicaName = opts.workloadType ? `${opts.replicaId}-${opts.workloadType}` : opts.replicaId
+  doc.setIn(['name'], replicaName)
   doc.setIn(['vars', 'INGRESS_PATH'], opts.replicaId)
   if (opts.imageTag !== undefined) doc.setIn(['vars', 'IMAGE_TAG'], opts.imageTag)
+
+  // Some repositories interpolate WORKLOAD_NAME in their dev selector, while
+  // older UI configs hardcode the project name. Retarget exact hardcoded
+  // references so the replica cannot attach to and sync over the primary pod.
+  const dev = doc.get('dev', true)
+  if (typeof parentName === 'string' && isMap(dev)) {
+    for (const targetPair of dev.items) {
+      const target = targetPair.value
+      if (!isMap(target)) continue
+      if (target.get('container') === parentName) target.set('container', replicaName)
+      const selector = target.get('labelSelector', true)
+      if (!isMap(selector)) continue
+      for (const labelPair of selector.items) {
+        if (isScalar(labelPair.value) && labelPair.value.value === parentName) {
+          labelPair.value.value = replicaName
+        }
+      }
+    }
+  }
   return doc.toString()
 }
 
