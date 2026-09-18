@@ -2,7 +2,16 @@
 // A replica is a git worktree of the parent repo with generated devspace
 // configs (renamed workloads, own URL path, pinned image tag) so it deploys
 // beside the parent in the same namespace without touching tracked files.
+import { dirname, join } from 'node:path'
 import { parseDocument } from 'yaml'
+
+/** Keep replica worktrees beside the parent checkout, not inside it. A nested
+ * worktree falls under the parent's DevSpace sync root and recursively syncs
+ * its own `.agents/replicas` directory. The hidden sibling preserves relative
+ * paths to neighboring repositories such as `../ui-support`. */
+export function replicaCheckoutPath(parentPath: string, replicaId: string): string {
+  return join(dirname(parentPath), `.devdock-${replicaId}`)
+}
 
 /** Smallest free `<parentId>-rN`. `isTaken` must answer for every claimant —
  *  registered repos, stored records, and leftover worktree dirs on disk — so

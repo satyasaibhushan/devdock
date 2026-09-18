@@ -1410,7 +1410,7 @@ describe('Service replicas', () => {
     }
   }
   const parentPath = () => join(root, 'parent')
-  const replicaPath = (id: string) => join(parentPath(), '.agents', 'replicas', id)
+  const replicaPath = (id: string) => join(root, `.devdock-${id}`)
 
   const newService = (runner = cannedRunner('{"items":[]}', false)) => {
     const svc = new Service(
@@ -1475,7 +1475,7 @@ describe('Service replicas', () => {
     const originalParentConfig = readFileSync(parentConfig, 'utf8')
     const rec = await svc.createReplica('svc-a', 'feature-x')
     expect(rec.id).toBe('svc-a-r1')
-    const wt = join(root, 'svc-a', '.agents', 'replicas', 'svc-a-r1')
+    const wt = join(root, '.devdock-svc-a-r1')
     expect(runner).toHaveBeenCalledWith('git', [
       '-C',
       join(root, 'svc-a'),
@@ -1544,7 +1544,7 @@ describe('Service replicas', () => {
       'worktree',
       'remove',
       '--force',
-      join(root, 'svc-a', '.agents', 'replicas', 'svc-a-r1'),
+      join(root, '.devdock-svc-a-r1'),
     ])
     expect(svc.listReplicas()).toEqual([])
   })

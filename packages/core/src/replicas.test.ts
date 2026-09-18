@@ -5,6 +5,7 @@ import {
   generateReplicaConfig,
   ingressPathOf,
   nextReplicaId,
+  replicaCheckoutPath,
 } from './replicas.js'
 
 // Verbatim excerpt of a real member config (career-service-agents-api) — the
@@ -43,6 +44,14 @@ describe('nextReplicaId', () => {
   })
   it('starts at r1 when nothing is taken', () => {
     expect(nextReplicaId('svc', () => false)).toBe('svc-r1')
+  })
+})
+
+describe('replicaCheckoutPath', () => {
+  it('places the worktree in a hidden sibling outside the parent sync root', () => {
+    expect(replicaCheckoutPath('/Code/frontend/career-service-ui', 'career-service-ui-r1')).toBe(
+      '/Code/frontend/.devdock-career-service-ui-r1',
+    )
   })
 })
 

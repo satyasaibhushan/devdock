@@ -21,6 +21,7 @@ import {
   generateReplicaConfig,
   ingressPathOf,
   nextReplicaId,
+  replicaCheckoutPath,
 } from './replicas.js'
 import { type ReplicaRecord, StateStore } from './stateStore.js'
 import { type SessionState, type StreamRunner, Supervisor, verbLabel } from './supervisor.js'
@@ -995,8 +996,8 @@ export class Service {
     return out
   }
 
-  /** Create a replica of `parentId` pinned to `branch`: a detached git
-   *  worktree under `.agents/replicas/` plus generated configs (per-member for
+  /** Create a replica of `parentId` pinned to `branch`: a detached hidden
+   *  sibling worktree plus generated configs (per-member for
    *  the `.devspace/<service>/` layout, the root devspace.yaml otherwise), so
    *  that branch's code deploys beside the parent in the same namespace with
    *  zero changes to tracked files anywhere. By default the replica reuses the
@@ -1038,16 +1039,16 @@ export class Service {
 
     // Orphan dirs from a crashed create still occupy their id (existsSync), so
     // a new replica can never collide with leftovers GC hasn't swept yet.
-    const replicasDir = join(parent.path, '.agents', 'replicas')
+    const legacyReplicasDir = join(parent.path, '.agents', 'replicas')
     const id = nextReplicaId(
       `${parentId}${this.replicaInstanceSuffix}`,
       (cand) =>
         this.repos.has(cand) ||
         !!this.store.getReplica(cand) ||
-        existsSync(join(replicasDir, cand)),
+        existsSync(replicaCheckoutPath(parent.path, cand)) ||
+        existsSync(join(legacyReplicasDir, cand)),
     )
-    const wt = join(replicasDir, id)
-    mkdirSync(replicasDir, { recursive: true })
+    const wt = replicaCheckoutPath(parent.path, id)
     // --detach: no branch is checked out twice (git forbids that) and the
     // worktree can't accumulate commits — replicas are strictly read-only
     // snapshots of the branch's tip at creation time.
