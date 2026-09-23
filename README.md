@@ -58,3 +58,14 @@ routes, and instance routing are rejected by this listener.
 
 Development clients use `DEVDOCK_SOCKET` pointing to that socket and
 `DEVDOCK_MCP_DEVELOPMENT_ONLY=1` to omit unavailable host and instance tools.
+
+## MCP endpoints
+
+The daemon serves MCP over Streamable HTTP on its own listener, both protocol
+eras (2025 `initialize` and 2026-07-28): `http://127.0.0.1:7717/mcp` is
+read-only and `/mcp/rw` adds the write verbs. Every agent session shares the
+warm daemon instead of spawning a process, and requests pass the same ingress
+gate as the rest of the API. The agent socket does not serve MCP.
+
+`devdock-mcp` still speaks stdio for clients that cannot use HTTP; it proxies
+to the daemon API and reads `DEVDOCK_MCP_SCOPE=rw` for write verbs.

@@ -12,6 +12,7 @@ import { AccessGate } from './accessGate.js'
 import { listenAgent } from './agentAccess.js'
 import { Instances } from './instances.js'
 import { listen } from './listener.js'
+import { mountMcp } from './mcp.js'
 import { buildApp } from './routes.js'
 import { attachWs } from './wsServer.js'
 
@@ -49,6 +50,8 @@ async function main() {
     Boolean(SOCKET),
   )
   const app = buildApp(service, gate, instances)
+  // Only the main listener serves MCP; the agent socket keeps its route allowlist.
+  const closeMcp = mountMcp(app)
   const address = await listen(app, { port: PORT, host: HOST, socket: SOCKET })
   const agentApp = process.env.DEVDOCK_AGENT_SOCKET
     ? await listenAgent(service, process.env.DEVDOCK_AGENT_SOCKET)
@@ -64,7 +67,7 @@ async function main() {
     service.stopLoop()
     for (const client of streams.clients) client.terminate()
     streams.close()
-    void Promise.all([app.close(), agentApp?.close()]).then(() => process.exit(0))
+    void Promise.all([closeMcp(), app.close(), agentApp?.close()]).then(() => process.exit(0))
   }
   process.on('SIGINT', shutdown)
   process.on('SIGTERM', shutdown)

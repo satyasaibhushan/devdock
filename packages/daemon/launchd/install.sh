@@ -51,20 +51,22 @@ trap cleanup EXIT
 STAGED_DAEMON="$STAGING/packages/daemon/dist/index.js"
 STAGED_CORE="$STAGING/packages/daemon/node_modules/@devdock/core/dist/index.js"
 STAGED_ROUTES="$STAGING/packages/daemon/dist/routes.js"
+STAGED_DAEMON_MCP="$STAGING/packages/daemon/dist/mcp.js"
 STAGED_MCP="$STAGING/packages/mcp/dist/index.js"
 STAGED_MCP_SERVER="$STAGING/packages/mcp/dist/server.js"
-STAGED_MCP_SDK="$STAGING/packages/mcp/node_modules/@modelcontextprotocol/sdk/package.json"
-for required in "$STAGED_DAEMON" "$STAGED_CORE" "$STAGED_ROUTES" "$STAGED_MCP" "$STAGED_MCP_SERVER" "$STAGED_MCP_SDK"; do
+STAGED_MCP_SDK="$STAGING/packages/mcp/node_modules/@modelcontextprotocol/server/package.json"
+for required in "$STAGED_DAEMON" "$STAGED_CORE" "$STAGED_ROUTES" "$STAGED_DAEMON_MCP" "$STAGED_MCP" "$STAGED_MCP_SERVER" "$STAGED_MCP_SDK"; do
   if [[ ! -f "$required" ]]; then
     echo "error: portable release is missing $required" >&2
     exit 1
   fi
 done
 
-# Import both the workspace core and daemon routes from the portable tree. This
+# Import the workspace core, daemon routes and MCP from the portable tree. This
 # catches missing/broken production dependencies before touching the live job.
 "$NODE_BIN" --input-type=module --eval 'await import(process.argv[1])' "$STAGED_CORE"
 "$NODE_BIN" --input-type=module --eval 'await import(process.argv[1])' "$STAGED_ROUTES"
+"$NODE_BIN" --input-type=module --eval 'await import(process.argv[1])' "$STAGED_DAEMON_MCP"
 "$NODE_BIN" --input-type=module --eval 'await import(process.argv[1])' "$STAGED_MCP_SERVER"
 
 REVISION="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || printf 'local')"

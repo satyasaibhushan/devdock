@@ -51,12 +51,13 @@ if [[ " $* " == *" @devdock/web "* ]]; then
 fi
 if [[ " $* " == *" deploy "* ]]; then
   target="${'${@: -1}'}"
-  mkdir -p "$target/dist" "$target/node_modules/@devdock/core/dist" "$target/node_modules/@modelcontextprotocol/sdk"
+  mkdir -p "$target/dist" "$target/node_modules/@devdock/core/dist" "$target/node_modules/@modelcontextprotocol/server"
   printf 'export {}\\n' > "$target/dist/index.js"
   printf 'export {}\\n' > "$target/dist/routes.js"
+  printf 'export {}\\n' > "$target/dist/mcp.js"
   printf 'export {}\\n' > "$target/dist/server.js"
   printf 'export {}\\n' > "$target/node_modules/@devdock/core/dist/index.js"
-  printf '{}\\n' > "$target/node_modules/@modelcontextprotocol/sdk/package.json"
+  printf '{}\\n' > "$target/node_modules/@modelcontextprotocol/server/package.json"
 fi
 `,
     )
@@ -122,7 +123,9 @@ esac
     const release = dirname(dirname(mcpLauncher))
     expect(existsSync(join(release, 'packages', 'mcp', 'dist', 'index.js'))).toBe(true)
     expect(
-      existsSync(join(release, 'packages', 'mcp', 'node_modules', '@modelcontextprotocol', 'sdk')),
+      existsSync(
+        join(release, 'packages', 'mcp', 'node_modules', '@modelcontextprotocol', 'server'),
+      ),
     ).toBe(true)
 
     rmSync(join(repo, 'node_modules'), { recursive: true, force: true })

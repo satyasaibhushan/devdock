@@ -105,6 +105,9 @@ export interface DaemonClient {
   termClose(tid: string): Promise<void>
 }
 
+/** Sends one request to the daemon API; `path` is relative to the daemon root. */
+export type DaemonTransport = (path: string, init?: RequestInit) => Promise<Response>
+
 /** A DaemonClient backed by the running daemon's HTTP endpoints. */
 export function httpClient(
   baseUrl: string,
@@ -113,8 +116,6 @@ export function httpClient(
   socketPath = process.env.DEVDOCK_SOCKET,
 ): DaemonClient {
   const url = (path: string) => `${baseUrl.replace(/\/$/, '')}${path}`
-  const id = (s: string) => encodeURIComponent(s)
-  const wl = (workload?: string) => (workload ? `?workload=${id(workload)}` : '')
   let token: string | undefined
   try {
     token = readFileSync(tokenFile, 'utf8').trim() || undefined
@@ -122,49 +123,62 @@ export function httpClient(
     // Loopback daemon access remains available. Remote ingress will reject it.
   }
 
-  async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const send: DaemonTransport = async (path, init) => {
     const headers = new Headers(init?.headers)
     if (token) headers.set('authorization', `Bearer ${token}`)
-    const res = socketPath
-      ? await new Promise<Response>((resolve, reject) => {
-          const target = new URL(url(path))
-          const req = httpRequest(
-            {
-              socketPath,
-              path: `${target.pathname}${target.search}`,
-              method: init?.method ?? 'GET',
-              headers: Object.fromEntries(headers.entries()),
-            },
-            (response) => {
-              const chunks: Buffer[] = []
-              let size = 0
-              response.on('data', (chunk: Buffer) => {
-                size += chunk.length
-                if (size > 8 * 1024 * 1024) {
-                  response.destroy(new Error('Response too large'))
-                  return
-                }
-                chunks.push(chunk)
-              })
-              response.on('error', reject)
-              response.on('end', () =>
-                resolve(
-                  new Response(Buffer.concat(chunks).toString(), {
-                    status: response.statusCode ?? 502,
-                  }),
-                ),
-              )
-            },
+    if (!socketPath) {
+      return fetch(url(path), { ...init, headers, signal: AbortSignal.timeout(180_000) })
+    }
+    return new Promise<Response>((resolve, reject) => {
+      const target = new URL(url(path))
+      const req = httpRequest(
+        {
+          socketPath,
+          path: `${target.pathname}${target.search}`,
+          method: init?.method ?? 'GET',
+          headers: Object.fromEntries(headers.entries()),
+        },
+        (response) => {
+          const chunks: Buffer[] = []
+          let size = 0
+          response.on('data', (chunk: Buffer) => {
+            size += chunk.length
+            if (size > 8 * 1024 * 1024) {
+              response.destroy(new Error('Response too large'))
+              return
+            }
+            chunks.push(chunk)
+          })
+          response.on('error', reject)
+          response.on('end', () =>
+            resolve(
+              new Response(Buffer.concat(chunks).toString(), {
+                status: response.statusCode ?? 502,
+              }),
+            ),
           )
-          const timer = setTimeout(
-            () => req.destroy(new Error('Daemon request timed out; check status before retrying')),
-            180_000,
-          )
-          req.on('close', () => clearTimeout(timer))
-          req.on('error', reject)
-          req.end(typeof init?.body === 'string' ? init.body : undefined)
-        })
-      : await fetch(url(path), { ...init, headers, signal: AbortSignal.timeout(180_000) })
+        },
+      )
+      const timer = setTimeout(
+        () => req.destroy(new Error('Daemon request timed out; check status before retrying')),
+        180_000,
+      )
+      req.on('close', () => clearTimeout(timer))
+      req.on('error', reject)
+      req.end(typeof init?.body === 'string' ? init.body : undefined)
+    })
+  }
+  return daemonClient(send)
+}
+
+/** A DaemonClient over any transport to the daemon API. `prefix` scopes every
+ *  path, which is how instance clients reach `/instances/:id/api/*`. */
+export function daemonClient(send: DaemonTransport, prefix = ''): DaemonClient {
+  const id = (s: string) => encodeURIComponent(s)
+  const wl = (workload?: string) => (workload ? `?workload=${id(workload)}` : '')
+
+  async function request<T>(path: string, init?: RequestInit): Promise<T> {
+    const res = await send(`${prefix}${path}`, init)
     const data = (await res.json().catch(() => ({}))) as T & { error?: string; stderr?: string }
     if (!res.ok) {
       throw new Error(
@@ -196,12 +210,7 @@ export function httpClient(
       post(`/repos/${id(repo)}/prerequisites`, { action, workload }),
     checkout: (repo, workload) => request(`/repos/${id(repo)}/checkout${wl(workload)}`),
     instances: () => request<unknown[]>('/instances'),
-    forInstance: (instance) =>
-      httpClient(
-        `${baseUrl.replace(/\/$/, '')}/instances/${id(instance)}/api`,
-        tokenFile,
-        socketPath,
-      ),
+    forInstance: (instance) => daemonClient(send, `${prefix}/instances/${id(instance)}/api`),
     linkInstance: (host, endpoint, terminals = false) =>
       post('/instances', { host, endpoint, terminals }),
     unlinkInstance: async (instance) => {

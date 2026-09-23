@@ -4,6 +4,11 @@
   "private": true,
   "type": "module",
   "main": "./dist/index.js",
+  "exports": {
+    ".": "./dist/index.js",
+    "./server": "./dist/server.js",
+    "./client": "./dist/client.js"
+  },
   "bin": {
     "devdock-mcp": "./dist/index.js"
   },
@@ -14,10 +19,11 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
-    "zod": "^3.24.1"
+    "@modelcontextprotocol/server": "^2.0.0",
+    "zod": "^4.6.5"
   },
   "devDependencies": {
-    "@devdock/core": "workspace:*"
+    "@devdock/core": "workspace:*",
+    "@modelcontextprotocol/client": "^2.0.0"
   }
 }
