@@ -1,5 +1,6 @@
 <script lang="ts">
   import { createTerminal, deleteTerminal, fetchTerminals, type TermInfo } from './api'
+  import Icon from './Icon.svelte'
   import Terminal from './Terminal.svelte'
   import { terminalVisible, terminalLabel } from './terminalContext'
 
@@ -165,24 +166,22 @@
 
 <div class="panel" class:full>
   <div class="tabs">
-    <div class="strip">
+    <div class="strip" role="tablist" aria-label="terminals">
       {#each terms as t (t.id)}
         <div class="tab" class:active={t.id === activeTid} class:primary={t.kind === 'auto'}>
-          <button class="tablabel" onclick={() => (activeTid = t.id)} title="{label(t)} — terminal {t.id}, shared with agents">
-            <span class="tdot {modeOf(t)}"></span>
+          <button class="tablabel" role="tab" aria-selected={t.id === activeTid} onclick={() => (activeTid = t.id)} title="{label(t)} — terminal {t.id}, shared with agents">
+            <span class="tdot {modeOf(t)}" title={modeOf(t) === 'rw' ? 'read-write' : 'read-only'}></span>
             <span class="name">{label(t)}</span>
-            <span class="badge {t.kind === 'auto' ? 'primary' : 'enter'}">{shortId(t)}</span>
+            <span class="num" class:primary={t.kind === 'auto'}>{shortId(t)}</span>
           </button>
           {#if t.kind !== 'auto'}
-            <button class="x" title="close for all clients" aria-label="close terminal" onclick={() => close(t.id)}
-              >×</button
-            >
+            <button class="x" title="close for all clients" aria-label="close terminal" onclick={() => close(t.id)}><Icon name="x" size={11} /></button>
           {/if}
         </div>
       {/each}
       <button
         bind:this={addButton}
-        class="add"
+        class="btn icon sm quiet add"
         title={repo ? 'Open DevSpace terminal. Right-click for a normal terminal on this machine.' : 'Open normal terminal on this machine'}
         aria-label="New terminal"
         aria-haspopup="menu"
@@ -190,20 +189,20 @@
         aria-disabled={!canAdd || adding}
         oncontextmenu={openMenu}
         onkeydown={(event) => { if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) openMenu(event) }}
-        onclick={() => add()}>+</button
+        onclick={() => add()}><Icon name="plus" size={13} /></button
       >
-      <button class="add" title="Terminal options" aria-label="Terminal options" aria-haspopup="menu" aria-expanded={menuOpen} onclick={openMenu}>⌄</button>
+      <button class="btn icon sm quiet add" title="Terminal options" aria-label="Terminal options" aria-haspopup="menu" aria-expanded={menuOpen} onclick={openMenu}><Icon name="chevron-down" size={13} /></button>
     </div>
 
     <div class="tools">
       {#if active}
-        <div class="modes">
-          <button class:active={modeOf(active) === 'ro'} onclick={() => setMode('ro')}>read-only</button>
-          <button class:active={modeOf(active) === 'rw'} onclick={() => setMode('rw')}>read-write</button>
+        <div class="modes" role="group" aria-label="viewer mode">
+          <button class:active={modeOf(active) === 'ro'} aria-pressed={modeOf(active) === 'ro'} onclick={() => setMode('ro')}>read-only</button>
+          <button class:active={modeOf(active) === 'rw'} aria-pressed={modeOf(active) === 'rw'} onclick={() => setMode('rw')}>read-write</button>
         </div>
       {/if}
-      <button class="full-btn" title={full ? 'restore' : 'expand to full screen'} onclick={() => (full = !full)}>
-        {full ? '⤡ restore' : '⤢ expand'}
+      <button class="btn icon sm quiet" title={full ? 'restore (Esc)' : 'expand to full screen'} aria-label={full ? 'restore' : 'expand to full screen'} onclick={() => (full = !full)}>
+        <Icon name={full ? 'collapse' : 'expand'} size={13} />
       </button>
     </div>
   </div>
@@ -212,12 +211,14 @@
     {#if terms.length === 0}
       <div class="empty">
         {#if createError}
+          <Icon name="alert" size={16} />
           <p class="err">{createError}</p>
         {:else}
+          <Icon name="terminal" size={16} />
           <p>{canAdd ? 'No terminal open.' : 'Start the workload to open a DevSpace terminal.'}</p>
         {/if}
         {#if canAdd}
-          <button onclick={() => add()}>+ open a shell</button>
+          <button class="btn sm" onclick={() => add()}><Icon name="plus" size={12} />Open a shell</button>
         {/if}
       </div>
     {:else}
@@ -232,22 +233,52 @@
 
 <!-- Auto popovers light-dismiss on the pointerup that completes a right-click. -->
 <div bind:this={menu} popover="manual" class="terminal-menu" role="menu" tabindex="-1" aria-label="New terminal" style:left="{menuX}px" style:top="{menuY}px" onkeydown={menuKey}>
-  <button role="menuitem" disabled={!repo || !canAdd || adding} onclick={() => add()}>Open DevSpace terminal</button>
-  <button role="menuitem" disabled={adding} onclick={() => add(true)}>Open normal terminal</button>
+  <button role="menuitem" disabled={!repo || !canAdd || adding} onclick={() => add()}><Icon name="terminal" size={13} />Open DevSpace terminal</button>
+  <button role="menuitem" disabled={adding} onclick={() => add(true)}><Icon name="monitor" size={13} />Open normal terminal</button>
 </div>
 {#if createError && terms.length > 0}<p class="err" role="alert">{createError}</p>{/if}
 
 <style>
-  .terminal-menu { position: fixed; margin: 0; padding: 5px; width: 250px; border: 1px solid var(--line); border-radius: 7px; background: var(--bg, #0b0f14); color: var(--ink); box-shadow: 0 10px 30px #0007; }
-  .terminal-menu button { display: block; width: 100%; padding: 9px 10px; text-align: left; font: inherit; font-size: 12px; color: inherit; background: transparent; border: 0; border-radius: 4px; cursor: pointer; }
-  .terminal-menu button:hover:not(:disabled), .terminal-menu button:focus-visible { background: var(--accent-dim, #182a29); outline: 1px solid var(--accent); }
-  .terminal-menu button:disabled { opacity: .4; cursor: default; }
+  .terminal-menu {
+    position: fixed;
+    margin: 0;
+    padding: 4px;
+    width: 230px;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r-2);
+    background: var(--bg-2);
+    color: var(--ink);
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
+  }
+  .terminal-menu button {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 7px 8px;
+    text-align: left;
+    font-size: 12px;
+    color: var(--ink-2);
+    background: transparent;
+    border: 0;
+    border-radius: var(--r-1);
+  }
+  .terminal-menu button:hover:not(:disabled),
+  .terminal-menu button:focus-visible {
+    background: var(--bg-3);
+    color: var(--ink);
+    outline: none;
+  }
+  .terminal-menu button:disabled {
+    opacity: 0.4;
+    cursor: default;
+  }
   .panel {
     display: flex;
     flex-direction: column;
-    gap: 6px;
     min-height: 0;
     height: 100%;
+    background: var(--term-bg);
   }
   /* Full-screen: cover the whole viewport above everything else. The terminals'
      own ResizeObserver refits them to the new size. */
@@ -255,112 +286,108 @@
     position: fixed;
     inset: 0;
     z-index: 50;
-    background: var(--bg, #0b0f14);
-    padding: 12px 16px 16px;
-    gap: 8px;
   }
 
   .tabs {
     display: flex;
-    align-items: center;
+    align-items: stretch;
     justify-content: space-between;
-    gap: 12px;
+    gap: 8px;
+    height: 32px;
     flex: none;
+    background: var(--bg-1);
+    border-bottom: 1px solid var(--line);
   }
   .strip {
     display: flex;
     align-items: center;
-    gap: 4px;
+    gap: 2px;
     min-width: 0;
+    padding: 0 4px 0 8px;
     overflow-x: auto;
+    scrollbar-width: none;
   }
   .tab {
     display: flex;
     align-items: center;
-    border: 1px solid var(--line);
-    border-radius: 7px;
-    background: var(--panel2);
-    overflow: hidden;
+    height: 32px;
     flex: none;
+    border-bottom: 2px solid transparent;
+    /* Room for the top edge so the active underline sits on the bar's border. */
+    margin-bottom: -1px;
   }
   .tab.active {
-    border-color: var(--accent);
-  }
-  /* The primary tab (devspace dev output / pod shell) reads as the anchor — it
-     can't be closed and carries an accent-tinted edge even when inactive. */
-  .tab.primary {
-    border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+    border-bottom-color: var(--accent);
   }
   .tablabel {
     display: inline-flex;
     align-items: center;
-    gap: 6px;
+    gap: 7px;
+    height: 100%;
     border: none;
     background: none;
     color: var(--muted);
-    font-size: 11px;
-    padding: 4px 8px;
-    cursor: pointer;
+    font-size: 12px;
+    padding: 0 8px;
     white-space: nowrap;
+    border-radius: var(--r-1) var(--r-1) 0 0;
+  }
+  .tablabel:hover {
+    color: var(--ink-2);
   }
   .tab.active .tablabel {
     color: var(--ink);
   }
   /* The terminal's per-scope number (1, 2, …); the tooltip carries the full
      scope-qualified id agents see. */
-  .badge {
+  .num {
     font-family: var(--mono);
-    font-size: 9px;
-    letter-spacing: 0.04em;
+    font-size: 10px;
     line-height: 1;
-    padding: 2px 5px;
-    border-radius: 999px;
-    border: 1px solid var(--line);
+    padding: 2px 4px;
+    border-radius: 3px;
     color: var(--muted);
+    background: color-mix(in srgb, var(--muted) 16%, transparent);
   }
-  .badge.primary {
+  /* The primary tab (devspace dev output / pod shell) is the anchor: it can't
+     be closed and its number carries the accent even when inactive. */
+  .num.primary {
     color: var(--accent);
-    border-color: color-mix(in srgb, var(--accent) 40%, transparent);
-    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
   }
   .tdot {
     width: 6px;
     height: 6px;
     border-radius: 50%;
     background: var(--muted);
+    opacity: 0.7;
   }
-  /* read-write tabs glow accent; read-only stay dim. */
+  /* read-write tabs glow ok-green; read-only stay dim. */
   .tdot.rw {
     background: var(--ok);
+    opacity: 1;
   }
   .x {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    margin-right: 4px;
     border: none;
+    border-radius: 3px;
     background: none;
     color: var(--muted);
-    font-size: 14px;
-    line-height: 1;
-    padding: 4px 7px 4px 2px;
-    cursor: pointer;
+    padding: 0;
   }
   .x:hover {
     color: var(--danger);
+    background: color-mix(in srgb, var(--danger) 14%, transparent);
   }
   .add {
-    border: 1px dashed var(--line);
-    background: none;
-    color: var(--muted);
-    font-size: 14px;
-    line-height: 1;
-    padding: 3px 9px;
-    border-radius: 7px;
-    cursor: pointer;
-    flex: none;
+    margin-left: 2px;
   }
-  .add:hover:not(:disabled) {
-    border-color: var(--accent);
-    color: var(--accent);
-  }
-  .add:disabled {
+  .add[aria-disabled='true'] {
     opacity: 0.4;
     cursor: not-allowed;
   }
@@ -368,25 +395,37 @@
   .tools {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 6px;
     flex: none;
+    padding: 0 8px;
   }
+  /* Segmented ro/rw control for the active tab. */
   .modes {
-    display: flex;
-    gap: 4px;
+    display: inline-flex;
+    height: 22px;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r-1);
+    overflow: hidden;
+    background: var(--bg-2);
   }
   .modes button {
+    height: 100%;
+    padding: 0 8px;
     font-size: 11px;
-    padding: 3px 8px;
+    font-weight: 500;
+    color: var(--muted);
+    background: transparent;
+    border: none;
+  }
+  .modes button + button {
+    border-left: 1px solid var(--line-strong);
+  }
+  .modes button:hover {
+    color: var(--ink);
   }
   .modes button.active {
-    border-color: var(--accent);
-    color: var(--accent);
-  }
-  .full-btn {
-    font-size: 11px;
-    padding: 3px 8px;
-    white-space: nowrap;
+    color: var(--ink);
+    background: var(--bg-3);
   }
 
   .screens {
@@ -413,16 +452,24 @@
     justify-content: center;
     gap: 10px;
     height: 100%;
+    padding: 20px;
     color: var(--muted);
-    border: 1px dashed var(--line);
-    border-radius: 10px;
+    text-align: center;
   }
-  .empty .err {
+  .empty p {
+    margin: 0;
+    font-size: 12.5px;
+  }
+  .empty .err,
+  .err {
     font-size: 12px;
     margin: 0;
     color: var(--danger);
     font-family: var(--mono);
     max-width: 80%;
-    text-align: center;
+  }
+  .err[role='alert'] {
+    padding: 6px 12px;
+    max-width: none;
   }
 </style>

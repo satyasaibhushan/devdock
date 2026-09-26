@@ -5,6 +5,7 @@
   // doesn't use oidc-login at all. A pending AWS sign-in shows its own pill
   // (the daemon never opens a browser, so this link is the only way in).
   import { type AuthState, clearAuthCache, startAuthLogin } from './api.js'
+  import Icon from './Icon.svelte'
 
   let {
     instance = '',
@@ -46,9 +47,9 @@
 
 {#if auth.awsLoginUrl}
   <div class="auth login_required" title="AWS refresh token expired" role="status">
-    <span class="dot" aria-hidden="true"></span>
+    <Icon name="alert" size={13} />
     <span class="msg">AWS sign-in required</span>
-    <a class="act" href={auth.awsLoginUrl} target="_blank" rel="noreferrer">open sign-in</a>
+    <a class="btn sm" href={auth.awsLoginUrl} target="_blank" rel="noreferrer">Open sign-in<Icon name="external" size={11} /></a>
   </div>
 {/if}
 {#if visible}
@@ -61,85 +62,74 @@
       <span class="spin" aria-hidden="true"></span>
       <span class="msg">{auth.message ?? 'preparing sign-in…'}</span>
       {#if auth.loginUrl}
-        <a class="act" href={auth.loginUrl} target="_blank" rel="noreferrer">open sign-in</a>
+        <a class="btn sm" href={auth.loginUrl} target="_blank" rel="noreferrer">Open sign-in<Icon name="external" size={11} /></a>
       {/if}
     {:else}
-      <span class="dot" aria-hidden="true"></span>
+      <Icon name="alert" size={13} />
       <span class="msg">
         {auth.message ??
           (auth.phase === 'error' ? 'kubernetes auth error' : 'kubernetes login required')}
       </span>
-      <button class="act" onclick={login} disabled={busy}>log in</button>
+      <button class="btn sm primary" onclick={login} disabled={busy}>Log in</button>
       <button
-        class="act ghost"
+        class="btn sm quiet"
         onclick={clearCache}
         disabled={busy}
         title="rm -r ~/.kube/cache/oidc-login — force a clean login"
       >
-        clear cache
+        Clear cache
       </button>
     {/if}
   </div>
 {/if}
 
 <style>
+  /* Compact warning chip: never wraps, the message ellipsises first so the
+     actions stay reachable at narrow widths. */
   .auth {
     display: inline-flex;
     align-items: center;
     gap: 8px;
-    max-width: 520px;
-    padding: 3px 10px;
-    border-radius: 999px;
-    border: 1px solid var(--line);
-    background: var(--panel2);
-    font-family: var(--mono);
-    font-size: 11px;
-    color: var(--ink);
+    height: 28px;
+    padding: 0 6px 0 10px;
+    border-radius: var(--r-2);
+    border: 1px solid color-mix(in srgb, var(--warn) 40%, transparent);
+    background: color-mix(in srgb, var(--warn) 10%, transparent);
+    color: var(--warn);
+    font-size: 12px;
+    white-space: nowrap;
+    min-width: 0;
+    flex: 0 1 auto;
   }
-  .auth.login_required,
   .auth.error {
-    border-color: color-mix(in srgb, var(--warn, #e2b93b) 55%, var(--line));
+    border-color: color-mix(in srgb, var(--danger) 40%, transparent);
+    background: color-mix(in srgb, var(--danger) 10%, transparent);
+    color: var(--danger);
   }
-  .dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: var(--warn, #e2b93b);
-    flex: none;
+  .auth.logging_in {
+    border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+    color: var(--accent);
   }
   .msg {
-    color: var(--muted);
-    white-space: nowrap;
+    color: var(--ink-2);
     overflow: hidden;
     text-overflow: ellipsis;
+    max-width: 220px;
+    min-width: 36px;
+    flex: 0 1 auto;
   }
-  .act {
-    font-family: var(--mono);
-    font-size: 11px;
-    padding: 2px 8px;
-    border-radius: 6px;
-    border: 1px solid var(--accent);
-    background: transparent;
-    color: var(--accent);
-    cursor: pointer;
+  .auth .btn {
     flex: none;
   }
-  .act:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--accent) 12%, transparent);
-  }
-  .act.ghost {
-    border-color: var(--line);
-    color: var(--muted);
-  }
-  .act:disabled {
-    opacity: 0.5;
-    cursor: default;
+  .auth a.btn {
+    text-decoration: none;
   }
   .spin {
     width: 10px;
     height: 10px;
     border-radius: 50%;
-    border: 2px solid var(--line);
+    border: 2px solid color-mix(in srgb, var(--accent) 30%, transparent);
     border-top-color: var(--accent);
     animation: rot 0.8s linear infinite;
     flex: none;

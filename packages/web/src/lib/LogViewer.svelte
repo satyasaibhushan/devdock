@@ -49,11 +49,23 @@
 
 <style>
   .logs {
-    height: 100%; min-height: 0; overflow-y: auto;
-    background: #0b0f14; border: 1px solid var(--line); border-radius: 10px;
-    padding: 10px; font-family: var(--mono); font-size: 12px; line-height: 1.5;
-    color: #c9d6e2; white-space: pre-wrap; word-break: break-all;
+    height: 100%;
+    min-height: 0;
+    overflow-y: auto;
+    background: var(--term-bg);
+    padding: 8px 16px;
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.5;
+    color: #c9d6e2;
+    white-space: pre-wrap;
+    word-break: break-all;
   }
-  .line { min-height: 1em; }
-  .empty { color: var(--muted); }
+  .line {
+    min-height: 1em;
+  }
+  .empty {
+    color: var(--muted);
+    font-family: var(--sans);
+  }
 </style>

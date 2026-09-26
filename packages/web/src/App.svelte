@@ -3,7 +3,9 @@
   import AuthBanner from './lib/AuthBanner.svelte'
   import InstancePanel from './lib/InstancePanel.svelte'
   import ConfirmModal from './lib/ConfirmModal.svelte'
+  import Icon from './lib/Icon.svelte'
   import LogViewer from './lib/LogViewer.svelte'
+  import MoveModal from './lib/MoveModal.svelte'
   import NamespacePicker from './lib/NamespacePicker.svelte'
   import ReplicaModal from './lib/ReplicaModal.svelte'
   import RepoList from './lib/RepoList.svelte'
@@ -22,11 +24,10 @@
     fetchAuth,
     fetchNamespace,
     fetchInstances,
+    moveDeployment,
     openEvents,
-    releaseOwnership,
     switchNamespace,
     stopSession,
-    takeOverOwnership,
   } from './lib/api'
 
   let instances = $state<InstanceView[]>([])
@@ -62,6 +63,9 @@
   // "follow the repo default"; a value sticks until the user picks another.
   let pickedType = $state<string | null>(null)
   let connected = $state(false)
+  // False until the first /instances round-trip settles, so the empty sidebar
+  // reads as "connecting" rather than "no repos" or "offline".
+  let loaded = $state(false)
   let busy = $state<{ id: string; verb: Verb } | null>(null)
   let activeOperation = $state<Operation | null>(null)
   let toast = $state<string | null>(null)
@@ -104,22 +108,17 @@
     select.value = from
     if (id !== from) moveTarget = instances.find((i) => i.id === id) ?? null
   }
+  // The local daemon runs the whole sequence (release or take-over, then the
+  // planned follow-up on the target); the modal has already shown that plan.
   async function doMove() {
     const to = moveTarget
-    const from = view?.ownerInstanceId
-    if (!to || !from || moveBusy) return
+    if (!to || moveBusy) return
     moveBusy = true
-    const id = sid
-    const workload = wl
-    const live = view?.hasSession === true
     try {
-      if (owner?.online) {
-        await releaseOwnership(id, workload, instanceEndpoint(owner))
-        // A live dev session moves with the deployment; otherwise the next verb claims it.
-        if (live) await beginOperation(id, 'start', workload, instanceEndpoint(to))
-      } else {
-        await takeOverOwnership(id, workload, from, instanceEndpoint(to))
-      }
+      const result = await moveDeployment(sid, wl, to.id)
+      // The follow-up runs on the new owner; hold the actions until its
+      // WorkflowPanel picks the operation up from /operations.
+      if (result.operation) activeOperation = result.operation
       chooseInstance(to.id)
       moveTarget = null
     } catch (error) {
@@ -143,6 +142,7 @@
     } catch {
       connected = false
     }
+    loaded = true
     // Polled alongside repos so a `kn` run in a terminal shows up here too.
     // Skipped mid-switch so the poll can't flash the old namespace back.
     if (!nsBusy) {
@@ -247,8 +247,23 @@
   const sterm = $derived(
     !view ? 'none' : view.hasSession ? 'tmux' : view.pods.length ? 'pod' : 'none',
   )
+  // Badge text: the running operation's stage wins over the polled status.
+  const statusText = $derived(
+    activeOperation?.repo === sid
+      ? activeOperation.stage
+      : vstatus === 'BUILDING'
+        ? 'starting'
+        : vstatus.replace('_', ' ').toLowerCase(),
+  )
 
   const verbs = $derived(view?.actions ?? selected?.actions ?? [])
+  const VERB_LABEL: Record<Verb, string> = {
+    start: 'Start',
+    build: 'Build',
+    build_start: 'Build + start',
+    restart: 'Restart',
+    destroy: 'Destroy',
+  }
 
   // The detail pane acts on the chosen workload (`wl`); a list row acts on the
   // repo's default workload, so it passes its own id and leaves `workload` unset.
@@ -314,15 +329,16 @@
       replicaDeleteBusy = false
     }
   }
+
+  const listState = $derived<'loading' | 'offline' | 'ready'>(
+    !loaded ? 'loading' : connected ? 'ready' : 'offline',
+  )
+  const podCount = $derived(view?.pods.length ?? 0)
 </script>
 
-<header>
-  <h1>dev<b>dock</b></h1>
+<header class="topbar">
+  <h1 class="brand">dev<b>dock</b></h1>
   <InstancePanel {instances} onrefresh={refresh} />
-  <span class="conn" class:on={connected}>
-    <span class="cdot" class:on={connected}></span>
-    {connected ? 'daemon connected' : 'daemon offline'}
-  </span>
   <div class="hright">
     {#if auth}
       {#key controlEndpoint}<AuthBanner {auth} instance={controlEndpoint} onchanged={(next) => (auth = next)} />{/key}
@@ -335,6 +351,10 @@
         onswitch={changeNamespace}
       />
     {/if}
+    <span class="conn" class:on={connected} title={connected ? 'The local daemon is answering' : 'The local daemon is not answering; retrying every 4s'}>
+      <span class="cdot"></span>
+      {connected ? 'daemon connected' : 'daemon offline'}
+    </span>
   </div>
 </header>
 
@@ -345,6 +365,7 @@
         {repos}
         {selectedId}
         {instances}
+        listState={listState}
         busyId={busy?.id ?? null}
         busyVerb={busy?.verb ?? null}
         onselect={(id) => (selectedId = id)}
@@ -360,7 +381,8 @@
       title="shells on this machine — shared with agents"
       onclick={() => (selectedId = HOST_ID)}
     >
-      <span class="hicon">❯_</span> all terminals
+      <Icon name="terminal" size={13} />
+      <span>All terminals</span>
     </button>
   </aside>
 
@@ -368,22 +390,23 @@
     {#if selectedId === HOST_ID}
       <div class="head">
         <div class="title">
+          <span class="ticon"><Icon name="terminal" size={14} /></span>
           <h2>All terminals</h2>
-          <label class="instance-target">On
-            <select class="wlselect" value={preferred} onchange={(e) => chooseInstance(e.currentTarget.value)} aria-label="Host terminal machine">
+          <label class="ctl">on
+            <select class="sel mono" value={preferred} onchange={(e) => chooseInstance(e.currentTarget.value)} aria-label="Host terminal machine">
               {#each instances as item (item.id)}<option value={item.id}>{item.name}{item.online ? '' : ' (offline)'}</option>{/each}
             </select>
           </label>
         </div>
       </div>
       <div class="meta">
-        <span>Every live DevDock terminal on this machine, including agent-created sessions</span>
+        <span class="fact">Every live DevDock terminal on this machine, including agent-created sessions</span>
       </div>
       <div class="streams solo">
-        <div class="block">
+        <div class="pane tpane">
           {#key preferred}
             {#if preferredInstance?.online}<TerminalPanel instance={preferredEndpoint} machine={preferredInstance.name} all />
-            {:else}<p class="placeholder">This instance is offline.</p>{/if}
+            {:else}<div class="placeholder"><Icon name="unplug" size={18} /><p>This instance is offline.</p></div>{/if}
           {/key}
         </div>
       </div>
@@ -391,10 +414,11 @@
       <div class="head">
         <div class="title">
           <span class="dot {vstatus}"></span>
-          <h2>{selected.repo.id}</h2>
-          <label class="instance-target">
+          <h2 title={selected.repo.id}>{selected.repo.id}</h2>
+          <span class="badge {vstatus}">{statusText}</span>
+          <span class="ctls">
             <select
-              class="wlselect"
+              class="sel mono"
               title={view?.ownerInstanceId ? `Deployed from ${owner?.name ?? 'an unlinked instance'}. Pick another machine to move it.` : 'Machine for new work'}
               value={view?.ownerInstanceId ?? owner?.id ?? preferred}
               onchange={(e) => pickMachine(e.currentTarget)}
@@ -404,67 +428,67 @@
               {#each machines as item (item.id)}<option value={item.id} disabled={!item.online}>{instanceSymbol(item)} {item.name}{item.online ? '' : ' (offline)'}</option>{/each}
               {#if view?.ownerInstanceId && !owner}<option value={view.ownerInstanceId} disabled>? unlinked owner</option>{/if}
             </select>
-          </label>
-          {#if family.length > 1}
-            <select
-              class="wlselect"
-              value={selected.repo.id}
-              onchange={(e) => (selectedId = e.currentTarget.value)}
-              aria-label="replica"
-            >
-              {#each family as f (f.repo.id)}
-                <option value={f.repo.id}>
-                  {f.repo.parentId
-                    ? `${f.repo.id.slice(f.repo.parentId.length + 1)} · ${f.repo.branch ?? ''}`
-                    : 'primary'}
-                </option>
-              {/each}
-            </select>
-          {/if}
-          {#if showSelector}
-            <select
-              class="wlselect"
-              value={active?.type ?? ''}
-              onchange={(e) => (pickedType = e.currentTarget.value)}
-              aria-label="workload"
-            >
-              {#each workloads as w (w.type)}
-                <option value={w.type}>{w.type}{w.status !== 'STOPPED' ? ' ●' : ''}</option>
-              {/each}
-            </select>
-          {:else if workloadLabel}
-            <span class="tag">{workloadLabel}</span>
-          {/if}
-          <span class="pill {vstatus}">{activeOperation?.repo === sid ? activeOperation.stage : vstatus === 'BUILDING' ? 'starting' : vstatus.replace('_', ' ').toLowerCase()}</span>
+            {#if family.length > 1}
+              <select
+                class="sel mono"
+                value={selected.repo.id}
+                onchange={(e) => (selectedId = e.currentTarget.value)}
+                aria-label="replica"
+              >
+                {#each family as f (f.repo.id)}
+                  <option value={f.repo.id}>
+                    {f.repo.parentId
+                      ? `${f.repo.id.slice(f.repo.parentId.length + 1)} · ${f.repo.branch ?? ''}`
+                      : 'primary'}
+                  </option>
+                {/each}
+              </select>
+            {/if}
+            {#if showSelector}
+              <select
+                class="sel mono"
+                value={active?.type ?? ''}
+                onchange={(e) => (pickedType = e.currentTarget.value)}
+                aria-label="workload"
+              >
+                {#each workloads as w (w.type)}
+                  <option value={w.type}>{w.type}{w.status !== 'STOPPED' ? ' ●' : ''}</option>
+                {/each}
+              </select>
+            {:else if workloadLabel}
+              <span class="tag">{workloadLabel}</span>
+            {/if}
+          </span>
         </div>
         <div class="actions">
           {#if view?.hasSession && !view.unavailable}
-            <button title="Stop the dev session and automatic reconnect. Keep the deployment." disabled={stoppingSession} onclick={stopDevSession}>{stoppingSession ? 'Stopping…' : 'Stop session'}</button>
+            <button class="btn" title="Stop the dev session and automatic reconnect. Keep the deployment." disabled={stoppingSession} onclick={stopDevSession}>{stoppingSession ? 'Stopping…' : 'Stop session'}</button>
           {/if}
           {#if vstatus === 'RUNNING_EXTERNAL' && !view?.unavailable}
             <button
-              class="adopt"
+              class="btn primary"
               title="stop the external devspace dev process and reconnect here (keeps the dev pod)"
               disabled={busy !== null || adoptBusy || stoppingSession}
               onclick={() => (confirmAdopt = true)}
-            >move here</button>
+            >Move here</button>
           {/if}
           {#each verbs as v (v)}
             <button
+              class="btn"
               class:danger={v === 'destroy'}
               disabled={busy !== null || adoptBusy || stoppingSession || activeOperation !== null}
               onclick={() => act(v, sid, wl)}
-            >{v === 'build_start' ? 'build + start' : v}</button>
+            >{VERB_LABEL[v]}</button>
           {/each}
         </div>
       </div>
 
       <div class="meta">
+        <span class="fact" title="pods for this workload"><Icon name="layers" size={12} />{podCount} pod{podCount === 1 ? '' : 's'}</span>
+        {#if selected.repo.ports.length}<span class="fact mono">:{selected.repo.ports.join(' :')}</span>{/if}
         {#if selected.repo.parentId}
-          <span>· url /{selected.repo.id}/</span>
+          <span class="fact mono">/{selected.repo.id}/</span>
         {/if}
-        <span>{view?.pods.length ?? 0} pod{(view?.pods.length ?? 0) === 1 ? '' : 's'}</span>
-        {#if selected.repo.ports.length}<span>· :{selected.repo.ports.join(' :')}</span>{/if}
         {#if !view?.unavailable}
           {#key ownerEndpoint + sid + swl}
             <WorkflowPanel repo={sid} workload={wl} instance={ownerEndpoint} onoperation={(operation) => activeOperation = operation} />
@@ -473,18 +497,27 @@
       </div>
 
       {#if view?.unavailable}
-        <div class="placeholder"><p>{owner ? `${owner.name} is unavailable or ownership could not be verified.` : 'Connect the instance that owns this deployment.'} Existing ownership is preserved.</p></div>
+        <div class="placeholder warn">
+          <Icon name="alert" size={18} />
+          <p>{owner ? `${owner.name} is unavailable or ownership could not be verified.` : 'Connect the instance that owns this deployment.'} Existing ownership is preserved.</p>
+        </div>
       {:else}
       <!-- The terminal is the dev session; without one there is nothing to attach to. -->
       <div class="streams" class:solo={!view?.hasSession}>
-        <div class="block">
-          {#key ownerEndpoint + sid + swl + sstatus}
-            <LogViewer id={sid} workload={wl} instance={ownerEndpoint} />
-          {/key}
+        <div class="pane">
+          <div class="pane-head">
+            <span class="pane-title">Logs</span>
+            {#if wl}<span class="pane-sub">{wl}</span>{/if}
+          </div>
+          <div class="pane-body">
+            {#key ownerEndpoint + sid + swl + sstatus}
+              <LogViewer id={sid} workload={wl} instance={ownerEndpoint} />
+            {/key}
+          </div>
         </div>
 
         {#if view?.hasSession}
-          <div class="block">
+          <div class="pane tpane">
             {#key ownerEndpoint + sid + swl}
               <TerminalPanel repo={sid} workload={wl} attach={sterm} instance={ownerEndpoint} machine={owner?.name ?? 'machine'} />
             {/key}
@@ -492,8 +525,14 @@
         {/if}
       </div>
       {/if}
+    {:else if listState === 'loading'}
+      <div class="placeholder"><span class="spin"></span><p>Connecting to the daemon…</p></div>
+    {:else if listState === 'offline' && repos.length === 0}
+      <div class="placeholder warn"><Icon name="unplug" size={18} /><p>The daemon is offline. Retrying every few seconds.</p></div>
+    {:else if repos.length === 0}
+      <div class="placeholder"><Icon name="inbox" size={18} /><p>No DevSpace repos discovered on any linked machine.</p></div>
     {:else}
-      <div class="placeholder"><p>Select a repo to view its logs and terminal.</p></div>
+      <div class="placeholder"><Icon name="layers" size={18} /><p>Select a repo to view its logs and terminal.</p></div>
     {/if}
   </section>
 </main>
@@ -556,45 +595,63 @@
 {/if}
 
 {#if moveTarget && selected}
-  <ConfirmModal
-    title="Move {selected.repo.id}{wl ? ` (${wl})` : ''} to {moveTarget.name}?"
-    message={owner?.online
-      ? `${owner.name} stops its dev session and gives up the deployment. The pods keep running.${view?.hasSession ? ` Dev then starts on ${moveTarget.name}, syncing its checkout into the pod.` : ` Deploy or start it from ${moveTarget.name} next.`}`
-      : `${owner?.name ?? 'The owner'} is unreachable, so ${moveTarget.name} takes the deployment over. If ${owner?.name ?? 'the owner'} comes back with a dev session still running, DevDock there stops it.`}
-    confirmLabel="Move to {moveTarget.name}"
-    busy={moveBusy}
-    onconfirm={doMove}
-    oncancel={() => (moveTarget = null)}
-  />
+  {#key moveTarget.id + sid + swl}
+    <MoveModal
+      repo={sid}
+      workload={wl}
+      to={moveTarget}
+      {owner}
+      busy={moveBusy}
+      onconfirm={doMove}
+      oncancel={() => (moveTarget = null)}
+    />
+  {/key}
 {/if}
 
-{#if toast}<div class="toast">{toast}</div>{/if}
+{#if toast}<div class="toast" role="alert"><Icon name="alert" size={14} /><span>{toast}</span></div>{/if}
 
 <style>
-  .instance-target { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; }
-  header {
+  /* ---- header ---- */
+  .topbar {
     display: flex;
     align-items: center;
-    gap: 16px;
-    padding: 14px 24px;
+    gap: 14px;
+    height: 44px;
+    padding: 0 14px;
+    background: var(--bg-1);
     border-bottom: 1px solid var(--line);
     flex: none;
   }
-  h1 {
+  .brand {
+    margin: 0 4px 0 0;
     font-family: var(--mono);
-    font-size: 20px;
-    margin: 0;
+    font-size: 15px;
+    font-weight: 600;
     letter-spacing: -0.02em;
+    white-space: nowrap;
   }
-  h1 b {
+  .brand b {
     color: var(--accent);
+    font-weight: 600;
+  }
+  /* Both header groups may shrink (chip labels ellipsise) so two auth chips
+     plus three machines still fit on one 1280px row without clipping. */
+  .hright {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+    flex: 0 1 auto;
   }
   .conn {
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    font-size: 12px;
+    flex: none;
+    font-size: 11px;
     color: var(--muted);
+    white-space: nowrap;
   }
   .cdot {
     width: 7px;
@@ -602,30 +659,40 @@
     border-radius: 50%;
     background: var(--danger);
   }
-  .cdot.on {
+  .conn.on .cdot {
     background: var(--ok);
-  }
-  /* right-aligned header controls (the namespace selector) */
-  .hright {
-    margin-left: auto;
-    display: flex;
-    align-items: center;
-    gap: 14px;
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 18%, transparent);
   }
 
+  /* ---- body ---- */
   main {
     flex: 1;
     min-height: 0;
     display: grid;
-    grid-template-columns: 320px 1fr;
-    gap: 16px;
-    padding: 16px 24px 24px;
+    grid-template-columns: 280px minmax(0, 1fr);
+  }
+  @media (max-width: 1100px) {
+    main {
+      grid-template-columns: 240px minmax(0, 1fr);
+    }
+    .conn {
+      font-size: 0;
+      gap: 0;
+    }
+  }
+  /* The daemon dot alone carries the state once the header gets crowded. */
+  @media (max-width: 1440px) {
+    .conn {
+      font-size: 0;
+      gap: 0;
+    }
   }
   aside {
     min-height: 0;
     display: flex;
     flex-direction: column;
-    gap: 10px;
+    background: var(--bg-1);
+    border-right: 1px solid var(--line);
   }
   aside .repos {
     flex: 1;
@@ -636,183 +703,227 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    padding: 9px 12px;
-    border: 1px dashed var(--line);
-    border-radius: 10px;
+    height: 36px;
+    padding: 0 14px;
+    border: none;
+    border-top: 1px solid var(--line);
     background: none;
     color: var(--muted);
     font-size: 12px;
-    cursor: pointer;
+    font-weight: 500;
     text-align: left;
   }
   .hostbtn:hover {
-    border-color: var(--accent);
     color: var(--ink);
+    background: var(--bg-2);
   }
   .hostbtn.selected {
-    border-style: solid;
-    border-color: var(--accent);
     color: var(--ink);
-    background: color-mix(in srgb, var(--accent) 10%, transparent);
-  }
-  .hicon {
-    font-family: var(--mono);
-    font-size: 11px;
-    color: var(--accent);
-  }
-  /* Host view: the terminal block gets the whole column (no logs pane). */
-  .streams.solo {
-    grid-template-rows: 1fr;
+    background: var(--bg-3);
+    box-shadow: inset 2px 0 0 var(--accent);
   }
 
+  /* ---- detail ---- */
   .detail {
     min-height: 0;
+    min-width: 0;
     display: flex;
     flex-direction: column;
-    gap: 12px;
+    background: var(--bg-0);
   }
   .head {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    gap: 16px;
+    gap: 12px;
     flex-wrap: wrap;
+    min-height: 48px;
+    padding: 8px 16px;
+    border-bottom: 1px solid var(--line);
   }
   .title {
     display: flex;
     align-items: center;
     gap: 10px;
     min-width: 0;
+    flex: 1 1 auto;
   }
   .title h2 {
     margin: 0;
-    font-size: 18px;
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .pill {
-    font-family: var(--mono);
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    padding: 3px 8px;
-    border-radius: 999px;
-    border: 1px solid var(--line);
-    color: var(--muted);
-    white-space: nowrap;
-  }
-  .pill.RUNNING_MANAGED {
-    color: var(--ok);
-    border-color: color-mix(in srgb, var(--ok) 40%, transparent);
-  }
-  .pill.RUNNING_EXTERNAL {
-    color: var(--warn);
-    border-color: color-mix(in srgb, var(--warn) 40%, transparent);
-  }
-  .pill.CRASHED {
-    color: var(--danger);
-    border-color: color-mix(in srgb, var(--danger) 40%, transparent);
-  }
-  .pill.BUILDING,
-  .pill.RESTARTING {
+  .ticon {
+    display: inline-flex;
     color: var(--accent);
-    border-color: color-mix(in srgb, var(--accent) 40%, transparent);
   }
-  .pill.DEPLOYED {
-    color: #9fb6cc;
-    border-color: #46566a;
+  .ctls {
+    display: inline-flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-left: 6px;
+    min-width: 0;
   }
-
-  .wlselect {
-    font-family: var(--mono);
-    font-size: 11px;
-    padding: 3px 6px;
-    border-radius: 6px;
-    border: 1px solid var(--line);
-    background: var(--panel2);
-    color: var(--ink);
-    cursor: pointer;
+  /* Replica names carry their branch; keep one long branch from eating the row. */
+  .ctls .sel {
+    max-width: 220px;
   }
-  .wlselect:hover {
-    border-color: var(--accent);
+  .ctl {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    color: var(--muted);
+    font-size: 12px;
   }
   /* The active workload's type, shown when it isn't the plain `api` default. */
   .tag {
     font-family: var(--mono);
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    padding: 3px 8px;
-    border-radius: 999px;
-    background: color-mix(in srgb, var(--accent) 18%, transparent);
+    font-size: 10.5px;
+    padding: 2px 6px;
+    border-radius: var(--r-1);
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
     color: var(--accent);
     white-space: nowrap;
   }
-
   .actions {
     display: flex;
+    align-items: center;
     gap: 6px;
-  }
-  .actions button {
-    text-transform: capitalize;
-  }
-  .actions button.danger:hover {
-    border-color: var(--danger);
-    color: var(--danger);
-  }
-  .actions button.adopt {
-    background: color-mix(in srgb, var(--accent) 18%, transparent);
-    border-color: color-mix(in srgb, var(--accent) 50%, transparent);
-    color: var(--accent);
-  }
-  .actions button.adopt:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--accent) 28%, transparent);
+    flex: none;
   }
 
   .meta {
     display: flex;
-    gap: 8px;
     align-items: center;
+    gap: 14px;
     flex-wrap: wrap;
+    min-height: 32px;
+    padding: 4px 16px;
     font-size: 12px;
     color: var(--muted);
+    border-bottom: 1px solid var(--line);
+    background: var(--bg-1);
+  }
+  .fact {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    white-space: nowrap;
+  }
+  .fact.mono {
+    font-family: var(--mono);
+    font-size: 11.5px;
   }
 
   .streams {
     flex: 1;
     min-height: 0;
     display: grid;
-    grid-template-rows: 1fr 1fr;
-    gap: 12px;
+    grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
   }
-  .block {
+  /* Host view / no session: the one pane gets the whole column. */
+  .streams.solo {
+    grid-template-rows: minmax(0, 1fr);
+  }
+  .pane {
     min-height: 0;
+    min-width: 0;
     display: flex;
     flex-direction: column;
-    gap: 6px;
+  }
+  .pane + .pane {
+    border-top: 1px solid var(--line-strong);
+  }
+  .pane-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    height: 32px;
+    padding: 0 16px;
+    flex: none;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--muted);
+    border-bottom: 1px solid var(--line);
+  }
+  .pane-sub {
+    font-family: var(--mono);
+    font-weight: 400;
+    text-transform: none;
+    letter-spacing: 0;
+    color: var(--muted);
+  }
+  .pane-body {
+    flex: 1;
+    min-height: 0;
   }
 
   .placeholder {
     flex: 1;
+    min-height: 0;
     display: flex;
+    flex-direction: column;
     align-items: center;
     justify-content: center;
+    gap: 10px;
+    padding: 24px;
     color: var(--muted);
-    border: 1px dashed var(--line);
-    border-radius: 12px;
+    text-align: center;
+  }
+  .placeholder p {
+    margin: 0;
+    max-width: 420px;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+  .placeholder.warn {
+    color: var(--warn);
+  }
+  .placeholder.warn p {
+    color: var(--ink-2);
+  }
+  .spin {
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    border: 2px solid var(--line-strong);
+    border-top-color: var(--accent);
+    animation: rot 0.8s linear infinite;
+  }
+  @keyframes rot {
+    to {
+      transform: rotate(360deg);
+    }
   }
 
   .toast {
     position: fixed;
-    bottom: 20px;
-    right: 20px;
-    background: var(--panel2);
-    border: 1px solid var(--danger);
+    bottom: 16px;
+    right: 16px;
+    z-index: 70;
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    max-width: 420px;
+    padding: 10px 12px;
+    background: var(--bg-2);
+    border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--line-strong));
+    border-left: 3px solid var(--danger);
+    border-radius: var(--r-2);
     color: var(--ink);
-    padding: 10px 14px;
-    border-radius: 8px;
-    font-size: 13px;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+    font-size: 12.5px;
+    line-height: 1.45;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+  }
+  .toast :global(svg) {
+    color: var(--danger);
+    margin-top: 2px;
   }
 </style>

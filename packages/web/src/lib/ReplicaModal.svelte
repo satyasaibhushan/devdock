@@ -1,5 +1,6 @@
 <script lang="ts">
   import { type BranchInfo, type ReplicaRecord, type InstanceView, createReplica, fetchBranches, fetchInstances } from './api'
+  import Icon from './Icon.svelte'
 
   let {
     preferred = '',
@@ -88,173 +89,135 @@
 ></div>
 <div class="modal" role="dialog" aria-modal="true" aria-label="New replica of {repoId}">
   <header>
-    <div>
-      <p class="eyebrow">parallel deployment</p>
-      <h3>New replica</h3>
-    </div>
+    <h3>New replica</h3>
     <code>{repoId}</code>
   </header>
-  <label>Run on
-    <select bind:value={target} disabled={creating}>
-      <option value={null} disabled>Choose an instance</option>
-      {#each instances as item (item.id)}<option value={item.local ? '' : item.id}>{item.name}</option>{/each}
-    </select>
-  </label>
-  <p class="hint">
-    Deploys the picked branch side-by-side with <b>{repoId}</b> — its own pods and
-    <b>/{repoId}-rN/</b> URL, the original checkout untouched. Auto-deleted after 2 days.
-  </p>
+  <div class="body">
+    <p class="hint">
+      Deploys the picked branch side-by-side with <b>{repoId}</b>: its own pods and
+      <b>/{repoId}-rN/</b> URL, the original checkout untouched. Auto-deleted after 2 days.
+    </p>
+    <label class="target">
+      <span>Run on</span>
+      <select class="sel" bind:value={target} disabled={creating}>
+        <option value={null} disabled>Choose an instance</option>
+        {#each instances as item (item.id)}<option value={item.local ? '' : item.id}>{item.name}</option>{/each}
+      </select>
+    </label>
 
-  <input
-    class="filter"
-    placeholder="Filter {branches.length} branches…"
-    bind:value={query}
-    disabled={loading}
-  />
+    <div class="search">
+      <span class="sicon"><Icon name="search" size={13} /></span>
+      <input
+        class="field"
+        placeholder="Filter {branches.length} branches…"
+        bind:value={query}
+        disabled={loading}
+      />
+    </div>
 
-  <div class="branches" role="listbox" aria-label="branches">
-    {#if loading}
-      <p class="empty">Loading branches…</p>
-    {:else}
-      {#each filtered as b (b.name)}
-        <button
-          class="branch"
-          class:picked={picked === b.name}
-          role="option"
-          aria-selected={picked === b.name}
-          onclick={() => (picked = b.name)}
-        >
-          <span class="bname">{b.name}</span>
-          <span class="bwhen">{when(b.lastCommitAt)}</span>
-        </button>
+    <div class="branches" role="listbox" aria-label="branches">
+      {#if loading}
+        <p class="empty">Loading branches…</p>
       {:else}
-        <p class="empty">
-          {branches.length === 0 ? 'No local branches found.' : 'No branches match your filter.'}
-        </p>
-      {/each}
-    {/if}
-  </div>
+        {#each filtered as b (b.name)}
+          <button
+            class="branch"
+            class:picked={picked === b.name}
+            role="option"
+            aria-selected={picked === b.name}
+            onclick={() => (picked = b.name)}
+          >
+            <Icon name="branch" size={12} />
+            <span class="bname">{b.name}</span>
+            <span class="bwhen">{when(b.lastCommitAt)}</span>
+          </button>
+        {:else}
+          <p class="empty">
+            {branches.length === 0 ? 'No local branches found.' : 'No branches match your filter.'}
+          </p>
+        {/each}
+      {/if}
+    </div>
 
-  {#if error}<p class="err">{error}</p>{/if}
+    {#if error}<p class="err">{error}</p>{/if}
+  </div>
   <footer>
-    <button class="ghost" onclick={onclose} disabled={creating}>Cancel</button>
-    <button class="primary" onclick={create} disabled={!picked || creating}>
+    <button class="btn ghost" onclick={onclose} disabled={creating}>Cancel</button>
+    <button class="btn primary" onclick={create} disabled={!picked || creating}>
       {creating ? 'Creating…' : picked ? `Create from ${picked}` : 'Pick a branch'}
     </button>
   </footer>
 </div>
 
 <style>
-  .backdrop {
-    position: fixed;
-    inset: 0;
-    background: rgba(4, 8, 12, 0.72);
-    backdrop-filter: blur(3px);
-    z-index: 50;
-  }
   .modal {
-    position: fixed;
-    top: 50%;
-    left: 50%;
-    transform: translate(-50%, -50%);
-    z-index: 51;
-    width: min(520px, calc(100vw - 40px));
-    background: var(--panel);
-    border: 1px solid var(--line);
-    border-top: 2px solid var(--accent);
-    border-radius: 10px;
-    padding: 20px;
+    width: min(520px, calc(100vw - 48px));
+  }
+  .target {
     display: flex;
-    flex-direction: column;
-    gap: 14px;
-    box-shadow: 0 28px 80px rgba(0, 0, 0, 0.58);
-  }
-  header {
-    display: flex;
-    align-items: flex-end;
-    justify-content: space-between;
-    gap: 16px;
-  }
-  .eyebrow {
-    margin: 0 0 4px;
-    color: var(--accent);
-    font-family: var(--mono);
-    font-size: 9px;
-    font-weight: 700;
-    letter-spacing: 0.18em;
-    text-transform: uppercase;
-  }
-  header h3 {
-    margin: 0;
-    font-size: 18px;
-    letter-spacing: -0.02em;
-  }
-  header code {
-    max-width: 55%;
-    color: var(--muted);
-    font-size: 11px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .hint {
-    margin: 0;
-    color: var(--muted);
+    align-items: center;
+    gap: 10px;
     font-size: 12px;
-    line-height: 1.55;
+    color: var(--ink-2);
   }
-  .hint b {
-    color: var(--ink);
-    font-weight: 600;
+  .target .sel {
+    flex: 1;
   }
-  .filter {
+  .search {
+    position: relative;
+  }
+  .sicon {
+    position: absolute;
+    left: 9px;
+    top: 50%;
+    transform: translateY(-50%);
+    display: inline-flex;
+    color: var(--muted);
+    pointer-events: none;
+  }
+  .search .field {
     width: 100%;
     box-sizing: border-box;
-    background: var(--bg);
-    border: 1px solid var(--line);
-    border-radius: 8px;
-    color: var(--ink);
-    font-family: var(--sans);
-    font-size: 13px;
-    padding: 7px 10px;
-    outline: none;
-  }
-  .filter:focus {
-    border-color: var(--accent);
+    padding-left: 28px;
   }
   .branches {
     height: 260px;
     overflow-y: auto;
     display: flex;
     flex-direction: column;
-    gap: 2px;
-    background: var(--bg);
+    gap: 1px;
+    background: var(--bg-0);
     border: 1px solid var(--line);
-    border-radius: 8px;
-    padding: 6px;
+    border-radius: var(--r-2);
+    padding: 4px;
   }
   .branch {
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    gap: 10px;
+    gap: 8px;
     width: 100%;
+    height: 28px;
+    flex: none;
     text-align: left;
     background: none;
-    border: 1px solid transparent;
-    border-radius: 6px;
-    padding: 7px 10px;
+    border: 0;
+    border-radius: var(--r-1);
+    padding: 0 8px;
     cursor: pointer;
-    color: var(--ink);
+    color: var(--ink-2);
   }
   .branch:hover {
-    background: var(--panel2);
+    background: var(--bg-2);
+    color: var(--ink);
   }
   .branch.picked {
-    background: color-mix(in srgb, var(--accent) 12%, transparent);
-    border-color: color-mix(in srgb, var(--accent) 36%, var(--line));
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+    color: var(--ink);
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 40%, transparent);
   }
   .bname {
+    flex: 1;
+    min-width: 0;
     font-family: var(--mono);
     font-size: 12px;
     overflow: hidden;
@@ -265,37 +228,12 @@
     flex: none;
     color: var(--muted);
     font-family: var(--mono);
-    font-size: 10px;
+    font-size: 10.5px;
   }
   .empty {
     color: var(--muted);
-    font-size: 13px;
+    font-size: 12.5px;
     padding: 16px 10px;
     margin: 0;
-  }
-  .err {
-    margin: 0;
-    font-size: 12px;
-    color: var(--danger);
-  }
-  footer {
-    display: flex;
-    justify-content: flex-end;
-    gap: 8px;
-  }
-  .ghost {
-    background: none;
-  }
-  .primary {
-    background: color-mix(in srgb, var(--accent) 20%, transparent);
-    border-color: color-mix(in srgb, var(--accent) 50%, transparent);
-    color: var(--accent);
-  }
-  .primary:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--accent) 30%, transparent);
-  }
-  button:disabled {
-    opacity: 0.5;
-    cursor: default;
   }
 </style>

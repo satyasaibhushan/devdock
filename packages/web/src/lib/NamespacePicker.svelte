@@ -57,7 +57,7 @@
   <span class="k">ns</span>
   {#if adding}
     <input
-      class="nsinput"
+      class="field nsinput"
       placeholder="namespace…"
       bind:value={draft}
       disabled={busy}
@@ -70,7 +70,7 @@
     />
   {:else}
     <select
-      class="nsselect"
+      class="sel mono"
       value={current}
       disabled={busy}
       onchange={pick}
@@ -95,41 +95,23 @@
     font-family: var(--mono);
     font-size: 10px;
     text-transform: uppercase;
-    letter-spacing: 0.05em;
+    letter-spacing: 0.06em;
     color: var(--muted);
   }
-  .nsselect,
+  .ns .sel {
+    max-width: 150px;
+  }
   .nsinput {
+    width: 150px;
+    height: 26px;
     font-family: var(--mono);
-    font-size: 11px;
-    padding: 3px 6px;
-    border-radius: 6px;
-    border: 1px solid var(--line);
-    background: var(--panel2);
-    color: var(--ink);
-  }
-  .nsselect {
-    cursor: pointer;
-  }
-  .nsselect:hover:not(:disabled) {
-    border-color: var(--accent);
-  }
-  .nsselect:disabled,
-  .nsinput:disabled {
-    opacity: 0.6;
-  }
-  .nsinput {
-    width: 140px;
-  }
-  .nsinput:focus {
-    outline: none;
-    border-color: var(--accent);
+    font-size: 12px;
   }
   .spin {
     width: 10px;
     height: 10px;
     border-radius: 50%;
-    border: 2px solid var(--line);
+    border: 2px solid color-mix(in srgb, var(--accent) 30%, transparent);
     border-top-color: var(--accent);
     animation: rot 0.8s linear infinite;
   }

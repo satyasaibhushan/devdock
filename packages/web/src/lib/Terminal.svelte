@@ -1,7 +1,6 @@
 <script lang="ts">
-  import { FitAddon } from '@xterm/addon-fit'
-  import { WebglAddon } from '@xterm/addon-webgl'
-  import { Terminal, type IDisposable } from '@xterm/xterm'
+  import type { FitAddon } from '@xterm/addon-fit'
+  import type { IDisposable, Terminal } from '@xterm/xterm'
   import { onMount } from 'svelte'
   import { attachTerminal, sendResize } from './api'
 
@@ -39,52 +38,68 @@
     getComputedStyle(document.documentElement).getPropertyValue('--mono').trim() ||
     'ui-monospace, Menlo, Consolas, monospace'
 
-  onMount(() => {
-    // NOTE: no `disableStdin` for read-only — it would also swallow the mouse
-    // reports that make wheel-scrolling work (tmux mouse mode). Read-only is
-    // enforced by only forwarding wheel reports (below), and again daemon-side.
-    term = new Terminal({
-      fontFamily: monoStack(),
-      fontSize: 12,
-      cursorBlink: modeVal === 'rw',
-      scrollback: 5000,
-      theme: { background: '#0b0f14', foreground: '#c9d6e2' },
-    })
-    fit = new FitAddon()
-    term.loadAddon(fit)
-    term.open(host)
-    // GPU renderer — the DOM renderer relayouts on every write and is the
-    // main source of sluggish output. Fall back silently where WebGL is
-    // unavailable (headless, software GL).
-    try {
-      const webgl = new WebglAddon()
-      webgl.onContextLoss(() => webgl.dispose())
-      term.loadAddon(webgl)
-    } catch {
-      /* DOM renderer fallback */
-    }
-    fit.fit()
+  // xterm and its addons are the bulk of the bundle and only needed once a
+  // terminal is actually on screen, so they load on first mount rather than
+  // with the shell. Vite splits them into their own chunk, cached after that.
+  const loadXterm = () =>
+    Promise.all([import('@xterm/xterm'), import('@xterm/addon-fit'), import('@xterm/addon-webgl')])
 
-    // Refit when the panel itself resizes (not just the window) and keep the
-    // daemon-side PTY in sync so tmux redraws at the real size.
-    cols = term.cols
-    rows = term.rows
-    const refit = () => {
-      fit?.fit()
-      if (!term) return
-      if (term.cols !== cols || term.rows !== rows) {
-        cols = term.cols
-        rows = term.rows
-        if (ws && ws.readyState === WebSocket.OPEN) sendResize(ws, cols, rows)
+  onMount(() => {
+    let disposed = false
+    let ro: ResizeObserver | null = null
+
+    loadXterm().then(([{ Terminal: XTerm }, { FitAddon }, { WebglAddon }]) => {
+      // Unmounted while the chunk was in flight: nothing to open.
+      if (disposed) return
+      // NOTE: no `disableStdin` for read-only — it would also swallow the mouse
+      // reports that make wheel-scrolling work (tmux mouse mode). Read-only is
+      // enforced by only forwarding wheel reports (below), and again daemon-side.
+      term = new XTerm({
+        fontFamily: monoStack(),
+        fontSize: 12,
+        cursorBlink: modeVal === 'rw',
+        scrollback: 5000,
+        theme: { background: '#0b0f14', foreground: '#c9d6e2' },
+      })
+      fit = new FitAddon()
+      term.loadAddon(fit)
+      term.open(host)
+      // GPU renderer — the DOM renderer relayouts on every write and is the
+      // main source of sluggish output. Fall back silently where WebGL is
+      // unavailable (headless, software GL).
+      try {
+        const webgl = new WebglAddon()
+        webgl.onContextLoss(() => webgl.dispose())
+        term.loadAddon(webgl)
+      } catch {
+        /* DOM renderer fallback */
       }
-    }
-    const ro = new ResizeObserver(refit)
-    ro.observe(host)
-    ready = true
+      fit.fit()
+
+      // Refit when the panel itself resizes (not just the window) and keep the
+      // daemon-side PTY in sync so tmux redraws at the real size.
+      cols = term.cols
+      rows = term.rows
+      const refit = () => {
+        fit?.fit()
+        if (!term) return
+        if (term.cols !== cols || term.rows !== rows) {
+          cols = term.cols
+          rows = term.rows
+          if (ws && ws.readyState === WebSocket.OPEN) sendResize(ws, cols, rows)
+        }
+      }
+      ro = new ResizeObserver(refit)
+      ro.observe(host)
+      ready = true
+    }).catch((e) => {
+      if (!disposed) error = e instanceof Error ? e.message : 'terminal renderer failed to load'
+    })
 
     return () => {
+      disposed = true
       ready = false
-      ro.disconnect()
+      ro?.disconnect()
       if (ws) {
         ws.onclose = null // deliberate detach — not an exit the panel should react to
         ws.close()
@@ -168,13 +183,12 @@
     position: relative;
     height: 100%;
     min-height: 0;
+    background: var(--term-bg);
   }
   .term {
     height: 100%;
-    padding: 8px;
-    background: #0b0f14;
-    border: 1px solid var(--line);
-    border-radius: 10px;
+    padding: 6px 10px;
+    box-sizing: border-box;
   }
   .term.hidden {
     visibility: hidden;
@@ -187,9 +201,7 @@
     align-items: center;
     justify-content: center;
     gap: 4px;
-    background: #0b0f14;
-    border: 1px solid var(--line);
-    border-radius: 10px;
+    background: var(--term-bg);
     text-align: center;
     padding: 20px;
   }
@@ -197,6 +209,7 @@
     margin: 0;
     color: var(--ink);
     font-weight: 600;
+    font-size: 13px;
   }
   .msg {
     margin: 0;
@@ -208,5 +221,6 @@
     margin: 6px 0 0;
     color: var(--muted);
     font-size: 12px;
+    max-width: 420px;
   }
 </style>

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { type RepoState, type RepoStatus, type Verb, type InstanceView } from './api'
   import { instanceSymbol, ownerInstanceIds } from './globalRepos'
+  import Icon, { type IconName } from './Icon.svelte'
 
   let {
     instances,
@@ -8,6 +9,7 @@
     selectedId,
     busyId,
     busyVerb,
+    listState = 'ready',
     onselect,
     onaction,
     oncustomize,
@@ -19,6 +21,8 @@
     selectedId: string | null
     busyId: string | null
     busyVerb: Verb | null
+    /** Daemon reachability, so an empty list can say why it is empty. */
+    listState?: 'loading' | 'offline' | 'ready'
     onselect: (id: string) => void
     onaction: (id: string, verb: Verb) => void
     oncustomize: (id: string) => void
@@ -32,6 +36,13 @@
     build_start: 'build + start',
     restart: 'restart',
     destroy: 'destroy',
+  }
+  const VERB_ICON: Record<Verb, IconName> = {
+    start: 'play',
+    build: 'hammer',
+    build_start: 'hammer',
+    restart: 'restart',
+    destroy: 'stop',
   }
 
   let query = $state('')
@@ -99,50 +110,11 @@
   const isOpen = (title: string) => query.trim() !== '' || !collapsed[title]
 </script>
 
-{#snippet icon(v: Verb)}
-  {#if v === 'start'}
-    <svg viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true">
-      <path d="M7 4.5v15l12-7.5z" />
-    </svg>
-  {:else if v === 'destroy'}
-    <svg viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true">
-      <rect x="5" y="5" width="14" height="14" rx="2.5" />
-    </svg>
-  {:else if v === 'restart'}
-    <svg
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      stroke-width="2"
-      stroke-linecap="round"
-      stroke-linejoin="round"
-      aria-hidden="true"
-    >
-      <path d="M21 12a9 9 0 1 1-6.2-8.5" />
-      <path d="M21 3v6h-6" />
-    </svg>
-  {:else if v === 'build' || v === 'build_start'}
-    <svg
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      stroke-width="2"
-      stroke-linecap="round"
-      stroke-linejoin="round"
-      aria-hidden="true"
-    >
-      <path d="m15 12-8.4 8.4a1.7 1.7 0 0 1-2.4-2.4L12.6 9.6" />
-      <path d="m18 15 3-3" />
-      <path
-        d="m21.5 11.5-1.9-1.9a2 2 0 0 1-.6-1.4V7l-2.3-2.3a6 6 0 0 0-4.2-1.7l-3.5.7.9.8a6.2 6.2 0 0 1 2.1 4.6V10l2 2h1.2a2 2 0 0 1 1.4.6l1.9 1.9"
-      />
-    </svg>
-  {/if}
-{/snippet}
-
 {#snippet spinner()}
   <svg
     class="spinner"
+    width="13"
+    height="13"
     viewBox="0 0 24 24"
     fill="none"
     stroke="currentColor"
@@ -156,7 +128,8 @@
 
 <div class="panel">
   <div class="search">
-    <input placeholder="Filter {repos.length} repos…" bind:value={query} />
+    <span class="sicon"><Icon name="search" size={13} /></span>
+    <input class="field" placeholder="Filter {repos.length} repos…" bind:value={query} aria-label="Filter repos" />
   </div>
   <div class="list" role="listbox" aria-label="repositories">
     {#each sections as section (section.title)}
@@ -165,7 +138,7 @@
         aria-expanded={isOpen(section.title)}
         onclick={() => toggle(section.title)}
       >
-        <span class="chev" class:open={isOpen(section.title)}>▸</span>
+        <span class="chev" class:open={isOpen(section.title)}><Icon name="chevron-right" size={11} /></span>
         <span class="stitle">{section.title}</span>
         <span class="scount">{section.repos.length}</span>
       </button>
@@ -179,8 +152,8 @@
           >
             <span class="dot {r.status}" title={r.status}></span>
             <span class="id" title={r.repo.id}>
-              {#if r.repo.parentId}<span class="rep">↳</span>{/if}
-              {r.repo.id}
+              {#if r.repo.parentId}<span class="rep" aria-hidden="true">↳</span>{/if}
+              <span class="name">{r.repo.id}</span>
               {#each ownerInstanceIds(r) as id (id)}
                 {@const machine = instances.find((i) => i.id === id)}
                 <span class="owner" class:offline={!machine?.online} title="{machine?.name ?? 'Owner not connected'}{machine?.online ? '' : ' · offline'}">{instanceSymbol(machine)}</span>
@@ -213,7 +186,7 @@
                 {#if busyId === r.repo.id && busyVerb === v}
                   {@render spinner()}
                 {:else}
-                  {@render icon(v)}
+                  <Icon name={VERB_ICON[v]} size={12} />
                 {/if}
               </button>
             {/each}
@@ -227,7 +200,7 @@
                   e.stopPropagation()
                   onreplicadelete(r.repo.id)
                 }}
-              >×</button>
+              ><Icon name="x" size={12} /></button>
             {:else}
               <button
                 class="act plus"
@@ -238,7 +211,7 @@
                   e.stopPropagation()
                   onreplicate(r.repo.id)
                 }}
-              >+</button>
+              ><Icon name="plus" size={12} /></button>
             {/if}
             <button
               class="act kebab"
@@ -251,125 +224,134 @@
                 e.stopPropagation()
                 oncustomize(r.repo.id)
               }}
-            >⋯</button>
+            ><Icon name="more" size={12} /></button>
           </div>
         </div>
       {/each}
     {:else}
-      <p class="empty">
-        {repos.length === 0 ? 'No DevSpace repos discovered.' : 'No repos match your filter.'}
-      </p>
+      <div class="empty">
+        {#if repos.length > 0}
+          <Icon name="search" size={16} />
+          <p>No repos match your filter.</p>
+        {:else if listState === 'loading'}
+          <span class="spin"></span>
+          <p>Connecting to the daemon…</p>
+        {:else if listState === 'offline'}
+          <Icon name="unplug" size={16} />
+          <p>Daemon offline. Retrying…</p>
+        {:else}
+          <Icon name="inbox" size={16} />
+          <p>No DevSpace repos discovered.</p>
+        {/if}
+      </div>
     {/each}
   </div>
 </div>
 
 <style>
-  .owner { display: inline-block; margin-left: 6px; color: var(--accent); font-size: 14px; }
-  .owner.offline { color: var(--muted); }
   .panel {
     display: flex;
     flex-direction: column;
     height: 100%;
     min-height: 0;
-    background: var(--panel);
-    border: 1px solid var(--line);
-    border-radius: 12px;
-    overflow: hidden;
   }
   .search {
-    padding: 10px;
+    position: relative;
+    flex: none;
+    padding: 8px 10px;
     border-bottom: 1px solid var(--line);
   }
-  .search input {
-    width: 100%;
-    background: var(--bg);
-    border: 1px solid var(--line);
-    border-radius: 8px;
-    color: var(--ink);
-    font-family: var(--sans);
-    font-size: 13px;
-    padding: 7px 10px;
-    outline: none;
+  .sicon {
+    position: absolute;
+    left: 19px;
+    top: 50%;
+    transform: translateY(-50%);
+    color: var(--muted);
+    pointer-events: none;
+    display: inline-flex;
   }
-  .search input:focus {
-    border-color: var(--accent);
+  .search .field {
+    width: 100%;
+    padding-left: 28px;
+    background: var(--bg-0);
   }
   .list {
     flex: 1;
     min-height: 0;
     overflow-y: auto;
-    padding: 6px;
+    padding: 4px 6px 8px;
     display: flex;
     flex-direction: column;
-    gap: 2px;
+    gap: 1px;
   }
   .shead {
     display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 10px 10px 4px;
+    gap: 6px;
+    height: 26px;
+    margin-top: 6px;
+    padding: 0 6px;
     position: sticky;
     top: 0;
-    background: var(--panel);
+    background: var(--bg-1);
     z-index: 1;
     width: 100%;
     border: none;
+    border-radius: var(--r-1);
     text-align: left;
-    cursor: pointer;
+    color: var(--muted);
   }
   .shead:first-child {
-    padding-top: 4px;
+    margin-top: 0;
   }
-  .shead:hover .stitle {
-    color: var(--ink);
+  .shead:hover {
+    color: var(--ink-2);
   }
   .chev {
-    font-size: 9px;
-    color: var(--muted);
+    display: inline-flex;
     transition: transform 0.12s ease;
   }
   .chev.open {
     transform: rotate(90deg);
   }
   .stitle {
-    font-family: var(--mono);
-    font-size: 10px;
+    font-size: 10.5px;
+    font-weight: 600;
     text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: var(--muted);
+    letter-spacing: 0.07em;
   }
   .scount {
+    font-size: 10.5px;
     font-family: var(--mono);
-    font-size: 10px;
     color: var(--muted);
-    background: var(--panel2);
-    border-radius: 999px;
-    padding: 1px 7px;
+    opacity: 0.8;
   }
   .rowwrap {
     position: relative;
-    border: 1px solid transparent;
-    border-radius: 8px;
+    border-radius: var(--r-1);
   }
   .rowwrap:hover {
-    background: var(--panel2);
+    background: var(--bg-2);
   }
   .rowwrap.sel {
-    background: var(--panel2);
-    border-color: var(--accent);
+    background: var(--bg-3);
+    box-shadow: inset 2px 0 0 var(--accent);
   }
   .row {
     display: grid;
-    grid-template-columns: auto 1fr auto;
+    grid-template-columns: 8px minmax(0, 1fr) auto;
     align-items: center;
-    gap: 10px;
+    gap: 9px;
     width: 100%;
+    height: 30px;
     text-align: left;
     background: none;
     border: none;
-    border-radius: 8px;
-    padding: 8px 10px;
-    cursor: pointer;
+    border-radius: var(--r-1);
+    padding: 0 8px 0 10px;
+    color: var(--ink-2);
+  }
+  .rowwrap.sel .row {
     color: var(--ink);
   }
   /* The action chips float over the right edge of the row on hover instead of
@@ -377,20 +359,24 @@
      left gradient fades the underlying status text out behind them. */
   .actions {
     position: absolute;
-    top: 1px;
-    right: 1px;
-    bottom: 1px;
+    top: 0;
+    right: 0;
+    bottom: 0;
     display: flex;
     align-items: center;
-    gap: 3px;
-    padding: 0 7px 0 32px;
-    border-radius: 0 8px 8px 0;
-    background: linear-gradient(to right, transparent, var(--panel2) 24px);
+    gap: 2px;
+    padding: 0 5px 0 28px;
+    border-radius: 0 var(--r-1) var(--r-1) 0;
+    background: linear-gradient(to right, transparent, var(--bg-2) 22px);
     opacity: 0;
     pointer-events: none;
-    transition: opacity 0.12s ease;
+    transition: opacity 0.1s ease;
   }
-  .rowwrap:hover .actions {
+  .rowwrap.sel .actions {
+    background: linear-gradient(to right, transparent, var(--bg-3) 22px);
+  }
+  .rowwrap:hover .actions,
+  .rowwrap:focus-within .actions {
     opacity: 1;
     pointer-events: auto;
   }
@@ -398,92 +384,46 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    background: var(--panel);
-    border: 1px solid var(--line);
-    border-radius: 6px;
+    width: 22px;
+    height: 22px;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: var(--r-1);
     color: var(--muted);
-    line-height: 1;
-    padding: 4px;
-    cursor: pointer;
-    transition: color 0.12s ease, border-color 0.12s ease, background 0.12s ease;
-  }
-  .act :global(svg) {
-    width: 13px;
-    height: 13px;
-    display: block;
+    padding: 0;
+    transition: color 0.1s ease, background 0.1s ease;
   }
   .act:hover:not(:disabled) {
-    background: var(--panel2);
+    background: var(--bg-1);
+    color: var(--ink);
   }
   .act:disabled {
     cursor: default;
+    opacity: 0.5;
   }
   .act.start:hover:not(:disabled) {
     color: var(--ok);
-    border-color: color-mix(in srgb, var(--ok) 45%, transparent);
   }
   .act.restart:hover:not(:disabled) {
     color: var(--accent);
-    border-color: color-mix(in srgb, var(--accent) 45%, transparent);
   }
-  .act.build:hover:not(:disabled) {
+  .act.build:hover:not(:disabled),
+  .act.build_start:hover:not(:disabled) {
     color: var(--warn);
-    border-color: color-mix(in srgb, var(--warn) 45%, transparent);
   }
-  .act.clear:hover:not(:disabled) {
-    color: #9fb6cc;
-    border-color: color-mix(in srgb, #9fb6cc 45%, transparent);
-  }
-  .act.stop:hover:not(:disabled) {
+  .act.destroy:hover:not(:disabled),
+  .act.del:hover:not(:disabled) {
     color: var(--danger);
-    border-color: color-mix(in srgb, var(--danger) 45%, transparent);
-  }
-  .act.spin {
-    color: var(--accent);
-    border-color: color-mix(in srgb, var(--accent) 45%, transparent);
-  }
-  .act.kebab {
-    font-size: 14px;
-    padding: 2px 5px;
-  }
-  .act.plus,
-  .act.del {
-    font-size: 13px;
-    padding: 2px 6px;
   }
   .act.plus:hover:not(:disabled) {
     color: var(--ok);
-    border-color: color-mix(in srgb, var(--ok) 45%, transparent);
   }
-  .act.del:hover:not(:disabled) {
-    color: var(--danger);
-    border-color: color-mix(in srgb, var(--danger) 45%, transparent);
-  }
-  /* Replica rows: the ↳ marker and the branch pill inside the id cell. */
-  .rep {
+  .act.spin {
     color: var(--accent);
-    font-family: var(--mono);
-    font-size: 11px;
-    margin-right: 2px;
-  }
-  .bpill {
-    font-family: var(--mono);
-    font-size: 9px;
-    font-weight: 400;
-    letter-spacing: 0.02em;
-    padding: 1px 5px;
-    margin-left: 4px;
-    border-radius: 999px;
-    border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
-    color: var(--accent);
-    white-space: nowrap;
   }
   /* A configured startup script tints the kebab accent. */
   .act.kebab.set {
     color: var(--accent);
-  }
-  .act.kebab:hover:not(:disabled) {
-    color: var(--ink);
   }
   .spinner {
     animation: spin 0.8s linear infinite;
@@ -493,19 +433,51 @@
       transform: rotate(360deg);
     }
   }
-  .dot {
-    flex: none;
-  }
   .id {
-    font-weight: 600;
-    font-size: 13px;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    min-width: 0;
+    font-size: 12.5px;
+    font-weight: 500;
+  }
+  .name {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .st {
+  /* Replica rows: the ↳ marker and the branch pill inside the id cell. */
+  .rep {
+    color: var(--accent);
+    font-family: var(--mono);
+    font-size: 11px;
+    flex: none;
+  }
+  .owner {
+    flex: none;
+    color: var(--accent);
+    font-size: 12px;
+    line-height: 1;
+  }
+  .owner.offline {
+    color: var(--muted);
+  }
+  .bpill {
+    flex: 0 1 auto;
+    min-width: 44px;
     font-family: var(--mono);
     font-size: 10px;
+    padding: 1px 5px;
+    border-radius: var(--r-1);
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: var(--accent);
+    white-space: nowrap;
+    max-width: 90px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .st {
+    font-size: 10.5px;
     text-transform: uppercase;
     letter-spacing: 0.04em;
     color: var(--muted);
@@ -525,7 +497,10 @@
     color: var(--accent);
   }
   .st.DEPLOYED {
-    color: #9fb6cc;
+    color: var(--deployed);
+  }
+  .st.STOPPED {
+    opacity: 0.7;
   }
   .wpills {
     display: flex;
@@ -536,37 +511,53 @@
   }
   .wpill {
     font-family: var(--mono);
-    font-size: 9px;
-    letter-spacing: 0.02em;
+    font-size: 10px;
     padding: 1px 5px;
-    border-radius: 999px;
-    border: 1px solid var(--line);
+    border-radius: var(--r-1);
     color: var(--muted);
+    background: color-mix(in srgb, var(--muted) 14%, transparent);
     white-space: nowrap;
   }
   .wpill.RUNNING_MANAGED {
     color: var(--ok);
-    border-color: color-mix(in srgb, var(--ok) 40%, transparent);
+    background: color-mix(in srgb, var(--ok) 14%, transparent);
   }
   .wpill.RUNNING_EXTERNAL {
     color: var(--warn);
-    border-color: color-mix(in srgb, var(--warn) 40%, transparent);
+    background: color-mix(in srgb, var(--warn) 14%, transparent);
   }
   .wpill.CRASHED {
     color: var(--danger);
-    border-color: color-mix(in srgb, var(--danger) 40%, transparent);
+    background: color-mix(in srgb, var(--danger) 14%, transparent);
   }
-  .wpill.BUILDING {
+  .wpill.BUILDING,
+  .wpill.RESTARTING {
     color: var(--accent);
-    border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
   }
   .wpill.DEPLOYED {
-    color: #9fb6cc;
-    border-color: #46566a;
+    color: var(--deployed);
+    background: color-mix(in srgb, var(--deployed) 14%, transparent);
   }
   .empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    padding: 32px 12px;
     color: var(--muted);
-    font-size: 13px;
-    padding: 16px 10px;
+    text-align: center;
+  }
+  .empty p {
+    margin: 0;
+    font-size: 12.5px;
+  }
+  .spin {
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    border: 2px solid var(--line-strong);
+    border-top-color: var(--accent);
+    animation: spin 0.8s linear infinite;
   }
 </style>

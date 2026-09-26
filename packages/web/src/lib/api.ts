@@ -253,6 +253,62 @@ export async function unlinkInstance(id: string): Promise<void> {
   if (!response.ok) throw new Error('Cannot unlink instance')
 }
 
+/** Moving a deployment between linked machines. The local daemon drives the
+ *  sequence (release or take-over, then an optional start on the target); the
+ *  UI only previews the plan and confirms. Both routes answer 409 {error}. */
+export interface CheckoutSummary {
+  branch: string | null
+  commit: string | null
+  dirty: boolean | null
+}
+export type MoveFollowUp = 'start' | 'build_start' | 'none'
+export interface MovePlan {
+  repo: string
+  workload?: string
+  to: string
+  owner?: string
+  ownerOnline: boolean
+  live: boolean
+  from?: CheckoutSummary
+  target: CheckoutSummary
+  sameRevision: boolean
+  followUp: MoveFollowUp
+}
+export interface MoveResult {
+  plan: MovePlan
+  claim: 'released' | 'taken_over' | 'unclaimed'
+  operation?: Operation
+}
+async function moveRequest<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await globalThis.fetch(path, init)
+  if (!response.ok) {
+    const body = (await response.json().catch(() => null)) as { error?: string } | null
+    throw new Error(body?.error ?? `move → ${response.status}`)
+  }
+  return response.json()
+}
+export function fetchMovePlan(
+  repo: string,
+  workload: string | undefined,
+  to: string,
+): Promise<MovePlan> {
+  const params = new URLSearchParams({ repo, to })
+  if (workload) params.set('workload', workload)
+  return moveRequest<MovePlan>(`/instances/move-plan?${params}`)
+}
+export function moveDeployment(
+  repo: string,
+  workload: string | undefined,
+  to: string,
+  followUp?: MoveFollowUp,
+): Promise<MoveResult> {
+  return moveRequest<MoveResult>('/instances/move', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ repo, workload, to, followUp }),
+  })
+}
+
 export function selectInstance(id: string, repo?: string): void {
   const url = new URL(location.href)
   if (id) url.searchParams.set('instance', id)
