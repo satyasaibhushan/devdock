@@ -355,7 +355,7 @@ export class AuthManager {
       this.loginUrl = undefined
       return this.settle('ok', undefined)
     }
-    const detail = lastLine(r.stderr)
+    const detail = loginFailure(r.stderr)
     const message = detail ? `login did not complete: ${detail}` : 'login did not complete'
     return this.settle('login_required', `${message} — ${OFF_NETWORK_HINT}`)
   }
@@ -526,14 +526,20 @@ function matchingJwtExpiryMs(
   }
 }
 
-/** The last non-empty line of a command's stderr — kubelogin puts the useful
- *  error there, after a wall of log noise. */
-function lastLine(text: string): string | undefined {
-  const lines = text
+/** kubelogin's useful error from its stderr. It puts the error after a wall of
+ *  log noise, and on a failed token exchange it echoes the server's response
+ *  body, so a firewall's HTML block page would otherwise end in `</html>`. */
+export function loginFailure(stderr: string): string | undefined {
+  const html = /<(?:!doctype|html)[\s>]/i.test(stderr)
+  const lines = stderr
+    .replace(/<(?:!doctype|html)[\s>][\s\S]*?(?:<\/html>|$)/gi, '')
     .split('\n')
     .map((l) => l.trim())
-    .filter(Boolean)
-  return lines[lines.length - 1]
+    .filter((l) => l && !l.startsWith('<'))
+  const found = [...lines].reverse().find((l) => /error/i.test(l)) ?? lines.at(-1)
+  const detail = found && found.length > 300 ? `${found.slice(0, 300)}…` : found
+  if (!html) return detail
+  return `${detail ?? 'sign-in failed'} (the sign-in server answered with a web page instead of a token, usually a firewall or proxy block; if this machine needs a proxy, set HTTPS_PROXY for the daemon)`
 }
 
 /** The `exp` claim of a JWT as epoch ms, without verifying anything — this is

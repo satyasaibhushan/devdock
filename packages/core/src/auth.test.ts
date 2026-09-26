@@ -438,6 +438,32 @@ describe('AuthManager', () => {
     expect(loginRunner).toHaveBeenCalledTimes(1)
   })
 
+  it('reports the token exchange error, not the tail of an HTML block page', async () => {
+    const loginRunner = vi.fn(async () => ({
+      code: 1,
+      stdout: '',
+      stderr: [
+        'I0926 starting a server at 127.0.0.1:8040',
+        'error: get-token: authentication error: authcode-browser error: oauth2: cannot fetch token: 403 Forbidden',
+        'Response: <!DOCTYPE html>',
+        '<html><head><title>Attention Required! | Cloudflare</title></head>',
+        '<body>blocked</body>',
+        '</html>',
+      ].join('\n'),
+    }))
+    const auth = new AuthManager({
+      runner: fakeRunner(OIDC_CONFIG),
+      loginRunner,
+      cacheDir,
+      fetchFn: fakeIssuer().fetchFn,
+    })
+    await auth.init()
+    const s = await auth.login()
+    expect(s.message).toContain('cannot fetch token: 403 Forbidden')
+    expect(s.message).toContain('HTTPS_PROXY')
+    expect(s.message).not.toContain('</html>')
+  })
+
   it('maintain() refreshes a token that is merely near expiry', async () => {
     writeCachedToken(5 * 60_000) // valid, but < REFRESH_AHEAD_MS left
     const { fetchFn, grants } = fakeIssuer(() => json({ id_token: makeToken(60 * 60_000) }))
