@@ -1628,6 +1628,31 @@ describe('Service replicas', () => {
     expect(svc.listRepos().some((r) => r.id === 'parent-r1')).toBe(false)
   })
 
+  it('stop uninstalls a non-api release the purge pipeline left behind, never the api one', async () => {
+    makeParent()
+    const released = new Set(['parent-api', 'parent-worker'])
+    const base = cannedRunner('{"items":[]}', false)
+    const runner = vi.fn(async (cmd: string, args: string[], opts?: object): Promise<RunResult> => {
+      if (cmd === 'helm' && args[0] === 'status') {
+        return { code: released.has(args[1] ?? '') ? 0 : 1, stdout: '', stderr: '' }
+      }
+      if (cmd === 'helm' && args[0] === 'uninstall') released.delete(args[1] ?? '')
+      return base(cmd, args, opts as never)
+    })
+    const { svc } = newService(runner)
+
+    await svc.stop('parent', 'api')
+    await svc.stop('parent', 'worker')
+    expect(runner).toHaveBeenCalledWith('helm', ['uninstall', 'parent-worker', '-n', 'ns'])
+    expect(runner).not.toHaveBeenCalledWith('helm', ['uninstall', 'parent-api', '-n', 'ns'])
+    expect([...released]).toEqual(['parent-api'])
+
+    // once the pipeline purges properly there is nothing left to uninstall
+    runner.mockClear()
+    await svc.stop('parent', 'worker')
+    expect(runner).not.toHaveBeenCalledWith('helm', expect.arrayContaining(['uninstall']))
+  })
+
   it('gcReplicas deletes replicas past the 2-day TTL and keeps fresh ones', async () => {
     makeParent()
     const { svc } = newService()

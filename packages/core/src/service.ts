@@ -810,11 +810,39 @@ export class Service {
     const r = await this.narrate(key, verbLabel(repo, 'purge'), (onLine) =>
       this.supervisor.kill(repo, onLine),
     )
+    if (r.code === 0) await this.uninstallLeftoverRelease(repo, key)
     this.piped.delete(key)
     this.store.setSessionNamespace(key, undefined) // session gone → pin released
     this.store.setPendingStartup(key, undefined) // canceled start must not fire later
     await this.reconcileOne(id)
     return r
+  }
+
+  /** The shared purge pipeline removes a non-api workload with
+   *  `purge_deployments ${WORKLOAD_TYPE}`, but DevSpace keys deployments by
+   *  release name (`<name>-<type>`), so it silently matches nothing and
+   *  `stop_dev` scales the workload back up. Finish the job: a purged non-api
+   *  workload must leave no release behind. The api keeps its stopped-state
+   *  release (ExternalName service routing to uat) by design. */
+  private async uninstallLeftoverRelease(repo: Repo, key: string): Promise<void> {
+    const type = repo.varDefaults?.WORKLOAD_TYPE ?? repo.workloadType
+    if (!type || type === 'api') return
+    const ns = repo.namespace || (await this.contextNamespace())
+    const nsArgs = ns ? ['-n', ns] : []
+    const status = await this.kubectl('helm', ['status', repo.name, ...nsArgs]).catch(
+      () => undefined,
+    )
+    if (!status || status.code !== 0) return
+    const hub = this.hubFor(key)
+    hub.push(`purge left release ${repo.name} installed; uninstalling it`)
+    const r = await this.kubectl('helm', ['uninstall', repo.name, ...nsArgs]).catch(
+      (err: unknown) => ({ code: 1, stdout: '', stderr: String(err) }),
+    )
+    hub.push(
+      r.code === 0
+        ? `✓ release ${repo.name} uninstalled`
+        : `✗ helm uninstall ${repo.name} failed: ${r.stderr.trim()}`,
+    )
   }
 
   /** Clear a crashed dev session: drop the replaced dev pod and release the
