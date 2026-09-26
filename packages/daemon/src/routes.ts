@@ -7,6 +7,15 @@ import fastifyStatic from '@fastify/static'
 import Fastify, { type FastifyInstance, type FastifyReply } from 'fastify'
 import type { AccessGate } from './accessGate.js'
 import { type Instances, peerPathAllowed } from './instances.js'
+import { type InstanceCall, type MoveFollowUp, moveDeployment, planMove } from './move.js'
+
+const parseJson = (text: string): unknown => {
+  try {
+    return JSON.parse(text)
+  } catch {
+    return undefined
+  }
+}
 
 /** The built web UI (`packages/web/dist`), relative to this module at
  *  `packages/daemon/dist/routes.js`. Bundled into the daemon so port 7717
@@ -106,6 +115,54 @@ export function buildApp(
       instances.unlink(req.params.instance)
       return { ok: true }
     })
+    const call: InstanceCall = async (instance, method, path, body) => {
+      if (instance === instances.identity.id) {
+        const result = await app.inject({
+          method,
+          url: path,
+          payload: body as Record<string, unknown> | undefined,
+        })
+        return { status: result.statusCode, body: parseJson(result.payload) }
+      }
+      const result = await instances.request(instance, method, path, body)
+      return { status: result.status, body: parseJson(result.body.toString()) }
+    }
+    app.get<{ Querystring: { repo?: string; workload?: string; to?: string } }>(
+      '/instances/move-plan',
+      async (req, reply) => {
+        const { repo, workload, to } = req.query
+        if (!repo || !to) return reply.code(400).send({ error: 'repo and to are required' })
+        try {
+          return await planMove(call, repo, workload, to)
+        } catch (error) {
+          return reply
+            .code(409)
+            .send({ error: error instanceof Error ? error.message : String(error) })
+        }
+      },
+    )
+    app.post<{ Body: { repo?: string; workload?: string; to?: string; followUp?: string } }>(
+      '/instances/move',
+      async (req, reply) => {
+        const { repo, workload, to, followUp } = req.body ?? {}
+        if (!repo || !to) return reply.code(400).send({ error: 'repo and to are required' })
+        if (followUp !== undefined && !['start', 'build_start', 'none'].includes(followUp))
+          return reply.code(400).send({ error: 'followUp must be start, build_start or none' })
+        try {
+          return await moveDeployment(
+            call,
+            repo,
+            workload,
+            to,
+            followUp as MoveFollowUp | undefined,
+          )
+        } catch (error) {
+          return reply
+            .code(409)
+            .send({ error: error instanceof Error ? error.message : String(error) })
+        }
+      },
+    )
     app.all<{ Params: { instance: string; '*': string } }>(
       '/instances/:instance/api/*',
       async (req, reply) => {
@@ -573,7 +630,7 @@ export function buildApp(
 
   // Moving a deployment between instances: the owner releases (stopping its
   // dev session, keeping the deployment), or a new owner takes over from an
-  // unreachable one. The UI then starts it on the new owner.
+  // unreachable one. The /instances/move then starts it on the new owner.
   const ownershipError = (reply: FastifyReply, error: unknown) => {
     const message = error instanceof Error ? error.message : String(error)
     return reply

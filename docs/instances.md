@@ -75,11 +75,16 @@ ownership read blocks the action. Existing managed sessions are claimed at boot.
 Claims do not expire on disconnect, restart or unlink. A successful purge
 releases the claim, since nothing of that workload runs any more.
 
-Moving is explicit, from the workload's machine picker:
+Moving is explicit, from the workload's machine picker or the `devdock_move`
+MCP tool. Both go through the initiating daemon: `GET /instances/move-plan`
+previews it and `POST /instances/move` runs it.
 
 - Owner online: the owner stops its dev session (pods keep running) and deletes
-  its claim (`POST /repos/:id/release`). If a dev session was live, the UI starts
-  dev on the target, which claims it. Otherwise the target's next verb claims it.
+  its claim (`POST /repos/:id/release`). If a dev session was live, the target
+  starts dev and claims it: plain start when both checkouts are at the same
+  commit, build + start otherwise, since the running image came from the
+  owner's code. Otherwise the target's next verb claims it. `followUp`
+  overrides this.
 - Owner unreachable: the target deletes the claim only while it still names that
   owner, then claims it (`POST /repos/:id/take-over`). When the old owner returns,
   its reconcile sees the claim names someone else, kills its tmux session and

@@ -4,7 +4,7 @@
 // thin call into the daemon client.
 import type { LogSource, RepoState, WorkflowAction } from '@devdock/core'
 import { z } from 'zod'
-import type { DaemonClient, RepoVerb, VerbResult } from './client.js'
+import type { DaemonClient, MoveFollowUp, RepoVerb, VerbResult } from './client.js'
 
 export type Scope = 'ro' | 'rw'
 
@@ -22,6 +22,11 @@ const workloadArg = {
     .string()
     .optional()
     .describe('workload type (api/cron/worker) for multi-workload repos; omit for the default'),
+}
+const moveArgs = {
+  ...repoArg,
+  ...workloadArg,
+  to: z.string().describe('target instance UUID, from devdock_instances'),
 }
 const tidArg = { terminal: z.string().describe('terminal id (from devdock_term_open)') }
 
@@ -566,6 +571,47 @@ export function toolsForScope(client: DaemonClient, scope: Scope): ToolDef[] {
       scope: 'ro',
       inputSchema: {},
       handler: async () => JSON.stringify(await client.instances?.()),
+    })
+  if (client.movePlan)
+    tools.push({
+      name: 'devdock_move_plan',
+      description:
+        'Preview moving a deployment to another linked machine: current owner, whether it is reachable and running, both checkouts (branch, commit, dirty) and the follow-up the move would run.',
+      scope: 'ro',
+      inputSchema: moveArgs,
+      handler: async (args) =>
+        JSON.stringify(
+          await client.movePlan?.(
+            args.repo as string,
+            args.to as string,
+            args.workload as string | undefined,
+          ),
+        ),
+    })
+  if (client.move)
+    tools.push({
+      name: 'devdock_move',
+      description:
+        'Move a deployment to another linked machine. A reachable owner releases it (its dev session stops, the deployment stays); an unreachable owner is taken over. A live session then restarts on the target, with build + start when the checkouts are at different commits. Check devdock_move_plan first.',
+      scope: 'rw',
+      inputSchema: {
+        ...moveArgs,
+        followUp: z
+          .enum(['start', 'build_start', 'none'])
+          .optional()
+          .describe(
+            "Override what runs on the target after the move. Omit to use the plan's choice.",
+          ),
+      },
+      handler: async (args) =>
+        JSON.stringify(
+          await client.move?.(
+            args.repo as string,
+            args.to as string,
+            args.workload as string | undefined,
+            args.followUp as MoveFollowUp | undefined,
+          ),
+        ),
     })
   if (client.linkInstance)
     tools.push({

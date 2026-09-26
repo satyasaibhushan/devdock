@@ -40,6 +40,9 @@ export interface ExecResult extends VerbResult {
 /** Lifecycle verbs the daemon exposes as POST /repos/:id/<verb>. */
 export type RepoVerb = 'start' | 'build' | 'build-start' | 'restart' | 'destroy' | 'adopt' | 'clear'
 
+/** What the target runs once a deployment moves; the plan picks a default. */
+export type MoveFollowUp = 'start' | 'build_start' | 'none'
+
 export interface TermOpenOpts {
   repo?: string
   workload?: string
@@ -76,6 +79,8 @@ export interface DaemonClient {
   forInstance?(id: string): DaemonClient
   linkInstance?(host: string, endpoint: string, terminals?: boolean): Promise<unknown>
   unlinkInstance?(id: string): Promise<void>
+  movePlan?(repo: string, to: string, workload?: string): Promise<unknown>
+  move?(repo: string, to: string, workload?: string, followUp?: MoveFollowUp): Promise<unknown>
   list(): Promise<RepoState[]>
   status(id: string): Promise<RepoState>
   verb(verb: RepoVerb, id: string, workload?: string): Promise<VerbResult>
@@ -216,6 +221,12 @@ export function daemonClient(send: DaemonTransport, prefix = ''): DaemonClient {
     unlinkInstance: async (instance) => {
       await request(`/instances/${id(instance)}`, { method: 'DELETE' })
     },
+    movePlan: (repo, to, workload) =>
+      request(
+        `/instances/move-plan?${new URLSearchParams({ repo, to, ...(workload ? { workload } : {}) })}`,
+      ),
+    move: (repo, to, workload, followUp) =>
+      post('/instances/move', { repo, to, workload, followUp }),
     list: () => request<RepoState[]>('/repos'),
     status: (i) => request<RepoState>(`/repos/${id(i)}`),
     verb: async (verb, i, workload) =>

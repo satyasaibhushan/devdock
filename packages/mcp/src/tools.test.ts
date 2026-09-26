@@ -27,6 +27,18 @@ it('routes concurrent MCP calls to their explicit instances without changing the
   )
 })
 
+it('moves a deployment through the daemon, previewing at ro and acting only at rw', async () => {
+  const move = vi.fn(async () => ({ claim: 'released' }))
+  const client = fakeClient({ movePlan: async () => ({ followUp: 'build_start' }), move })
+  const names = (scope: 'ro' | 'rw') => toolsForScope(client, scope).map((item) => item.name)
+  expect(names('ro')).toContain('devdock_move_plan')
+  expect(names('ro')).not.toContain('devdock_move')
+  const tool = toolsForScope(client, 'rw').find((item) => item.name === 'devdock_move')
+  expect(tool?.inputSchema).not.toHaveProperty('instance')
+  await tool?.handler({ repo: 'api', to: 'box', followUp: 'none' })
+  expect(move).toHaveBeenCalledWith('api', 'box', undefined, 'none')
+})
+
 function repoState(over: Partial<RepoState> = {}): RepoState {
   return {
     repo: {
