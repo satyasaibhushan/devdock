@@ -9,6 +9,7 @@
 #   DEVDOCK_NO_PROXY      hosts reached directly (default: $NO_PROXY, else localhost)
 #   DEVDOCK_DOCKER_HOST   Docker socket, e.g. rootless (default: $DOCKER_HOST)
 #   DEVDOCK_PATH_PREFIX   extra PATH entries ahead of the defaults
+#   DEVDOCK_SSH_AUTH_SOCK SSH agent socket for git over SSH (default: none)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,6 +23,7 @@ PROXY="${DEVDOCK_HTTPS_PROXY-${HTTPS_PROXY:-}}"
 NO_PROXY_HOSTS="${DEVDOCK_NO_PROXY:-${NO_PROXY:-localhost,127.0.0.1}}"
 DOCKER="${DEVDOCK_DOCKER_HOST-${DOCKER_HOST:-}}"
 PATH_PREFIX="${DEVDOCK_PATH_PREFIX:-}"
+AGENT_SOCKET="${DEVDOCK_SSH_AUTH_SOCK:-}"
 RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 SOCKET="$RUNTIME_DIR/devdock/control.sock"
 INSTALL_ROOT="${DEVDOCK_INSTALL_ROOT:-$HOME/.local/share/devdock}"
@@ -117,6 +119,7 @@ fi
   printf 'Environment=DEVDOCK_SOCKET=%%t/devdock/control.sock\n'
   if [[ -S "$RUNTIME_DIR/bus" ]]; then printf 'Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%%t/bus\n'; fi
   if [[ -n "$DOCKER" ]]; then printf 'Environment=DOCKER_HOST=%s\n' "$DOCKER"; fi
+  if [[ -n "$AGENT_SOCKET" ]]; then printf 'Environment=SSH_AUTH_SOCK=%s\n' "$AGENT_SOCKET"; fi
   if [[ -n "$PROXY" ]]; then
     printf 'Environment=HTTPS_PROXY=%s\n' "$PROXY"
     printf 'Environment=NO_PROXY=%s\n' "$NO_PROXY_HOSTS"

@@ -86,6 +86,7 @@ Old releases are kept; delete them by hand when no longer needed.
 | `DEVDOCK_NO_PROXY` | `$NO_PROXY`, else `localhost,127.0.0.1` | Hosts reached directly, written only with a proxy |
 | `DEVDOCK_DOCKER_HOST` | `$DOCKER_HOST` | Docker socket, e.g. rootless |
 | `DEVDOCK_PATH_PREFIX` | none | Extra `PATH` entries ahead of the defaults |
+| `DEVDOCK_SSH_AUTH_SOCK` | none | SSH agent socket for git over SSH, see [below](#git-over-ssh) |
 | `DEVDOCK_NODE_BIN`, `DEVDOCK_PNPM_BIN` | `node`, `pnpm` on `PATH` | Toolchain used to build and run |
 | `DEVDOCK_INSTALL_ROOT` | `~/.local/share/devdock` | Releases, `current` and the `node` links |
 | `DEVDOCK_UNIT_DEST` | `~/.config/systemd/user/devdock.service` | Unit path |
@@ -125,6 +126,31 @@ reads it differently:
 
   `proxy-url` overrides the environment for that cluster only; the rest of AWS
   stays direct.
+
+## Git over SSH
+
+DevSpace pulls its git dependencies (shared pipelines, charts) on every deploy.
+A machine with no key of its own can use the agent forwarded by your SSH
+sessions. A service has no session, so keep a stable link to a forwarded agent
+in `~/.ssh/rc`, which sshd runs at each login. Linking each login's own agent
+would let a one-off `ssh host cmd` take the link and leave it dead seconds
+later, so point at the oldest open session instead:
+
+```sh
+for sock in $(ls -tr /tmp/ssh-*/agent.* 2>/dev/null); do
+  if [ -S "$sock" ] && [ -O "$sock" ]; then
+    ln -sfn "$sock" "$HOME/.ssh/agent.sock"
+    break
+  fi
+done
+```
+
+Then install with `DEVDOCK_SSH_AUTH_SOCK=$HOME/.ssh/agent.sock`. This works only
+while an interactive or command SSH session with agent forwarding is open: the
+link tunnel runs `ssh -N`, which opens no session and forwards no agent. Without
+one, the dependency pull fails with `Permission denied (publickey)` and DevSpace
+continues with its cached copy, so a first deploy on a new machine needs one.
+A `~/.ssh/rc` also replaces sshd's own X11 `xauth` setup.
 
 Inspect without printing credentials:
 

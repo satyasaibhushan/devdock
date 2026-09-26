@@ -187,7 +187,11 @@ describe('systemd installer', () => {
 
   it('installs a release behind current with the machine proxy in the unit', () => {
     const m = machine()
-    m.install({ DEVDOCK_HTTPS_PROXY: 'http://127.0.0.1:18080', DEVDOCK_NO_PROXY: '.amazonaws.com' })
+    m.install({
+      DEVDOCK_HTTPS_PROXY: 'http://127.0.0.1:18080',
+      DEVDOCK_NO_PROXY: '.amazonaws.com',
+      DEVDOCK_SSH_AUTH_SOCK: '/home/me/.ssh/agent.sock',
+    })
     const release = readlinkSync(join(m.installRoot, 'current'))
     expect(release).toContain('/releases/')
     expect(existsSync(join(release, 'packages', 'daemon', 'dist', 'index.js'))).toBe(true)
@@ -198,6 +202,7 @@ describe('systemd installer', () => {
     expect(unit).toContain('Environment=HTTPS_PROXY=http://127.0.0.1:18080')
     expect(unit).toContain('Environment=NO_PROXY=.amazonaws.com')
     expect(unit).toContain('Environment=DEVDOCK_SOCKET=%t/devdock/control.sock')
+    expect(unit).toContain('Environment=SSH_AUTH_SOCK=/home/me/.ssh/agent.sock')
     // A restart must not take the tmux server, and every dev session, with it.
     expect(unit).toContain('KillMode=process')
     expect(readFileSync(m.log, 'utf8')).toContain('systemctl --user restart devdock')
@@ -209,6 +214,7 @@ describe('systemd installer', () => {
     const unit = readFileSync(m.unit, 'utf8')
     expect(unit).not.toContain('HTTPS_PROXY')
     expect(unit).not.toContain('--use-env-proxy')
+    expect(unit).not.toContain('SSH_AUTH_SOCK')
   })
 
   it('puts the previous release and unit back when the new daemon is unhealthy', () => {
