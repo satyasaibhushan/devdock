@@ -10,18 +10,22 @@
 //
 //  - token freshness is read straight from kubelogin's cache (a JWT decode,
 //    no process spawn), so the reconcile loop can gate kubectl cheaply;
-//  - silent refresh runs `get-token --skip-open-browser` under a timeout, so
-//    it can never open a browser or hang the daemon (refresh works from any
-//    network — only the interactive Google page is IP-restricted to the
-//    office);
+//  - silent refresh is the daemon's own refresh_token grant against the
+//    issuer, written back into kubelogin's cache — never a kubelogin spawn.
+//    kubelogin falls back to its browser flow on ANY refresh failure, so a
+//    Wi-Fi blip after wake used to read as "login required" until clicked.
+//    Here only a rejected grant (invalid_grant) needs a login; transport
+//    trouble is retried with backoff (refresh works from any network — only
+//    the interactive Google page is IP-restricted to the office);
 //  - explicit login is single-flight and uses `--skip-open-browser`; its URL is
 //    surfaced to the UI/MCP for a deliberate user click;
 //  - kubectl calls are refused while login is required (see kubectlAllowed),
 //    so the 5s reconcile loop can't trigger login storms.
-import { readFileSync, readdirSync, rmSync } from 'node:fs'
+import { readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { type RunOptions, type RunResult, run, runStream } from './exec.js'
+import { type OidcEndpoints, TokenEndpointError, discoverEndpoints, tokenGrant } from './oidc.js'
 
 /** Runner with timeout support — auth probes MUST be killable (a kubelogin
  *  waiting for a browser callback would otherwise hang the daemon forever). */
@@ -45,6 +49,9 @@ export interface AuthState {
   /** Cached id_token expiry (epoch ms), when present and parseable. */
   tokenExpiresAt?: number
   loginUrl?: string
+  /** Pending AWS sign-in URL (set by the service from AwsCreds, not by this
+   *  manager): the refresh token is dead and a verb is waiting on it. */
+  awsLoginUrl?: string
   checkedAt: number
 }
 
@@ -53,7 +60,7 @@ export interface AuthManagerOptions {
   loginRunner?: AuthLoginRunner
   /** kubelogin's token cache — the dir behind `rm -r ~/.kube/cache/oidc-login`. */
   cacheDir?: string
-  probeTimeoutMs?: number
+  fetchFn?: typeof fetch
   loginTimeoutMs?: number
   /** How long a cache-dir read is trusted before re-reading (tests set 0). */
   expiryTtlMs?: number
@@ -62,13 +69,12 @@ export interface AuthManagerOptions {
 /** Consider a token stale this long before its real expiry, so a verb never
  *  starts with a token that dies mid-`devspace deploy`. */
 const TOKEN_MARGIN_MS = 60_000
-/** Background maintenance renews the token when it has less than this left —
- *  kubelogin only refreshes an *expired* token on its own, so `--force-refresh`
- *  here keeps the cache perpetually fresh and login interruptions rare. */
+/** Background maintenance renews the token when it has less than this left,
+ *  so kubectl/devspace (and their own kubelogin exec) never see a stale one. */
 const REFRESH_AHEAD_MS = 20 * 60_000
-/** A probe that needs the browser prints a URL and waits for the callback —
- *  kill it well before kubelogin's own 180s authcode timeout. */
-const PROBE_TIMEOUT_MS = 20_000
+/** Backoff between silent refreshes after a transport failure. */
+const RETRY_BASE_MS = 15_000
+const RETRY_MAX_MS = 5 * 60_000
 /** Interactive login: kubelogin's authcode flow times out at 180s; give it
  *  slack, then kill so a verb can't hang forever. */
 const LOGIN_TIMEOUT_MS = 190_000
@@ -81,20 +87,17 @@ const EXEC_ARGS_TTL_MS = 5 * 60_000
 export const OFF_NETWORK_HINT =
   'if you are off the office network, the Google sign-in page is IP-restricted — connect to the office network/VPN and retry'
 
-/** Output that means kubelogin gave up on the cache and started the
- *  interactive authcode flow (it prints the URL and waits for the callback). */
-const INTERACTIVE_RE = /visit the following URL|open the browser|authentication in progress/i
-
-/** kubelogin could not bind its fixed callback port — another kubelogin
- *  (a devspace dev session refreshing its own token, a kubectl in a terminal)
- *  is already waiting on it. It exits immediately, without opening a browser. */
-const BIND_ERROR_RE = /address already in use/i
+interface CacheEntry {
+  path: string
+  data: { id_token: string; refresh_token?: unknown; [key: string]: unknown }
+  expiresAt: number
+}
 
 export class AuthManager {
   private readonly runner: AuthRunner
   private readonly loginRunner: AuthLoginRunner
   private readonly cacheDir: string
-  private readonly probeTimeoutMs: number
+  private readonly fetchFn: typeof fetch
   private readonly loginTimeoutMs: number
   private readonly expiryTtlMs: number
 
@@ -106,9 +109,13 @@ export class AuthManager {
   private checkedAt = 0
   private loginUrl: string | undefined
   private identity: { issuer: string; clientId: string } | undefined
+  /** Set while a transport failure waits out its backoff; phase is 'error'. */
+  private retryAt: number | undefined
+  private failures = 0
+  private endpointsCache: { issuer: string; endpoints: OidcEndpoints } | undefined
 
   private execArgsCache: { args: string[] | null; at: number } | undefined
-  private expiryCache: { expiresAt: number | undefined; at: number } | undefined
+  private expiryCache: { entry: CacheEntry | undefined; at: number } | undefined
 
   /** Serializes probe/refresh/login — kubelogin binds a fixed localhost port,
    *  so two live instances always fight. */
@@ -130,7 +137,7 @@ export class AuthManager {
           }
         : runStream)
     this.cacheDir = opts.cacheDir ?? join(homedir(), '.kube', 'cache', 'oidc-login')
-    this.probeTimeoutMs = opts.probeTimeoutMs ?? PROBE_TIMEOUT_MS
+    this.fetchFn = opts.fetchFn ?? fetch
     this.loginTimeoutMs = opts.loginTimeoutMs ?? LOGIN_TIMEOUT_MS
     this.expiryTtlMs = opts.expiryTtlMs ?? EXPIRY_TTL_MS
   }
@@ -158,7 +165,7 @@ export class AuthManager {
    *  later expiry. */
   async syncContext(): Promise<AuthState> {
     if (this.logging || this.probing) return this.snapshot()
-    if (this.phase === 'login_required' || this.phase === 'error') return this.snapshot()
+    if (this.settledFailure()) return this.snapshot()
     const args = await this.execArgs(true)
     if (!args) return this.noExecArgsState()
     if (this.tokenFresh(TOKEN_MARGIN_MS)) return this.settle('ok', undefined)
@@ -171,16 +178,15 @@ export class AuthManager {
    *  kicked off (single-flight) and the call is refused, so a stale token can
    *  never fan out into per-process kubelogin browser storms.
    *
-   *  Once the phase is login_required/error, no more probes are kicked from here: a
-   *  dead refresh token cannot be fixed silently, and re-probing every tick
-   *  would hold kubelogin's callback port ~85% of the time — starving the
-   *  Login button (and any external kubelogin) of the port. */
+   *  Once the phase is login_required/error, no more probes are kicked from
+   *  here: a dead refresh token cannot be fixed silently. A transport failure
+   *  is the exception — it is re-probed once its backoff has elapsed. */
   kubectlAllowed(args: string[]): boolean {
     const sub = args[0]
     if (sub === 'config' || sub === 'oidc-login') return true
     if (this.oidc !== true) return true
     if (this.tokenFresh(TOKEN_MARGIN_MS)) return true
-    if (this.phase === 'unknown' || this.phase === 'ok') void this.probe().catch(() => undefined)
+    if (!this.settledFailure()) void this.probe().catch(() => undefined)
     return false
   }
 
@@ -188,7 +194,7 @@ export class AuthManager {
    *  retries a settled failure; only login() may do that. */
   async ensure(): Promise<AuthState> {
     if (this.oidc === undefined) await this.execArgs()
-    if (this.phase === 'error') return this.snapshot()
+    if (this.phase === 'error' && !this.retryDue()) return this.snapshot()
     if (this.oidc !== true) return this.settle('ok', undefined)
     if (this.tokenFresh(TOKEN_MARGIN_MS)) return this.settle('ok', undefined)
     if (this.phase === 'login_required') return this.snapshot()
@@ -196,27 +202,24 @@ export class AuthManager {
   }
 
   /** Silent check-and-refresh: never opens a browser. Joins an in-flight
-   *  probe/login instead of stacking another kubelogin on the port. */
+   *  probe/login instead of stacking a second refresh or kubelogin. */
   probe(): Promise<AuthState> {
     if (this.logging) return this.logging
     if (this.probing) return this.probing
-    const p = this.exclusive(() => this.doProbe(false, TOKEN_MARGIN_MS)).finally(() => {
+    const p = this.exclusive(() => this.doProbe(TOKEN_MARGIN_MS)).finally(() => {
       this.probing = null
     })
     this.probing = p
     return p
   }
 
-  /** Background maintenance: renew the token before it expires (kubelogin only
-   *  refreshes an already-expired one on its own — `--force-refresh` keeps the
-   *  cache warm so kubectl/devspace never see a stale token). Silent. */
+  /** Background maintenance: renew the token before it expires, so the cache
+   *  stays warm and kubectl/devspace never see a stale token. Silent. */
   maintain(): Promise<AuthState> {
-    if (this.phase === 'login_required' || this.phase === 'error') {
-      return Promise.resolve(this.snapshot())
-    }
+    if (this.settledFailure()) return Promise.resolve(this.snapshot())
     if (this.logging) return this.logging
     if (this.probing) return this.probing
-    const p = this.exclusive(() => this.doProbe(true, REFRESH_AHEAD_MS)).finally(() => {
+    const p = this.exclusive(() => this.doProbe(REFRESH_AHEAD_MS)).finally(() => {
       this.probing = null
     })
     this.probing = p
@@ -241,7 +244,8 @@ export class AuthManager {
 
   /** `rm -r ~/.kube/cache/oidc-login` as a button. */
   clearCache(): AuthState {
-    // A login/probe owns kubelogin's fixed callback port. Do not hide that
+    // A login owns kubelogin's fixed callback port; a probe may be rewriting
+    // the cache. Do not hide that
     // operation by replacing its visible state with `login_required`: a later
     // Login click would only join the hidden operation and appear inert.
     if (this.logging || this.probing) return this.snapshot()
@@ -256,37 +260,76 @@ export class AuthManager {
 
   // ---- internals ----
 
-  private async doProbe(forceRefresh: boolean, marginMs: number): Promise<AuthState> {
+  private async doProbe(marginMs: number): Promise<AuthState> {
     const args = await this.execArgs()
     if (!args) return this.noExecArgsState()
     this.expiryCache = undefined
     if (this.tokenFresh(marginMs)) return this.settle('ok', undefined)
 
-    const extra = forceRefresh
-      ? ['--force-refresh', '--skip-open-browser']
-      : ['--skip-open-browser']
-    const r = await this.runner(args[0] as string, [...args.slice(1), ...extra], {
-      timeoutMs: this.probeTimeoutMs,
-    })
-    this.expiryCache = undefined
-    if (r.code === 0) return this.settle('ok', undefined)
-
-    const out = `${r.stdout}\n${r.stderr}`
-    if (r.code < 0 || INTERACTIVE_RE.test(out)) {
-      // It fell back to the interactive flow (we killed it before it could
-      // wait 3 minutes for a browser callback that was never coming).
+    const entry = this.latestEntry()
+    const identity = this.identity
+    const refreshToken = entry?.data.refresh_token
+    if (!entry || !identity || typeof refreshToken !== 'string' || !refreshToken) {
       return this.settle('login_required', `Kubernetes login required — ${OFF_NETWORK_HINT}`)
     }
-    if (BIND_ERROR_RE.test(out)) {
-      // Another kubelogin is mid-interactive-flow on the callback port — that
-      // only happens when its refresh failed too, so login IS required. Leave
-      // the squatter alone: its sign-in tab may be open in front of the user.
-      return this.settle(
-        'login_required',
-        'Kubernetes login required — another sign-in is already waiting (check for an open tab, or click log in to take over)',
-      )
+    try {
+      const { token } = await this.endpoints(identity.issuer)
+      const form: Record<string, string> = {
+        grant_type: 'refresh_token',
+        client_id: identity.clientId,
+        refresh_token: refreshToken,
+      }
+      const secret = flagValue(args, '--oidc-client-secret')
+      if (secret) form.client_secret = secret
+      const t = await tokenGrant(this.fetchFn, token, form)
+      const rotated =
+        typeof t.refresh_token === 'string' && t.refresh_token ? t.refresh_token : refreshToken
+      if (typeof t.id_token !== 'string' || !t.id_token) {
+        if (rotated !== refreshToken)
+          writeCacheEntry(entry.path, { ...entry.data, refresh_token: rotated })
+        throw new Error('OIDC refresh response is missing an ID token')
+      }
+      writeCacheEntry(entry.path, { ...entry.data, id_token: t.id_token, refresh_token: rotated })
+    } catch (err) {
+      if (err instanceof TokenEndpointError && err.invalidGrant) {
+        return this.settle('login_required', `Kubernetes sign-in expired — ${OFF_NETWORK_HINT}`)
+      }
+      return this.retryLater(err)
     }
-    return this.settle('error', lastLine(r.stderr) ?? `kubelogin exited ${r.code}`)
+    this.expiryCache = undefined
+    return this.settle('ok', undefined)
+  }
+
+  /** A transient refresh failure: keep the refresh token, retry after backoff. */
+  private retryLater(err: unknown): AuthState {
+    this.failures += 1
+    const delay = Math.min(RETRY_BASE_MS * 2 ** (this.failures - 1), RETRY_MAX_MS)
+    const detail = err instanceof Error ? err.message : String(err)
+    this.settle(
+      'error',
+      `Kubernetes token refresh failed (${detail}) — retrying in ${Math.round(delay / 1000)}s`,
+    )
+    this.retryAt = Date.now() + delay
+    return this.snapshot()
+  }
+
+  private retryDue(): boolean {
+    return this.phase === 'error' && this.retryAt !== undefined && Date.now() >= this.retryAt
+  }
+
+  /** A failure only an explicit login (or a due retry) may move past. */
+  private settledFailure(): boolean {
+    return this.phase === 'login_required' || (this.phase === 'error' && !this.retryDue())
+  }
+
+  private async endpoints(issuer: string): Promise<OidcEndpoints> {
+    if (this.endpointsCache?.issuer === issuer) return this.endpointsCache.endpoints
+    const endpoints = await discoverEndpoints(
+      this.fetchFn,
+      `${issuer}/.well-known/openid-configuration`,
+    )
+    this.endpointsCache = { issuer, endpoints }
+    return endpoints
   }
 
   private async doLogin(): Promise<AuthState> {
@@ -352,6 +395,7 @@ export class AuthManager {
       this.oidc = true
       this.identity = undefined
       this.expiryCache = undefined
+      this.retryAt = undefined
       this.phase = 'error'
       this.message = 'could not inspect the active Kubernetes auth context'
       this.checkedAt = Date.now()
@@ -374,6 +418,10 @@ export class AuthManager {
     return args
   }
 
+  private tokenExpiresAt(): number | undefined {
+    return this.latestEntry()?.expiresAt
+  }
+
   private tokenFresh(marginMs: number): boolean {
     const exp = this.tokenExpiresAt()
     return exp !== undefined && exp - marginMs > Date.now()
@@ -383,21 +431,28 @@ export class AuthManager {
     return this.phase === 'error' ? this.snapshot() : this.settle('ok', undefined)
   }
 
-  /** Latest id_token expiry across kubelogin's cache files — a pure fs read +
-   *  JWT payload decode, so the reconcile-loop gate never spawns a process. */
-  private tokenExpiresAt(): number | undefined {
+  /** The kubelogin cache entry holding the latest id_token for the active
+   *  identity — a pure fs read + JWT payload decode, so the reconcile-loop gate
+   *  never spawns a process. */
+  private latestEntry(): CacheEntry | undefined {
     const cached = this.expiryCache
-    if (cached && Date.now() - cached.at < this.expiryTtlMs) return cached.expiresAt
-    let latest: number | undefined
+    if (cached && Date.now() - cached.at < this.expiryTtlMs) return cached.entry
+    let latest: CacheEntry | undefined
     try {
       for (const f of readdirSync(this.cacheDir)) {
-        if (f.endsWith('.lock')) continue
+        if (f.endsWith('.lock') || f.endsWith('.tmp')) continue
         try {
-          const raw = readFileSync(join(this.cacheDir, f), 'utf8')
+          const path = join(this.cacheDir, f)
+          const raw = readFileSync(path, 'utf8')
           if (!raw.trim()) continue
-          const data = JSON.parse(raw) as { id_token?: string }
-          const exp = data.id_token ? matchingJwtExpiryMs(data.id_token, this.identity) : undefined
-          if (exp !== undefined && (latest === undefined || exp > latest)) latest = exp
+          const data = JSON.parse(raw) as CacheEntry['data']
+          const exp =
+            typeof data.id_token === 'string'
+              ? matchingJwtExpiryMs(data.id_token, this.identity)
+              : undefined
+          if (exp !== undefined && (latest === undefined || exp > latest.expiresAt)) {
+            latest = { path, data, expiresAt: exp }
+          }
         } catch {
           // an unreadable cache entry is just not evidence of a fresh token
         }
@@ -405,13 +460,15 @@ export class AuthManager {
     } catch {
       // no cache dir yet — no token
     }
-    this.expiryCache = { expiresAt: latest, at: Date.now() }
+    this.expiryCache = { entry: latest, at: Date.now() }
     return latest
   }
 
   private settle(phase: AuthPhase, message: string | undefined): AuthState {
     this.phase = phase
     this.message = message
+    this.retryAt = undefined
+    if (phase === 'ok') this.failures = 0
     this.checkedAt = Date.now()
     return this.snapshot()
   }
@@ -421,6 +478,14 @@ export class AuthManager {
     this.lock = p.catch(() => undefined)
     return p
   }
+}
+
+/** Replace a kubelogin cache file atomically (it reads the same file on every
+ *  kubectl call), keeping kubelogin's owner-only mode. */
+function writeCacheEntry(path: string, data: Record<string, unknown>): void {
+  const tmp = `${path}.${process.pid}.tmp`
+  writeFileSync(tmp, JSON.stringify(data), { mode: 0o600 })
+  renameSync(tmp, path)
 }
 
 function flagValue(args: string[], flag: string): string | undefined {

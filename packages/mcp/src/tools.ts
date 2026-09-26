@@ -276,7 +276,7 @@ export function allTools(client: DaemonClient): ToolDef[] {
     {
       name: 'devdock_auth_status',
       description:
-        'Kubernetes OIDC auth state (phase, token expiry). Poll this after devdock_auth_login.',
+        'Kubernetes OIDC auth state (phase, token expiry, sign-in URL) plus awsLoginUrl when an AWS sign-in is pending. Neither sign-in opens a browser: hand the URL to the user. Poll this after devdock_auth_login.',
       scope: 'ro',
       inputSchema: {},
       handler: async () => JSON.stringify(await client.auth(), null, 2),

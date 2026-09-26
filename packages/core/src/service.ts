@@ -2130,14 +2130,14 @@ export class Service {
 
   // ---- kubernetes auth (owned by AuthManager, surfaced over /auth) ----
   authState(): AuthState {
-    return this.auth.snapshot()
+    return { ...this.auth.snapshot(), awsLoginUrl: this.awsCreds.loginUrl() }
   }
 
   /** Kick off one explicit login without holding the HTTP request open. The
    *  sign-in URL appears in later /auth polls; no browser is launched. */
   authLogin(): AuthState {
     void this.auth.login().catch(() => undefined)
-    return this.auth.snapshot()
+    return this.authState()
   }
 
   authClearCache(): AuthState {

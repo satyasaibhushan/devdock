@@ -60,17 +60,22 @@ function fakeFetch(handlers: {
   return { fetchFn: fetchFn as unknown as typeof fetch, grants }
 }
 
-/** A browser-opener that completes the sign-in: parses the authorize URL the
- *  manager built and hits its redirect_uri back with a code, like the real
- *  browser redirect would. */
-function fakeBrowser(code = 'auth-code'): ReturnType<typeof vi.fn> {
-  return vi.fn(async (_cmd: string, args: string[]) => {
-    const url = new URL(args[0] as string)
+/** The user watching the UI: records every sign-in URL the manager surfaces
+ *  and, when `complete`, follows it — hits its redirect_uri back with a code,
+ *  like the real browser redirect would. */
+function watchSignIn(creds: AwsCreds, complete = true) {
+  const urls: string[] = []
+  const timer = setInterval(() => {
+    const surfaced = creds.loginUrl()
+    if (!surfaced || urls.includes(surfaced)) return
+    urls.push(surfaced)
+    if (!complete) return
+    const url = new URL(surfaced)
     const redirect = url.searchParams.get('redirect_uri') as string
     const state = url.searchParams.get('state') as string
-    void fetch(`${redirect}/?code=${code}&state=${encodeURIComponent(state)}`)
-    return ok()
-  })
+    void fetch(`${redirect}/?code=auth-code&state=${encodeURIComponent(state)}`)
+  }, 1)
+  return { urls, stop: () => clearInterval(timer) }
 }
 
 let dir: string
@@ -84,13 +89,8 @@ beforeEach(() => {
 })
 afterEach(() => rmSync(dir, { recursive: true, force: true }))
 
-const make = (
-  fetchFn: typeof fetch,
-  runner: ReturnType<typeof vi.fn> = vi.fn(async () => ok()),
-  extra: Record<string, unknown> = {},
-) =>
+const make = (fetchFn: typeof fetch, extra: Record<string, unknown> = {}) =>
   new AwsCreds({
-    runner: runner as never,
     oidcConfigPath: configPath,
     tokenFile,
     fetchFn,
@@ -104,12 +104,13 @@ describe('AwsCreds', () => {
     const { fetchFn, grants } = fakeFetch({
       token: () => json({ id_token: 'id-1' }),
     })
-    const runner = vi.fn(async () => ok())
-    const creds = make(fetchFn, runner)
+    const creds = make(fetchFn)
+    const browser = watchSignIn(creds, false)
     expect(creds.configured()).toBe(true)
 
     expect(await creds.warm()).toEqual({ ok: true })
-    expect(runner).not.toHaveBeenCalled() // the whole point
+    browser.stop()
+    expect(browser.urls).toEqual([]) // the whole point
     expect(grants[0]?.get('grant_type')).toBe('refresh_token')
     expect(grants[0]?.get('refresh_token')).toBe('rt-1')
     expect(grants[0]?.get('client_id')).toBe('client-123')
@@ -152,11 +153,15 @@ describe('AwsCreds', () => {
           ? json({ id_token: 'id-2', refresh_token: 'rt-new' })
           : json({ error: 'invalid_grant' }, 400),
     })
-    const runner = fakeBrowser()
-    const creds = make(fetchFn, runner)
+    const creds = make(fetchFn)
+    const browser = watchSignIn(creds)
 
     expect(await creds.warm()).toEqual({ ok: true })
-    expect(runner).toHaveBeenCalledTimes(1)
+    browser.stop()
+    // surfaced for the user to open (nothing is launched on the host), then cleared
+    expect(browser.urls).toHaveLength(1)
+    expect(browser.urls[0]).toMatch(/^https:\/\/idp\.example\/oauth2\/authorize\?/)
+    expect(creds.loginUrl()).toBeUndefined()
     const grant = grants.find((g) => g.get('grant_type') === 'authorization_code')
     expect(grant?.get('code')).toBe('auth-code')
     expect(grant?.get('code_verifier')).toBeTruthy()
@@ -172,10 +177,11 @@ describe('AwsCreds', () => {
           ? json({ error: 'invalid_grant' }, 400)
           : json({ id_token: 'id-3', refresh_token: 'rt-live' }),
     })
-    const runner = fakeBrowser()
-    const creds = make(fetchFn, runner)
+    const creds = make(fetchFn)
+    const browser = watchSignIn(creds)
 
     expect(await creds.warm()).toEqual({ ok: true })
+    browser.stop()
     expect(grants.map((g) => g.get('grant_type'))).toEqual(['refresh_token', 'authorization_code'])
     expect(JSON.parse(readFileSync(tokenFile, 'utf8')).refreshToken).toBe('rt-live')
   })
@@ -186,13 +192,14 @@ describe('AwsCreds', () => {
       if (String(input) === METADATA_URL) return metadata()
       throw new Error('network is down')
     }) as unknown as typeof fetch
-    const runner = vi.fn(async () => ok())
-    const creds = make(fetchFn, runner, { failCooldownMs: 0 })
+    const creds = make(fetchFn, { failCooldownMs: 0 })
+    const browser = watchSignIn(creds, false)
 
     const r = await creds.warm()
+    browser.stop()
     expect(r.ok).toBe(false)
     expect(r.message).toContain('network is down')
-    expect(runner).not.toHaveBeenCalled()
+    expect(browser.urls).toEqual([])
     expect(JSON.parse(readFileSync(tokenFile, 'utf8')).refreshToken).toBe('rt-1')
   })
 
@@ -205,24 +212,25 @@ describe('AwsCreds', () => {
         token: () =>
           failing ? json({ error: 'temporarily_unavailable' }, status) : json({ id_token: 'id-1' }),
       })
-      const runner = vi.fn(async () => ok())
-      const creds = make(fetchFn, runner, { failCooldownMs: 0, loginTimeoutMs: 20 })
+      const creds = make(fetchFn, { failCooldownMs: 0, loginTimeoutMs: 20 })
+      const browser = watchSignIn(creds, false)
       expect((await creds.warm()).ok).toBe(false)
       expect(JSON.parse(readFileSync(tokenFile, 'utf8')).refreshToken).toBe('rt-1')
-      expect(runner).not.toHaveBeenCalled()
       failing = false
       expect(await creds.warm()).toEqual({ ok: true })
-      expect(runner).not.toHaveBeenCalled()
+      browser.stop()
+      expect(browser.urls).toEqual([])
     },
   )
 
   it('preserves a rotated refresh token when the response is missing an ID token', async () => {
     writeFileSync(tokenFile, JSON.stringify({ refreshToken: 'rt-1' }))
     const { fetchFn } = fakeFetch({ token: () => json({ refresh_token: 'rt-2' }) })
-    const runner = vi.fn(async () => ok())
-    const creds = make(fetchFn, runner, { loginTimeoutMs: 20 })
+    const creds = make(fetchFn, { loginTimeoutMs: 20 })
+    const browser = watchSignIn(creds, false)
     expect((await creds.warm()).ok).toBe(false)
-    expect(runner).not.toHaveBeenCalled()
+    browser.stop()
+    expect(browser.urls).toEqual([])
     expect(JSON.parse(readFileSync(tokenFile, 'utf8')).refreshToken).toBe('rt-2')
   })
 
@@ -254,11 +262,7 @@ describe('AwsCreds', () => {
       token: () => json({ id_token: 'id-1' }),
     })
     writeFileSync(tokenFile, JSON.stringify({ refreshToken: 'rt-1' }))
-    const creds = make(
-      fetchFn,
-      vi.fn(async () => ok()),
-      { failCooldownMs: 60_000 },
-    )
+    const creds = make(fetchFn, { failCooldownMs: 60_000 })
 
     const r = await creds.warm()
     expect(r.ok).toBe(false)
@@ -281,11 +285,7 @@ describe('AwsCreds', () => {
           ? new Response('<Error><Message>nope</Message></Error>', { status: 403 })
           : new Response(stsXml(3600_000), { status: 200 }),
     })
-    const creds = make(
-      fetchFn,
-      vi.fn(async () => ok()),
-      { failCooldownMs: 0 },
-    )
+    const creds = make(fetchFn, { failCooldownMs: 0 })
     expect((await creds.warm()).ok).toBe(false)
     expect((await creds.warm()).ok).toBe(true)
   })

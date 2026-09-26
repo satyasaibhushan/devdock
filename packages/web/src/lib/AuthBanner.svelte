@@ -2,7 +2,8 @@
   // Kubernetes auth indicator (header) — visible only when something needs the
   // user: login required (one explicit shared sign-in for all workloads),
   // sign-in in progress, or an auth error. Silent when ok or when the cluster
-  // doesn't use oidc-login at all.
+  // doesn't use oidc-login at all. A pending AWS sign-in shows its own pill
+  // (the daemon never opens a browser, so this link is the only way in).
   import { type AuthState, clearAuthCache, startAuthLogin } from './api.js'
 
   let {
@@ -43,6 +44,13 @@
   }
 </script>
 
+{#if auth.awsLoginUrl}
+  <div class="auth login_required" title="AWS refresh token expired" role="status">
+    <span class="dot" aria-hidden="true"></span>
+    <span class="msg">AWS sign-in required</span>
+    <a class="act" href={auth.awsLoginUrl} target="_blank" rel="noreferrer">open sign-in</a>
+  </div>
+{/if}
 {#if visible}
   <div
     class="auth {auth.phase}"

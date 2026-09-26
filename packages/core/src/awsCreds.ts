@@ -12,7 +12,10 @@
 //    requires access to the identity provider and STS;
 //  - interactive path (first login, or the refresh token expired): ONE
 //    single-flight PKCE authorization-code flow on the registered localhost
-//    port, same cure AuthManager applies to kubelogin/8040;
+//    port, same cure AuthManager applies to kubelogin/8040. Its URL is
+//    surfaced (auth banner, devdock_auth_status), never opened: the daemon may
+//    run on a headless box, and a tab popping up for a still-valid IdP session
+//    is noise;
 //  - the aws profile's credential_process points at the devdock-aws-cred shim,
 //    which asks the daemon over HTTP — every aws/devspace/docker process reads
 //    the daemon-minted credential and can never trigger its own login.
@@ -26,8 +29,14 @@ import { createServer } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { type AuthRunner, OFF_NETWORK_HINT } from './auth.js'
-import { run } from './exec.js'
+import { OFF_NETWORK_HINT } from './auth.js'
+import {
+  HTTP_TIMEOUT_MS,
+  type OidcEndpoints,
+  TokenEndpointError,
+  discoverEndpoints,
+  tokenGrant,
+} from './oidc.js'
 
 export interface WarmResult {
   ok: boolean
@@ -45,8 +54,6 @@ export interface AwsCredential {
 }
 
 export interface AwsCredsOptions {
-  /** Used only to open the browser for the interactive flow. */
-  runner?: AuthRunner
   /** The aws-cli-oidc yaml describing the OIDC provider. `null` disables the
    *  manager entirely (tests, machines without this setup). */
   oidcConfigPath?: string | null
@@ -66,11 +73,9 @@ const FALLBACK_FRESH_MS = 10 * 60_000
 /** The interactive flow (browser + Cognito) needs human time; give up after
  *  this so a verb can't hang forever on a sign-in nobody completes. */
 const LOGIN_TIMEOUT_MS = 190_000
-/** After a failed mint, don't re-run (and re-open a browser tab) for this
+/** After a failed mint, don't re-run (and re-issue a sign-in URL) for this
  *  long — reconcile-driven reconnect attempts would otherwise storm it. */
 const FAIL_COOLDOWN_MS = 60_000
-/** Every non-interactive HTTP hop (metadata, token grant, STS). */
-const HTTP_TIMEOUT_MS = 30_000
 /** Global endpoint — role credentials are region-agnostic. */
 const STS_URL = 'https://sts.amazonaws.com/'
 
@@ -85,24 +90,7 @@ interface ProviderConfig {
   durationSeconds: number
 }
 
-interface TokenResponse {
-  id_token?: string
-  refresh_token?: string
-}
-
-/** An OAuth error response from the token endpoint (bad/expired grant) — as
- *  opposed to transport trouble, which must NOT burn the refresh token. */
-class TokenEndpointError extends Error {
-  constructor(
-    message: string,
-    readonly invalidGrant: boolean,
-  ) {
-    super(message)
-  }
-}
-
 export class AwsCreds {
-  private readonly runner: AuthRunner
   private readonly oidcConfigPath: string | null
   private readonly tokenFile: string
   private readonly fetchFn: typeof fetch
@@ -112,15 +100,15 @@ export class AwsCreds {
 
   /** undefined = config not inspected yet; null = no usable provider entry. */
   private cfg: ProviderConfig | null | undefined
-  private endpointsCache: { authorize: string; token: string } | undefined
+  private endpointsCache: OidcEndpoints | undefined
   private cred: AwsCredential | undefined
   private expiresAt = 0
   private lastFailAt = 0
   private lastFailMessage: string | undefined
   private inflight: Promise<WarmResult> | null = null
+  private pendingLoginUrl: string | undefined
 
   constructor(opts: AwsCredsOptions = {}) {
-    this.runner = opts.runner ?? run
     this.oidcConfigPath =
       opts.oidcConfigPath === undefined
         ? join(homedir(), '.aws-cli-oidc', 'config.yaml')
@@ -144,7 +132,7 @@ export class AwsCreds {
 
   /** Make the AWS credential good before devspace runs. Single-flight: every
    *  concurrent caller awaits the same mint, so at most ONE refresh runs and
-   *  at most ONE browser tab ever opens. */
+   *  at most ONE sign-in URL is ever pending. */
   warm(): Promise<WarmResult> {
     if (this.inflight) return this.inflight
     const p = this.doWarm().finally(() => {
@@ -166,6 +154,11 @@ export class AwsCreds {
       return { ok: false, message: r.message ?? 'credential refresh failed' }
     }
     return { ok: true, cred: this.cred }
+  }
+
+  /** The sign-in URL while an interactive login waits for its callback. */
+  loginUrl(): string | undefined {
+    return this.pendingLoginUrl
   }
 
   /** Forget the persisted refresh token — the next warm is interactive. */
@@ -206,7 +199,7 @@ export class AwsCreds {
     const refreshToken = this.loadRefreshToken()
     if (refreshToken) {
       try {
-        const t = await this.tokenGrant(ep.token, {
+        const t = await tokenGrant(this.fetchFn, ep.token, {
           grant_type: 'refresh_token',
           client_id: cfg.clientId,
           refresh_token: refreshToken,
@@ -228,12 +221,9 @@ export class AwsCreds {
 
   /** PKCE authorization-code flow: local callback server on the REGISTERED
    *  host/port (the redirect_uri must match the app client exactly), one
-   *  browser tab, code → tokens. The refresh token is persisted so this runs
+   *  surfaced sign-in URL, code → tokens. The refresh token is persisted so this runs
    *  again only when that token dies (~monthly), not hourly. */
-  private async interactiveLogin(
-    cfg: ProviderConfig,
-    ep: { authorize: string; token: string },
-  ): Promise<string> {
+  private async interactiveLogin(cfg: ProviderConfig, ep: OidcEndpoints): Promise<string> {
     const verifier = randomBytes(64).toString('base64url')
     const challenge = createHash('sha256').update(verifier).digest('base64url')
     const state = randomBytes(16).toString('base64url')
@@ -286,13 +276,8 @@ export class AwsCreds {
         scope: 'openid',
         state,
       })}`
-      const opened = await this.runner(process.platform === 'darwin' ? 'open' : 'xdg-open', [url], {
-        timeoutMs: 10_000,
-      })
-      if (opened.code > 0) {
-        throw new Error(`could not open a browser for the AWS sign-in (exit ${opened.code})`)
-      }
-      const tokens = await this.tokenGrant(ep.token, {
+      this.pendingLoginUrl = url
+      const tokens = await tokenGrant(this.fetchFn, ep.token, {
         grant_type: 'authorization_code',
         client_id: cfg.clientId,
         code: await code,
@@ -303,6 +288,7 @@ export class AwsCreds {
       if (!tokens.id_token) throw new Error('sign-in succeeded but returned no id_token')
       return tokens.id_token
     } finally {
+      this.pendingLoginUrl = undefined
       server.close()
     }
   }
@@ -338,44 +324,9 @@ export class AwsCreds {
     }
   }
 
-  private async tokenGrant(tokenUrl: string, form: Record<string, string>): Promise<TokenResponse> {
-    const res = await this.fetchFn(tokenUrl, {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams(form).toString(),
-      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
-    })
-    const body = (await res.json().catch(() => ({}))) as TokenResponse & {
-      error?: string
-      error_description?: string
-    }
-    if (!res.ok) {
-      throw new TokenEndpointError(
-        `OIDC token grant failed: HTTP ${res.status}`,
-        res.status === 400 && body.error === 'invalid_grant',
-      )
-    }
-    return body
-  }
-
   /** authorize/token endpoints from the provider's metadata URL, fetched once. */
-  private async discover(cfg: ProviderConfig): Promise<{ authorize: string; token: string }> {
-    if (this.endpointsCache) return this.endpointsCache
-    const res = await this.fetchFn(cfg.metadataUrl, {
-      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
-    })
-    if (!res.ok) throw new Error(`OIDC metadata fetch failed (${res.status})`)
-    const meta = (await res.json()) as {
-      authorization_endpoint?: unknown
-      token_endpoint?: unknown
-    }
-    if (
-      typeof meta.authorization_endpoint !== 'string' ||
-      typeof meta.token_endpoint !== 'string'
-    ) {
-      throw new Error('OIDC metadata is missing its endpoints')
-    }
-    this.endpointsCache = { authorize: meta.authorization_endpoint, token: meta.token_endpoint }
+  private async discover(cfg: ProviderConfig): Promise<OidcEndpoints> {
+    this.endpointsCache ??= await discoverEndpoints(this.fetchFn, cfg.metadataUrl)
     return this.endpointsCache
   }
 

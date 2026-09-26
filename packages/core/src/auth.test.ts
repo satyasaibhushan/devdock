@@ -1,4 +1,12 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -63,6 +71,38 @@ function writeCachedToken(
 type Handler = (cmd: string, args: string[]) => RunResult | Promise<RunResult>
 const ok = (stdout = ''): RunResult => ({ code: 0, stdout, stderr: '' })
 
+const METADATA_URL = 'https://issuer.example/.well-known/openid-configuration'
+const TOKEN_URL = 'https://issuer.example/oauth2/token'
+const json = (body: unknown, status = 200): Response =>
+  new Response(JSON.stringify(body), { status })
+
+/** The issuer: metadata plus a token endpoint answering refresh grants with
+ *  `onGrant`. By default every grant is rejected as a dead refresh token. */
+function fakeIssuer(
+  onGrant: (form: URLSearchParams) => Response | Promise<Response> = () =>
+    json({ error: 'invalid_grant' }, 400),
+) {
+  const grants: URLSearchParams[] = []
+  const fetchFn = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input)
+    if (url === METADATA_URL) {
+      return json({
+        authorization_endpoint: 'https://issuer.example/authorize',
+        token_endpoint: TOKEN_URL,
+      })
+    }
+    if (url === TOKEN_URL) {
+      const form = new URLSearchParams(String(init?.body))
+      grants.push(form)
+      return onGrant(form)
+    }
+    throw new Error(`unexpected fetch ${url}`)
+  })
+  return { fetchFn: fetchFn as unknown as typeof fetch, grants }
+}
+
+const cached = () => JSON.parse(readFileSync(join(cacheDir, 'entry'), 'utf8'))
+
 /** Routes `kubectl config view` to the given kubeconfig; everything else to `onExec`. */
 function fakeRunner(kubeconfigJson: string, onExec: Handler = () => ok()) {
   return vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
@@ -116,78 +156,134 @@ describe('AuthManager', () => {
 
   it('ignores a newer cached token from a different issuer or client', async () => {
     writeCachedToken(60 * 60_000, { iss: 'https://other.example', aud: 'other-client' })
-    const exec = vi.fn(() => ({ code: -1, stdout: '', stderr: '' }))
-    const auth = new AuthManager({ runner: fakeRunner(OIDC_CONFIG, exec), cacheDir })
+    const { fetchFn, grants } = fakeIssuer()
+    const auth = new AuthManager({ runner: fakeRunner(OIDC_CONFIG), cacheDir, fetchFn })
     const state = await auth.init()
     expect(state.phase).toBe('login_required')
     expect(state.tokenExpiresAt).toBeUndefined()
-    expect(exec).toHaveBeenCalledTimes(1)
+    // the other identity's refresh token is never sent to this issuer
+    expect(grants).toHaveLength(0)
   })
 
   it('rechecks the active context instead of trusting the previous context token', async () => {
     writeCachedToken(60 * 60_000)
     let config = OIDC_CONFIG
-    const exec = vi.fn(() => ({ code: -1, stdout: '', stderr: '' }))
     const runner = vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
       if (cmd === 'kubectl' && args[0] === 'config') return ok(config)
-      return exec()
+      return ok()
     })
-    const auth = new AuthManager({ runner, cacheDir })
+    const { fetchFn } = fakeIssuer()
+    const auth = new AuthManager({ runner, cacheDir, fetchFn })
     expect((await auth.init()).phase).toBe('ok')
 
     config = OIDC_CONFIG.replace('https://issuer.example', 'https://new-issuer.example')
     const state = await auth.syncContext()
     expect(state.phase).toBe('login_required')
     expect(state.tokenExpiresAt).toBeUndefined()
-    expect(exec).toHaveBeenCalledTimes(1)
   })
 
-  it('probes with --skip-open-browser and reads success as ok', async () => {
-    const exec = vi.fn((_cmd: string, args: string[]) => {
-      expect(args).toContain('--skip-open-browser')
-      writeCachedToken(60 * 60_000) // kubelogin refreshed the cache
-      return ok('{"kind":"ExecCredential"}')
-    })
-    const auth = new AuthManager({ runner: fakeRunner(OIDC_CONFIG, exec), cacheDir })
+  it('refreshes an expired token via the refresh grant and rewrites the cache', async () => {
+    writeCachedToken(-60_000)
+    const fresh = makeToken(60 * 60_000)
+    const { fetchFn, grants } = fakeIssuer(() => json({ id_token: fresh }))
+    const exec = vi.fn(() => ok())
+    const auth = new AuthManager({ runner: fakeRunner(OIDC_CONFIG, exec), cacheDir, fetchFn })
     const s = await auth.probe()
     expect(s.phase).toBe('ok')
-    expect(exec).toHaveBeenCalledTimes(1)
+    expect(s.tokenExpiresAt).toBeGreaterThan(Date.now())
+    expect(exec).not.toHaveBeenCalled() // no kubelogin, so no browser fallback
+    expect(grants[0]?.get('grant_type')).toBe('refresh_token')
+    expect(grants[0]?.get('refresh_token')).toBe('r')
+    expect(grants[0]?.get('client_id')).toBe('abc')
+    // kubelogin reads the same file: new id_token, refresh token kept
+    expect(cached()).toEqual({ id_token: fresh, refresh_token: 'r' })
+    expect(statSync(join(cacheDir, 'entry')).mode & 0o777).toBe(0o600)
   })
 
-  it('reads a killed (hanging) probe as login_required', async () => {
-    // timeoutMs kill → run() resolves code -1: kubelogin was waiting for a
-    // browser callback, i.e. the refresh token is gone and login is needed.
-    const exec = vi.fn(() => ({ code: -1, stdout: '', stderr: '' }))
-    const auth = new AuthManager({ runner: fakeRunner(OIDC_CONFIG, exec), cacheDir })
+  it('keeps a rotated refresh token', async () => {
+    writeCachedToken(-60_000)
+    const { fetchFn } = fakeIssuer(() =>
+      json({ id_token: makeToken(60 * 60_000), refresh_token: 'r2' }),
+    )
+    const auth = new AuthManager({ runner: fakeRunner(OIDC_CONFIG), cacheDir, fetchFn })
+    expect((await auth.probe()).phase).toBe('ok')
+    expect(cached().refresh_token).toBe('r2')
+  })
+
+  it('reads a rejected refresh grant as login_required', async () => {
+    writeCachedToken(-60_000)
+    const { fetchFn } = fakeIssuer()
+    const auth = new AuthManager({ runner: fakeRunner(OIDC_CONFIG), cacheDir, fetchFn })
     const s = await auth.probe()
     expect(s.phase).toBe('login_required')
     expect(s.message).toMatch(/office network/)
   })
 
-  it('reads an interactive-flow banner as login_required even on quick exit', async () => {
-    const exec = vi.fn(() => ({
-      code: 1,
-      stdout: '',
-      stderr: 'Please visit the following URL in your browser: https://issuer.example/authorize',
-    }))
-    const auth = new AuthManager({ runner: fakeRunner(OIDC_CONFIG, exec), cacheDir })
-    const s = await auth.probe()
-    expect(s.phase).toBe('login_required')
+  it('needs a login when the cache holds no refresh token', async () => {
+    const { fetchFn, grants } = fakeIssuer()
+    const auth = new AuthManager({ runner: fakeRunner(OIDC_CONFIG), cacheDir, fetchFn })
+    expect((await auth.probe()).phase).toBe('login_required')
+    expect(grants).toHaveLength(0)
   })
 
-  it('reads other kubelogin failures as error, not login_required', async () => {
-    const exec = vi.fn(() => ({ code: 1, stdout: '', stderr: 'dial tcp: no route to host' }))
-    const auth = new AuthManager({ runner: fakeRunner(OIDC_CONFIG, exec), cacheDir })
+  it.each([
+    ['network failure', () => Promise.reject(new Error('fetch failed'))],
+    ['server error', () => json({ error: 'internal' }, 500)],
+  ])('reads a %s as a retryable error and recovers silently', async (_label, fail) => {
+    writeCachedToken(-60_000)
+    let failing = true
+    const { fetchFn, grants } = fakeIssuer(() =>
+      failing ? fail() : json({ id_token: makeToken(60 * 60_000) }),
+    )
+    const auth = new AuthManager({
+      runner: fakeRunner(OIDC_CONFIG),
+      cacheDir,
+      fetchFn,
+      expiryTtlMs: 0,
+    })
     const s = await auth.probe()
     expect(s.phase).toBe('error')
-    expect(s.message).toContain('no route to host')
+    expect(s.message).toMatch(/retrying in 15s/)
+    expect(cached().refresh_token).toBe('r')
+
+    // within the backoff: maintenance and the kubectl gate leave it alone
+    await auth.maintain()
+    expect(auth.kubectlAllowed(['get', 'pods'])).toBe(false)
+    await new Promise((r) => setTimeout(r, 10))
+    expect(grants).toHaveLength(1)
+
+    // backoff elapsed and the network is back: the next tick recovers
+    failing = false
+    vi.useFakeTimers({ now: Date.now() + 16_000, toFake: ['Date'] })
+    try {
+      expect((await auth.maintain()).phase).toBe('ok')
+    } finally {
+      vi.useRealTimers()
+    }
+    expect(grants).toHaveLength(2)
+    expect(auth.kubectlAllowed(['get', 'pods'])).toBe(true)
+  })
+
+  it('backs off exponentially across repeated transport failures', async () => {
+    writeCachedToken(-60_000)
+    const { fetchFn } = fakeIssuer(() => Promise.reject(new Error('fetch failed')))
+    const auth = new AuthManager({ runner: fakeRunner(OIDC_CONFIG), cacheDir, fetchFn })
+    const start = Date.now()
+    vi.useFakeTimers({ now: start, toFake: ['Date'] })
+    try {
+      expect((await auth.probe()).message).toMatch(/retrying in 15s/)
+      vi.setSystemTime(start + 16_000)
+      expect((await auth.probe()).message).toMatch(/retrying in 30s/)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('gates kubectl API calls while the token is stale, but never config/oidc-login', async () => {
-    const exec = vi.fn(() => ({ code: -1, stdout: '', stderr: '' }))
     const auth = new AuthManager({
-      runner: fakeRunner(OIDC_CONFIG, exec),
+      runner: fakeRunner(OIDC_CONFIG),
       cacheDir,
+      fetchFn: fakeIssuer().fetchFn,
       expiryTtlMs: 0,
     })
     await auth.init() // login_required
@@ -201,15 +297,16 @@ describe('AuthManager', () => {
 
   it('never starts a login from ensure after a probe fails', async () => {
     let logins = 0
-    const probe = vi.fn(() => ({ code: -1, stdout: '', stderr: '' }))
+    writeCachedToken(-60_000)
     const loginRunner = vi.fn(async () => {
       logins++
       return ok()
     })
     const auth = new AuthManager({
-      runner: fakeRunner(OIDC_CONFIG, probe),
+      runner: fakeRunner(OIDC_CONFIG),
       loginRunner,
       cacheDir,
+      fetchFn: fakeIssuer().fetchFn,
     })
     const [a, b, c] = await Promise.all([auth.ensure(), auth.ensure(), auth.ensure()])
     expect([a.phase, b.phase, c.phase]).toEqual([
@@ -228,9 +325,10 @@ describe('AuthManager', () => {
       return ok()
     })
     const auth = new AuthManager({
-      runner: fakeRunner(OIDC_CONFIG, () => ({ code: -1, stdout: '', stderr: '' })),
+      runner: fakeRunner(OIDC_CONFIG),
       loginRunner,
       cacheDir,
+      fetchFn: fakeIssuer().fetchFn,
     })
     await auth.init()
     const results = await Promise.all([auth.login(), auth.login(), auth.login()])
@@ -248,9 +346,10 @@ describe('AuthManager', () => {
       return { code: 1, stdout: '', stderr: 'callback timed out' }
     })
     const auth = new AuthManager({
-      runner: fakeRunner(OIDC_CONFIG, () => ({ code: -1, stdout: '', stderr: '' })),
+      runner: fakeRunner(OIDC_CONFIG),
       loginRunner,
       cacheDir,
+      fetchFn: fakeIssuer().fetchFn,
     })
     await auth.init()
 
@@ -277,9 +376,10 @@ describe('AuthManager', () => {
       return { code: -1, stdout: '', stderr: '' }
     })
     const auth = new AuthManager({
-      runner: fakeRunner(OIDC_CONFIG, () => ({ code: -1, stdout: '', stderr: '' })),
+      runner: fakeRunner(OIDC_CONFIG),
       loginRunner,
       cacheDir,
+      fetchFn: fakeIssuer().fetchFn,
     })
     await auth.init()
 
@@ -302,30 +402,19 @@ describe('AuthManager', () => {
   })
 
   it('stops kicking probes from the kubectl gate once login is required', async () => {
-    const exec = vi.fn(() => ({ code: -1, stdout: '', stderr: '' }))
+    writeCachedToken(-60_000)
+    const { fetchFn, grants } = fakeIssuer()
     const auth = new AuthManager({
-      runner: fakeRunner(OIDC_CONFIG, exec),
+      runner: fakeRunner(OIDC_CONFIG),
       cacheDir,
+      fetchFn,
       expiryTtlMs: 0,
     })
-    await auth.init() // one probe → login_required
-    expect(exec).toHaveBeenCalledTimes(1)
+    await auth.init() // one rejected grant → login_required
+    expect(grants).toHaveLength(1)
     expect(auth.kubectlAllowed(['get', 'pods'])).toBe(false)
-    await new Promise((r) => setTimeout(r, 10)) // a kicked probe would have spawned by now
-    expect(exec).toHaveBeenCalledTimes(1) // no new kubelogin holding the callback port
-  })
-
-  it('reads a callback-port conflict as login_required, not error', async () => {
-    const exec = vi.fn(() => ({
-      code: 1,
-      stdout: '',
-      stderr:
-        'error: could not start a local server: listen tcp 127.0.0.1:8040: bind: address already in use',
-    }))
-    const auth = new AuthManager({ runner: fakeRunner(OIDC_CONFIG, exec), cacheDir })
-    const s = await auth.probe()
-    expect(s.phase).toBe('login_required')
-    expect(s.message).toContain('another sign-in')
+    await new Promise((r) => setTimeout(r, 10)) // a kicked probe would have fetched by now
+    expect(grants).toHaveLength(1)
   })
 
   it('does not retry a failed explicit login', async () => {
@@ -337,9 +426,10 @@ describe('AuthManager', () => {
     }
     const loginRunner = vi.fn(async () => bindError)
     const auth = new AuthManager({
-      runner: fakeRunner(OIDC_CONFIG, () => ({ code: -1, stdout: '', stderr: '' })),
+      runner: fakeRunner(OIDC_CONFIG),
       loginRunner,
       cacheDir,
+      fetchFn: fakeIssuer().fetchFn,
     })
     await auth.init()
     const s = await auth.login()
@@ -348,20 +438,15 @@ describe('AuthManager', () => {
     expect(loginRunner).toHaveBeenCalledTimes(1)
   })
 
-  it('maintain() force-refreshes a token that is merely near expiry', async () => {
+  it('maintain() refreshes a token that is merely near expiry', async () => {
     writeCachedToken(5 * 60_000) // valid, but < REFRESH_AHEAD_MS left
-    const exec = vi.fn((_cmd: string, args: string[]) => {
-      expect(args).toContain('--force-refresh')
-      writeCachedToken(60 * 60_000)
-      return ok()
-    })
-    const auth = new AuthManager({ runner: fakeRunner(OIDC_CONFIG, exec), cacheDir })
+    const { fetchFn, grants } = fakeIssuer(() => json({ id_token: makeToken(60 * 60_000) }))
+    const auth = new AuthManager({ runner: fakeRunner(OIDC_CONFIG), cacheDir, fetchFn })
     const s = await auth.maintain()
     expect(s.phase).toBe('ok')
-    expect(exec).toHaveBeenCalledTimes(1)
+    expect(grants).toHaveLength(1)
     // fresh-enough tokens are left alone
-    exec.mockClear()
     await auth.maintain()
-    expect(exec).not.toHaveBeenCalled()
+    expect(grants).toHaveLength(1)
   })
 })

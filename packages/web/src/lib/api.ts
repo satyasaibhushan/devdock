@@ -261,6 +261,8 @@ export interface AuthState {
   message?: string
   tokenExpiresAt?: number
   loginUrl?: string
+  /** Pending AWS sign-in; shown even when kubernetes auth is ok. */
+  awsLoginUrl?: string
   checkedAt: number
 }
 
