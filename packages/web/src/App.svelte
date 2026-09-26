@@ -430,18 +430,21 @@
       {#if view?.unavailable}
         <div class="placeholder"><p>{owner ? `${owner.name} is unavailable or ownership could not be verified.` : 'Connect the instance that owns this deployment.'} Existing ownership is preserved.</p></div>
       {:else}
-      <div class="streams">
+      <!-- The terminal is the dev session; without one there is nothing to attach to. -->
+      <div class="streams" class:solo={!view?.hasSession}>
         <div class="block">
           {#key ownerEndpoint + sid + swl + sstatus}
             <LogViewer id={sid} workload={wl} instance={ownerEndpoint} />
           {/key}
         </div>
 
-        <div class="block">
-          {#key ownerEndpoint + sid + swl}
-            <TerminalPanel repo={sid} workload={wl} attach={sterm} instance={ownerEndpoint} machine={owner?.name ?? 'machine'} />
-          {/key}
-        </div>
+        {#if view?.hasSession}
+          <div class="block">
+            {#key ownerEndpoint + sid + swl}
+              <TerminalPanel repo={sid} workload={wl} attach={sterm} instance={ownerEndpoint} machine={owner?.name ?? 'machine'} />
+            {/key}
+          </div>
+        {/if}
       </div>
       {/if}
     {:else}
