@@ -25,9 +25,48 @@ shell or expose the credential socket. Renewal no longer depends on unlocking
 the desktop keyring. Provider expiry and revocation still require sign-in.
 Kubernetes authentication retains its separate kubeconfig and token cache.
 
-The unit uses the devbox's rootless Docker socket and allowlisted VPN proxy.
-Adjust those paths and `DEVDOCK_ROOTS` for another machine. Install the unit in
-`~/.config/systemd/user/devdock.service` and enable it after building the release.
+`devdock.service` is the devbox's unit, with its rootless Docker socket and
+allowlisted VPN proxy. On another machine, run `install.sh` from a checkout
+instead. It builds a release under `~/.local/share/devdock/releases`, points
+`current` at it, writes the unit from the environment, restarts the service and
+rolls back if the daemon does not become healthy:
+
+```sh
+DEVDOCK_ROOTS=~/Code \
+DEVDOCK_HTTPS_PROXY=http://127.0.0.1:18080 \
+DEVDOCK_NO_PROXY=localhost,127.0.0.1,.amazonaws.com \
+packages/daemon/systemd/install.sh
+```
+
+`DEVDOCK_DOCKER_HOST` and `DEVDOCK_PATH_PREFIX` cover a rootless Docker socket
+and extra tools. Run `loginctl enable-linger` once so the service survives
+logout.
+
+## Behind a proxy
+
+Set the proxy only when some endpoints are unreachable directly. Each client
+reads it differently:
+
+- The daemon's own HTTPS (OIDC sign-in and refresh) uses `HTTPS_PROXY` only
+  because the unit runs Node with `--use-env-proxy`. `install.sh` adds the flag
+  when a proxy is set. A sign-in that fails with an HTML page instead of a token
+  usually means a firewall answered; the daemon says so.
+- AWS (STS, ECR, S3) often must stay direct: list `.amazonaws.com` in
+  `NO_PROXY`.
+- kubectl, kubelogin and devspace inherit the daemon's environment, so an EKS
+  API host matches `.amazonaws.com` and goes direct. When the API is reachable
+  only through the proxy, set it on the cluster in the kubeconfig:
+
+  ```yaml
+  clusters:
+    - name: dev
+      cluster:
+        server: https://…eks.amazonaws.com
+        proxy-url: http://127.0.0.1:18080
+  ```
+
+  `proxy-url` overrides the environment for that cluster only; the rest of AWS
+  stays direct.
 
 Inspect without printing credentials:
 

@@ -14,7 +14,29 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
 
-const installScript = join(dirname(fileURLToPath(import.meta.url)), '..', 'launchd', 'install.sh')
+const daemonRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
+const installScript = join(daemonRoot, 'launchd', 'install.sh')
+const systemdScript = join(daemonRoot, 'systemd', 'install.sh')
+
+/** Builds just enough of a portable release for the installers' checks. */
+const FAKE_PNPM = `#!/usr/bin/env bash
+set -euo pipefail
+printf 'pnpm %s\\n' "$*" >> "$DEVDOCK_TEST_LOG"
+if [[ " $* " == *" @devdock/web "* ]]; then
+  mkdir -p "$DEVDOCK_REPO_ROOT/packages/web/dist"
+  printf '<html>devdock</html>\\n' > "$DEVDOCK_REPO_ROOT/packages/web/dist/index.html"
+fi
+if [[ " $* " == *" deploy "* ]]; then
+  target="${'${@: -1}'}"
+  mkdir -p "$target/dist" "$target/node_modules/@devdock/core/dist" "$target/node_modules/@modelcontextprotocol/server"
+  printf 'export {}\\n' > "$target/dist/index.js"
+  printf 'export {}\\n' > "$target/dist/routes.js"
+  printf 'export {}\\n' > "$target/dist/mcp.js"
+  printf 'export {}\\n' > "$target/dist/server.js"
+  printf 'export {}\\n' > "$target/node_modules/@devdock/core/dist/index.js"
+  printf '{}\\n' > "$target/node_modules/@modelcontextprotocol/server/package.json"
+fi
+`
 
 const dirs: string[] = []
 
@@ -40,27 +62,7 @@ describe('launchd installer', () => {
     mkdirSync(join(repo, 'packages', 'web'), { recursive: true })
     mkdirSync(bin, { recursive: true })
 
-    executable(
-      join(bin, 'pnpm'),
-      `#!/usr/bin/env bash
-set -euo pipefail
-printf 'pnpm %s\\n' "$*" >> "$DEVDOCK_TEST_LOG"
-if [[ " $* " == *" @devdock/web "* ]]; then
-  mkdir -p "$DEVDOCK_REPO_ROOT/packages/web/dist"
-  printf '<html>devdock</html>\\n' > "$DEVDOCK_REPO_ROOT/packages/web/dist/index.html"
-fi
-if [[ " $* " == *" deploy "* ]]; then
-  target="${'${@: -1}'}"
-  mkdir -p "$target/dist" "$target/node_modules/@devdock/core/dist" "$target/node_modules/@modelcontextprotocol/server"
-  printf 'export {}\\n' > "$target/dist/index.js"
-  printf 'export {}\\n' > "$target/dist/routes.js"
-  printf 'export {}\\n' > "$target/dist/mcp.js"
-  printf 'export {}\\n' > "$target/dist/server.js"
-  printf 'export {}\\n' > "$target/node_modules/@devdock/core/dist/index.js"
-  printf '{}\\n' > "$target/node_modules/@modelcontextprotocol/server/package.json"
-fi
-`,
-    )
+    executable(join(bin, 'pnpm'), FAKE_PNPM)
     executable(join(bin, 'node'), '#!/usr/bin/env bash\nexit 0\n')
     executable(
       join(bin, 'launchctl'),
@@ -139,5 +141,83 @@ esac
     expect(calls).toContain('pnpm --filter @devdock/daemon deploy --prod --legacy')
     expect(calls).toContain('pnpm --filter @devdock/mcp deploy --prod --legacy')
     expect(calls).toContain('launchctl bootstrap')
+  })
+})
+
+describe('systemd installer', () => {
+  function machine() {
+    const root = mkdtempSync(join(tmpdir(), 'devdock-systemd-'))
+    dirs.push(root)
+    const home = join(root, 'home')
+    const repo = join(root, 'repo')
+    const bin = join(root, 'bin')
+    const log = join(root, 'commands.log')
+    mkdirSync(join(repo, 'packages', 'web'), { recursive: true })
+    mkdirSync(bin, { recursive: true })
+    executable(join(bin, 'pnpm'), FAKE_PNPM)
+    executable(join(bin, 'node'), '#!/usr/bin/env bash\nexit 0\n')
+    executable(
+      join(bin, 'systemctl'),
+      `#!/usr/bin/env bash\nprintf 'systemctl %s\\n' "$*" >> "$DEVDOCK_TEST_LOG"\nexit 0\n`,
+    )
+    executable(join(bin, 'curl'), '#!/usr/bin/env bash\n[[ -z "$DEVDOCK_TEST_BROKEN" ]]\n')
+    // The health wait polls; skip its pauses.
+    executable(join(bin, 'sleep'), '#!/usr/bin/env bash\nexit 0\n')
+    const installRoot = join(home, '.local', 'share', 'devdock')
+    const unit = join(home, '.config', 'systemd', 'user', 'devdock.service')
+    const install = (env: Record<string, string> = {}) =>
+      execFileSync('/bin/bash', [systemdScript], {
+        env: {
+          ...process.env,
+          HOME: home,
+          PATH: `${bin}:${process.env.PATH ?? ''}`,
+          XDG_RUNTIME_DIR: join(root, 'run'),
+          HTTPS_PROXY: '',
+          DOCKER_HOST: '',
+          DEVDOCK_REPO_ROOT: repo,
+          DEVDOCK_INSTALL_ROOT: installRoot,
+          DEVDOCK_TEST_LOG: log,
+          DEVDOCK_TEST_BROKEN: '',
+          ...env,
+        },
+        stdio: 'pipe',
+      })
+    return { installRoot, unit, log, install }
+  }
+
+  it('installs a release behind current with the machine proxy in the unit', () => {
+    const m = machine()
+    m.install({ DEVDOCK_HTTPS_PROXY: 'http://127.0.0.1:18080', DEVDOCK_NO_PROXY: '.amazonaws.com' })
+    const release = readlinkSync(join(m.installRoot, 'current'))
+    expect(release).toContain('/releases/')
+    expect(existsSync(join(release, 'packages', 'daemon', 'dist', 'index.js'))).toBe(true)
+    const unit = readFileSync(m.unit, 'utf8')
+    expect(unit).toContain(
+      `ExecStart=${m.installRoot}/node --use-env-proxy ${m.installRoot}/current/`,
+    )
+    expect(unit).toContain('Environment=HTTPS_PROXY=http://127.0.0.1:18080')
+    expect(unit).toContain('Environment=NO_PROXY=.amazonaws.com')
+    expect(unit).toContain('Environment=DEVDOCK_SOCKET=%t/devdock/control.sock')
+    expect(readFileSync(m.log, 'utf8')).toContain('systemctl --user restart devdock')
+  })
+
+  it('leaves the proxy out of a machine that has none', () => {
+    const m = machine()
+    m.install()
+    const unit = readFileSync(m.unit, 'utf8')
+    expect(unit).not.toContain('HTTPS_PROXY')
+    expect(unit).not.toContain('--use-env-proxy')
+  })
+
+  it('puts the previous release and unit back when the new daemon is unhealthy', () => {
+    const m = machine()
+    m.install()
+    const previous = readlinkSync(join(m.installRoot, 'current'))
+    const previousUnit = readFileSync(m.unit, 'utf8')
+    expect(() =>
+      m.install({ DEVDOCK_HTTPS_PROXY: 'http://proxy:1', DEVDOCK_TEST_BROKEN: '1' }),
+    ).toThrow()
+    expect(readlinkSync(join(m.installRoot, 'current'))).toBe(previous)
+    expect(readFileSync(m.unit, 'utf8')).toBe(previousUnit)
   })
 })
