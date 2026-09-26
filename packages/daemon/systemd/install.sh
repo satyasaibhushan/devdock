@@ -132,7 +132,7 @@ fi
 healthy() {
   for ((attempt = 0; attempt < 50; attempt++)); do
     if "$SYSTEMCTL_BIN" --user is-active --quiet devdock \
-      && "$CURL_BIN" -fsS --max-time 1 --unix-socket "$SOCKET" http://localhost/health >/dev/null; then
+      && "$CURL_BIN" -fs --max-time 1 --unix-socket "$SOCKET" http://localhost/health >/dev/null; then
       return 0
     fi
     sleep 0.2
