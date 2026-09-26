@@ -26,21 +26,79 @@ the desktop keyring. Provider expiry and revocation still require sign-in.
 Kubernetes authentication retains its separate kubeconfig and token cache.
 
 `devdock.service` is the devbox's unit, with its rootless Docker socket and
-allowlisted VPN proxy. On another machine, run `install.sh` from a checkout
-instead. It builds a release under `~/.local/share/devdock/releases`, points
-`current` at it, writes the unit from the environment, restarts the service and
-rolls back if the daemon does not become healthy:
+allowlisted VPN proxy. On any other Linux machine, install from a checkout with
+`install.sh` instead.
+
+## Install on Linux
+
+Prerequisites: Node (with `--use-env-proxy` when a proxy is set; the installer
+checks), pnpm, git, curl, a systemd user session, and the tools DevDock drives
+(`kubectl`, `devspace`, `aws`, `kubelogin`, Docker). Run once so the service
+survives logout:
 
 ```sh
+loginctl enable-linger
+```
+
+Get the source onto the machine. From a Mac checkout, sync it without build
+output, which the installer regenerates:
+
+```sh
+rsync -az --exclude node_modules --exclude dist --exclude .turbo \
+  --exclude '*.tsbuildinfo' ~/Code/Personal/devdock/ HOST:Code/Personal/devdock/
+```
+
+Then install from the checkout on that machine:
+
+```sh
+cd ~/Code/Personal/devdock
 DEVDOCK_ROOTS=~/Code \
 DEVDOCK_HTTPS_PROXY=http://127.0.0.1:18080 \
 DEVDOCK_NO_PROXY=localhost,127.0.0.1,.amazonaws.com \
 packages/daemon/systemd/install.sh
 ```
 
-`DEVDOCK_DOCKER_HOST` and `DEVDOCK_PATH_PREFIX` cover a rootless Docker socket
-and extra tools. Run `loginctl enable-linger` once so the service survives
-logout.
+Omit the proxy variables when the machine reaches everything directly. Rerun the
+same command after every sync or pull; each run builds a new release.
+
+The installer:
+
+1. Runs `pnpm install --frozen-lockfile`, builds core, daemon, MCP and web, and
+   deploys production dependencies into a staging release. It then restores
+   the checkout's dev dependencies, because pnpm 12's `deploy --prod` leaves it
+   production-only.
+2. Imports the staged modules with the target Node, then moves the release to
+   `~/.local/share/devdock/releases/<time>-<commit>-<pid>`.
+3. Writes `~/.config/systemd/user/devdock.service` from the environment, points
+   `~/.local/share/devdock/current` at the release, and restarts the service.
+4. Waits up to 10 seconds for `/health` on the socket. If the daemon does not
+   come up, it restores the previous release and unit, or removes the unit on a
+   first install, and exits non-zero.
+5. Links `~/.local/bin/devdock-mcp` to the release's stdio MCP wrapper, which
+   defaults `DEVDOCK_SOCKET` to the daemon socket.
+
+Old releases are kept; delete them by hand when no longer needed.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `DEVDOCK_ROOTS` | `~/Code` | Checkout roots scanned for `.devspace` workloads |
+| `DEVDOCK_HTTPS_PROXY` | `$HTTPS_PROXY` | Proxy for the daemon's HTTPS; set empty to disable |
+| `DEVDOCK_NO_PROXY` | `$NO_PROXY`, else `localhost,127.0.0.1` | Hosts reached directly, written only with a proxy |
+| `DEVDOCK_DOCKER_HOST` | `$DOCKER_HOST` | Docker socket, e.g. rootless |
+| `DEVDOCK_PATH_PREFIX` | none | Extra `PATH` entries ahead of the defaults |
+| `DEVDOCK_NODE_BIN`, `DEVDOCK_PNPM_BIN` | `node`, `pnpm` on `PATH` | Toolchain used to build and run |
+| `DEVDOCK_INSTALL_ROOT` | `~/.local/share/devdock` | Releases, `current` and the `node` links |
+| `DEVDOCK_UNIT_DEST` | `~/.config/systemd/user/devdock.service` | Unit path |
+| `DEVDOCK_MCP_LINK` | `~/.local/bin/devdock-mcp` | MCP wrapper link |
+
+The unit's `PATH` is `~/.local/bin`, the install's `bin`, then the system
+directories. Put `kubectl`, `devspace`, `aws` and `kubelogin` in one of those
+or add their directory with `DEVDOCK_PATH_PREFIX`.
+
+After installing, link the machine from the Mac's instance selector (or
+`devdock_instance_link`) through its SSH alias and sign in from the UI. The
+link forwards the sign-in callback ports (8010, 8040) while a login is pending. Moving a deployment onto
+it is covered in [linked instances](../../../docs/instances.md).
 
 ## Behind a proxy
 
@@ -78,6 +136,7 @@ journalctl --user -u devdock -f
 
 Deployment output is available through DevDock's workload log stream, separate
 from the daemon journal. The macOS daemon and clients remain unchanged.
+
 # Linked instances and MCP
 
 The instance selector links another daemon through an existing SSH alias. See

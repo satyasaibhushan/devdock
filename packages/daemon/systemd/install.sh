@@ -46,6 +46,10 @@ trap cleanup EXIT
 # dependencies into the staging tree, then import it before the handover.
 (
   cd "$REPO_ROOT"
+  # pnpm 12's `deploy --prod` records the checkout as production-only, and the
+  # next `pnpm exec` prunes the dev tools the build needs. Install first, and
+  # restore the dev dependencies after deploying so the checkout stays usable.
+  "$PNPM_BIN" install --frozen-lockfile
   "$PNPM_BIN" --filter @devdock/core exec tsc -b tsconfig.json --force
   "$PNPM_BIN" --filter @devdock/daemon exec tsc -b tsconfig.json --force
   "$PNPM_BIN" --filter @devdock/mcp exec tsc -b tsconfig.json --force
@@ -56,6 +60,7 @@ trap cleanup EXIT
   "$PNPM_BIN" --filter @devdock/mcp deploy --prod --legacy "$STAGING/packages/mcp"
   mkdir -p "$STAGING/packages/web"
   cp -R "$REPO_ROOT/packages/web/dist" "$STAGING/packages/web/dist"
+  "$PNPM_BIN" install --frozen-lockfile --offline
 )
 
 STAGED_CORE="$STAGING/packages/daemon/node_modules/@devdock/core/dist/index.js"
