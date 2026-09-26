@@ -1792,3 +1792,118 @@ describe('Service.wait', () => {
     await expect(svc.wait('svc-a', {})).rejects.toThrow('at least one condition')
   })
 })
+
+describe('moving a deployment between instances', () => {
+  const MAC = 'aaaaaaaa-1111-4111-8111-111111111111'
+  const WSPACE = 'bbbbbbbb-2222-4222-8222-222222222222'
+  const ok = { code: 0, stdout: '', stderr: '' }
+
+  /** One namespace's owner ConfigMaps plus a single svc-a tmux session. */
+  function cluster(session = true) {
+    const claims = new Map<string, string>()
+    const state = { session }
+    const calls: string[][] = []
+    const runner = vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
+      calls.push([cmd, ...args])
+      if (cmd === 'tmux' && args[0] === 'list-panes')
+        return { ...ok, stdout: state.session ? 'devdock-svc-a 0 1\n' : '' }
+      if (cmd === 'tmux' && args[0] === 'kill-session') {
+        state.session = false
+        return ok
+      }
+      if (cmd !== 'kubectl') return ok
+      if (args[0] === 'get' && args[1] === 'configmaps')
+        return {
+          ...ok,
+          stdout: [...claims].map(([name, id]) => `${name}\tsvc-a\t${id}\n`).join(''),
+        }
+      const name = args[2] ?? ''
+      if (args[1] === 'configmap' && name.startsWith('devdock-owner-')) {
+        if (args[0] === 'get') {
+          const id = claims.get(name)
+          return {
+            ...ok,
+            stdout: id ? JSON.stringify({ data: { instance: id, deployment: 'svc-a' } }) : '',
+          }
+        }
+        if (args[0] === 'create') {
+          if (claims.has(name)) return { code: 1, stdout: '', stderr: 'AlreadyExists' }
+          claims.set(
+            name,
+            args.find((a) => a.startsWith('--from-literal=instance='))?.split('=')[2] ?? '',
+          )
+          return ok
+        }
+        if (args[0] === 'delete') {
+          claims.delete(name)
+          return ok
+        }
+      }
+      if (args[0] === 'get') return { ...ok, stdout: '{"items":[]}' }
+      return ok
+    })
+    const make = (instanceId: string) => {
+      const svc = new Service({ roots: [root], stateFile, instanceId }, { runner })
+      svc.rescan()
+      return svc
+    }
+    return {
+      claims,
+      calls,
+      state,
+      make,
+      owner: () => [...claims.values()][0],
+    }
+  }
+
+  it('releases from the owner: stops its dev session and drops the claim', async () => {
+    const c = cluster()
+    const mac = c.make(MAC)
+    await mac.build('svc-a')
+    expect(c.owner()).toBe(MAC)
+    const result = await mac.release('svc-a')
+    expect(result.code).toBe(0)
+    expect(c.state.session).toBe(false)
+    expect(c.owner()).toBeUndefined()
+    expect(
+      await c
+        .make(WSPACE)
+        .build('svc-a')
+        .then(() => c.owner()),
+    ).toBe(WSPACE)
+  })
+
+  it('never releases or takes over a claim held by someone else', async () => {
+    const c = cluster()
+    await c.make(WSPACE).build('svc-a')
+    await expect(c.make(MAC).release('svc-a')).rejects.toThrow(`owned by instance ${WSPACE}`)
+    await expect(
+      c.make('cccccccc-3333-4333-8333-333333333333').takeOver('svc-a', undefined, MAC),
+    ).rejects.toThrow(`owned by instance ${WSPACE}`)
+    expect(c.owner()).toBe(WSPACE)
+  })
+
+  it('takes over from an unreachable owner, and that owner stops its session on return', async () => {
+    const c = cluster()
+    const mac = c.make(MAC)
+    await mac.build('svc-a')
+    const wspace = c.make(WSPACE)
+    expect((await wspace.takeOver('svc-a', undefined, MAC)).code).toBe(0)
+    expect(c.owner()).toBe(WSPACE)
+    // The mac wakes up with its tmux session still alive.
+    c.calls.length = 0
+    const state = await c.make(MAC).reconcileOne('svc-a')
+    expect(c.state.session).toBe(false)
+    expect(state.workloads[0]?.hasSession).toBe(false)
+    expect(c.calls.some((call) => call.includes('devspace-dependencies'))).toBe(false)
+  })
+
+  it('releases ownership once a purge succeeds, so any instance can deploy next', async () => {
+    const c = cluster(false)
+    const mac = c.make(MAC)
+    await mac.build('svc-a')
+    expect(c.owner()).toBe(MAC)
+    expect((await mac.stop('svc-a')).code).toBe(0)
+    expect(c.owner()).toBeUndefined()
+  })
+})

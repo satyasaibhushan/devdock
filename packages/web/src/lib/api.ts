@@ -196,6 +196,43 @@ export async function stopSession(
     throw new Error(result.error ?? result.stderr ?? 'Could not stop session')
 }
 
+async function ownershipRequest(path: string, instance: string, body?: unknown): Promise<void> {
+  const response = await fetch(
+    path,
+    body === undefined
+      ? { method: 'POST' }
+      : {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body),
+        },
+    instance,
+  )
+  const result = (await response.json()) as { ok?: boolean; error?: string; stderr?: string }
+  if (!response.ok || !result.ok)
+    throw new Error(result.error ?? result.stderr ?? 'Could not move the deployment')
+}
+
+/** Ask the owner to stop its dev session and drop its claim. */
+export const releaseOwnership = (id: string, workload: string | undefined, instance: string) =>
+  ownershipRequest(
+    `/repos/${encodeURIComponent(id)}/release${workload ? `?workload=${encodeURIComponent(workload)}` : ''}`,
+    instance,
+  )
+
+/** Claim a deployment on `instance` whose owner `from` cannot be reached. */
+export const takeOverOwnership = (
+  id: string,
+  workload: string | undefined,
+  from: string,
+  instance: string,
+) =>
+  ownershipRequest(
+    `/repos/${encodeURIComponent(id)}/take-over${workload ? `?workload=${encodeURIComponent(workload)}` : ''}`,
+    instance,
+    { from },
+  )
+
 export async function linkInstance(
   host: string,
   endpoint: string,

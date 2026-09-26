@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { LifecycleAction, Service, WorkflowAction } from '@devdock/core'
 import fastifyStatic from '@fastify/static'
-import Fastify, { type FastifyInstance } from 'fastify'
+import Fastify, { type FastifyInstance, type FastifyReply } from 'fastify'
 import type { AccessGate } from './accessGate.js'
 import { type Instances, peerPathAllowed } from './instances.js'
 
@@ -567,6 +567,45 @@ export function buildApp(
         return reply
           .code(409)
           .send({ error: error instanceof Error ? error.message : String(error) })
+      }
+    },
+  )
+
+  // Moving a deployment between instances: the owner releases (stopping its
+  // dev session, keeping the deployment), or a new owner takes over from an
+  // unreachable one. The UI then starts it on the new owner.
+  const ownershipError = (reply: FastifyReply, error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error)
+    return reply
+      .code(
+        message.includes('unknown repo') ? 404 : message.includes('owned by instance') ? 409 : 500,
+      )
+      .send({ error: message })
+  }
+  app.post<{ Params: { id: string }; Querystring: { workload?: string } }>(
+    '/repos/:id/release',
+    async (req, reply) => {
+      try {
+        const result = await service.release(req.params.id, req.query.workload)
+        const body = { ok: result.code === 0, stderr: result.stderr }
+        return result.code === 0 ? body : reply.code(409).send(body)
+      } catch (error) {
+        return ownershipError(reply, error)
+      }
+    },
+  )
+  app.post<{ Params: { id: string }; Querystring: { workload?: string }; Body: { from?: string } }>(
+    '/repos/:id/take-over',
+    async (req, reply) => {
+      const from = req.body?.from
+      if (typeof from !== 'string' || !/^[0-9a-f-]{36}$/i.test(from))
+        return reply.code(400).send({ error: 'previous owner instance id required' })
+      try {
+        const result = await service.takeOver(req.params.id, req.query.workload, from)
+        const body = { ok: result.code === 0, stderr: result.stderr }
+        return result.code === 0 ? body : reply.code(409).send(body)
+      } catch (error) {
+        return ownershipError(reply, error)
       }
     },
   )

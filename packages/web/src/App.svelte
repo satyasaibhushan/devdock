@@ -23,8 +23,10 @@
     fetchNamespace,
     fetchInstances,
     openEvents,
+    releaseOwnership,
     switchNamespace,
     stopSession,
+    takeOverOwnership,
   } from './lib/api'
 
   let instances = $state<InstanceView[]>([])
@@ -87,6 +89,45 @@
       toast = error instanceof Error ? error.message : String(error)
       setTimeout(() => toast = null, 5000)
     } finally { stoppingSession = false }
+  }
+
+  // Moving the selected workload's deployment to another machine.
+  let moveTarget = $state<InstanceView | null>(null)
+  let moveBusy = $state(false)
+  // Machines with this checkout; new work and moves can only target those.
+  const machines = $derived(instances.filter((i) => i.repos.some((r) => r.repo.id === sid)))
+  function pickMachine(select: HTMLSelectElement) {
+    const id = select.value
+    const from = view?.ownerInstanceId
+    if (!from) return chooseInstance(id)
+    // Stay on the owner until the move is confirmed.
+    select.value = from
+    if (id !== from) moveTarget = instances.find((i) => i.id === id) ?? null
+  }
+  async function doMove() {
+    const to = moveTarget
+    const from = view?.ownerInstanceId
+    if (!to || !from || moveBusy) return
+    moveBusy = true
+    const id = sid
+    const workload = wl
+    const live = view?.hasSession === true
+    try {
+      if (owner?.online) {
+        await releaseOwnership(id, workload, instanceEndpoint(owner))
+        // A live dev session moves with the deployment; otherwise the next verb claims it.
+        if (live) await beginOperation(id, 'start', workload, instanceEndpoint(to))
+      } else {
+        await takeOverOwnership(id, workload, from, instanceEndpoint(to))
+      }
+      chooseInstance(to.id)
+      moveTarget = null
+    } catch (error) {
+      toast = `move failed: ${error instanceof Error ? error.message : String(error)}`
+      setTimeout(() => (toast = null), 5000)
+    } finally {
+      moveBusy = false
+    }
   }
 
   let refreshing = false
@@ -351,15 +392,19 @@
         <div class="title">
           <span class="dot {vstatus}"></span>
           <h2>{selected.repo.id}</h2>
-          {#if view?.ownerInstanceId}
-            <span class="pill" title={`Deployment owner: ${owner?.name ?? 'Owner not connected'}`} aria-label={`Deployment owner: ${owner?.name ?? 'Owner not connected'}`}>{instanceSymbol(owner)}</span>
-          {:else}
-            <label class="instance-target">
-              <select class="wlselect" title={`Run on ${owner?.name ?? 'selected instance'}`} value={owner?.id ?? preferred} onchange={(e) => chooseInstance(e.currentTarget.value)} aria-label="Instance for new work" disabled={busy !== null}>
-                {#each instances.filter((i) => i.repos.some((r) => r.repo.id === sid)) as item (item.id)}<option value={item.id} disabled={!item.online}>{item.name}{item.online ? '' : ' (offline)'}</option>{/each}
-              </select>
-            </label>
-          {/if}
+          <label class="instance-target">
+            <select
+              class="wlselect"
+              title={view?.ownerInstanceId ? `Deployed from ${owner?.name ?? 'an unlinked instance'}. Pick another machine to move it.` : 'Machine for new work'}
+              value={view?.ownerInstanceId ?? owner?.id ?? preferred}
+              onchange={(e) => pickMachine(e.currentTarget)}
+              aria-label="Machine"
+              disabled={busy !== null || moveBusy || activeOperation !== null}
+            >
+              {#each machines as item (item.id)}<option value={item.id} disabled={!item.online}>{instanceSymbol(item)} {item.name}{item.online ? '' : ' (offline)'}</option>{/each}
+              {#if view?.ownerInstanceId && !owner}<option value={view.ownerInstanceId} disabled>? unlinked owner</option>{/if}
+            </select>
+          </label>
           {#if family.length > 1}
             <select
               class="wlselect"
@@ -507,6 +552,19 @@
     busy={adoptBusy}
     onconfirm={doAdopt}
     oncancel={() => (confirmAdopt = false)}
+  />
+{/if}
+
+{#if moveTarget && selected}
+  <ConfirmModal
+    title="Move {selected.repo.id}{wl ? ` (${wl})` : ''} to {moveTarget.name}?"
+    message={owner?.online
+      ? `${owner.name} stops its dev session and gives up the deployment. The pods keep running.${view?.hasSession ? ` Dev then starts on ${moveTarget.name}, syncing its checkout into the pod.` : ` Deploy or start it from ${moveTarget.name} next.`}`
+      : `${owner?.name ?? 'The owner'} is unreachable, so ${moveTarget.name} takes the deployment over. If ${owner?.name ?? 'the owner'} comes back with a dev session still running, DevDock there stops it.`}
+    confirmLabel="Move to {moveTarget.name}"
+    busy={moveBusy}
+    onconfirm={doMove}
+    oncancel={() => (moveTarget = null)}
   />
 {/if}
 

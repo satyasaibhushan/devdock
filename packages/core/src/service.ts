@@ -197,6 +197,7 @@ export class Service {
   readonly events = new EventEmitter()
   private readonly opts: Required<Omit<ServiceOptions, 'instanceId'>>
   private readonly ownership?: DeploymentOwnership
+  private readonly instanceId?: string
   private readonly replicaInstanceSuffix: string
   private readonly supervisor: Supervisor
   private readonly reconciler: Reconciler
@@ -297,6 +298,7 @@ export class Service {
       ? (c, a, o) => baseRunner(c, a, o)
       : (c, a, o, onLine) => runStream(c, a, o, onLine)
     this.kubectl = gatedRunner
+    this.instanceId = opts.instanceId
     if (opts.instanceId) this.ownership = new DeploymentOwnership(opts.instanceId, gatedRunner)
     this.supervisor = deps.supervisor ?? new Supervisor(gatedRunner, streamRunner)
     this.reconciler = deps.reconciler ?? new Reconciler(gatedRunner)
@@ -810,7 +812,15 @@ export class Service {
     const r = await this.narrate(key, verbLabel(repo, 'purge'), (onLine) =>
       this.supervisor.kill(repo, onLine),
     )
-    if (r.code === 0) await this.uninstallLeftoverRelease(repo, key)
+    if (r.code === 0) {
+      await this.uninstallLeftoverRelease(repo, key)
+      // Nothing of this workload runs any more, so any instance may deploy it next.
+      await this.releaseOwnership(repo).catch((error: unknown) =>
+        this.hubFor(key).push(
+          `! ownership kept: ${error instanceof Error ? error.message : String(error)}`,
+        ),
+      )
+    }
     this.piped.delete(key)
     this.store.setSessionNamespace(key, undefined) // session gone → pin released
     this.store.setPendingStartup(key, undefined) // canceled start must not fire later
@@ -942,6 +952,61 @@ export class Service {
     const r = await fn((line) => hub.push(line))
     hub.push(r.code === 0 ? `✓ ${label}` : `✗ ${label} exited ${r.code}`)
     return r
+  }
+
+  /** Hand the deployment to another instance. The dev session here stops, the
+   *  deployment keeps running, and the claim is dropped so the target can claim it. */
+  async release(id: string, workload?: string): Promise<RunResult> {
+    const { repo, key, type } = this.scoped(id, workload)
+    if (!this.ownership)
+      return { code: 2, stdout: '', stderr: 'This instance does not track ownership' }
+    if (this.operations.active(id, type ?? ''))
+      return { code: 2, stdout: '', stderr: 'A workflow operation is active' }
+    const denied = await this.ensureAuth(key)
+    if (denied) return denied
+    await this.claimOwnership(repo)
+    if ((await this.supervisor.sessionStates()).has(repo.session)) {
+      const stopped = await this.stopSession(id, workload)
+      if (stopped.code !== 0) return stopped
+    }
+    await this.releaseOwnership(repo)
+    this.store.setSessionNamespace(key, undefined)
+    this.hubFor(key).push('✓ ownership released; another instance can take this deployment')
+    await this.reconcileOne(id)
+    return { code: 0, stdout: '', stderr: '' }
+  }
+
+  /** Claim a deployment whose owner is unreachable. When that owner returns,
+   *  its reconcile sees the new claim and stops its own dev session. */
+  async takeOver(id: string, workload: string | undefined, from: string): Promise<RunResult> {
+    const { repo, key } = this.scoped(id, workload)
+    if (!this.ownership)
+      return { code: 2, stdout: '', stderr: 'This instance does not track ownership' }
+    const denied = await this.ensureAuth(key)
+    if (denied) return denied
+    const namespace = repo.namespace || (await this.contextNamespace()) || 'default'
+    await this.ownership.takeOver({ ...repo, namespace }, from)
+    this.hubFor(key).push(`✓ ownership taken over from instance ${from}`)
+    await this.reconcileOne(id)
+    return { code: 0, stdout: '', stderr: '' }
+  }
+
+  private async releaseOwnership(repo: Repo): Promise<void> {
+    if (!this.ownership) return
+    await this.ownership.release({
+      ...repo,
+      namespace: repo.namespace || (await this.contextNamespace()) || 'default',
+    })
+  }
+
+  /** The instance holding this workload's claim when it is not us, else undefined.
+   *  Unreadable ownership is not proof of a move, so it reads as ours. */
+  private async claimedElsewhere(repo: Repo): Promise<string | undefined> {
+    if (!this.ownership || !this.instanceId) return undefined
+    const namespace = repo.namespace || (await this.contextNamespace()) || 'default'
+    const owners = await this.ownership.owners(namespace).catch(() => undefined)
+    const holder = owners?.[repo.name]
+    return holder && holder !== this.instanceId ? holder : undefined
   }
 
   private async claimOwnership(repo: Repo): Promise<void> {
@@ -1544,6 +1609,24 @@ export class Service {
       let exists = !!session
       let sessionDead = session?.dead === true
       let hasSession = exists && !sessionDead
+      const transitioning = this.transitions.has(key)
+      const holder = exists && !transitioning ? await this.claimedElsewhere(scoped) : undefined
+      if (holder) {
+        // Moved while this instance slept or was unreachable. Leave the session
+        // lock alone: it now belongs to the new owner's session.
+        this.pausedSessions.add(key)
+        this.reconnects.delete(key)
+        this.store.setPendingStartup(key, undefined)
+        this.store.setSessionNamespace(key, undefined)
+        await this.supervisor.abandonSession(scoped)
+        this.piped.delete(key)
+        this.hubFor(key).push(
+          `! deployment now owned by instance ${holder}; dev session stopped here`,
+        )
+        exists = false
+        sessionDead = false
+        hasSession = false
+      }
       const ws = await this.reconciler.reconcileWorkload(
         scoped,
         hasSession,

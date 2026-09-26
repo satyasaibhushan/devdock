@@ -224,6 +224,14 @@ export class Supervisor {
     await this.releaseSessionLock(repo)
   }
 
+  /** Kill the tmux session but keep the DevSpace lock, which another
+   *  instance's session holds after an ownership move. */
+  async abandonSession(repo: Repo): Promise<void> {
+    await this.runner('tmux', ['kill-session', '-t', exactTarget(repo.session)]).catch(
+      () => undefined,
+    )
+  }
+
   async stopSession(repo: Repo): Promise<RunResult> {
     const result = await this.runner('tmux', ['kill-session', '-t', exactTarget(repo.session)])
     if (result.code !== 0) return result

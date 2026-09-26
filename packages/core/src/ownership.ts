@@ -35,8 +35,7 @@ export class DeploymentOwnership {
       for (const line of result.stdout.split('\n')) {
         const [name, deployment, instance] = line.split('\t')
         if (!deployment || !instance || !/^[0-9a-f-]{36}$/i.test(instance)) continue
-        const expected = `devdock-owner-${createHash('sha256').update(deployment).digest('hex').slice(0, 32)}`
-        if (name === expected) owners[deployment] = instance
+        if (name === claimName(deployment)) owners[deployment] = instance
       }
       return owners
     })
@@ -51,18 +50,9 @@ export class DeploymentOwnership {
 
   async claim(repo: Repo): Promise<void> {
     if (!repo.namespace) throw new Error('Deployment ownership requires an explicit namespace')
-    const name = `devdock-owner-${createHash('sha256').update(repo.name).digest('hex').slice(0, 32)}`
-    const args = [
-      'get',
-      'configmap',
-      name,
-      '-n',
-      repo.namespace,
-      '--ignore-not-found',
-      '-o',
-      'json',
-    ]
-    const read = () => this.runner('kubectl', args, { timeoutMs: 15_000 })
+    const name = claimName(repo.name)
+    const namespace = repo.namespace
+    const read = () => this.read(repo.name, namespace)
     let result = await read()
     if (result.code !== 0)
       throw new Error(
@@ -82,7 +72,10 @@ export class DeploymentOwnership {
         ],
         { timeoutMs: 15_000 },
       )
-      if (created.code === 0) return
+      if (created.code === 0) {
+        this.snapshots.delete(repo.namespace)
+        return
+      }
       // A competing daemon may have won. Read authoritative ownership, never retry a write.
       result = await read()
     }
@@ -97,4 +90,62 @@ export class DeploymentOwnership {
       )
     }
   }
+
+  /** Give up this instance's claim so another instance can claim the deployment. */
+  async release(repo: Repo): Promise<void> {
+    await this.remove(repo, this.instanceId)
+  }
+
+  /** Move a claim held by `from` (an unreachable owner) to this instance. */
+  async takeOver(repo: Repo, from: string): Promise<void> {
+    await this.remove(repo, from)
+    await this.claim(repo)
+  }
+
+  /** Delete the claim only while `holder` still holds it; never someone else's. */
+  private async remove(repo: Repo, holder: string): Promise<void> {
+    if (!repo.namespace) throw new Error('Deployment ownership requires an explicit namespace')
+    const result = await this.read(repo.name, repo.namespace)
+    if (result.code !== 0)
+      throw new Error(
+        'Cannot verify deployment ownership. Check Kubernetes access and ConfigMap permissions.',
+      )
+    if (!result.stdout.trim()) return
+    const record = JSON.parse(result.stdout) as {
+      data?: { instance?: string; deployment?: string }
+    }
+    if (record.data?.deployment !== repo.name || record.data.instance !== holder)
+      throw new Error(
+        `Deployment ${repo.name} is owned by instance ${record.data?.instance ?? 'unknown'}, not ${holder}.`,
+      )
+    const deleted = await this.runner(
+      'kubectl',
+      ['delete', 'configmap', claimName(repo.name), '-n', repo.namespace, '--ignore-not-found'],
+      { timeoutMs: 15_000 },
+    )
+    if (deleted.code !== 0)
+      throw new Error('Cannot release deployment ownership. Check ConfigMap delete permissions.')
+    this.snapshots.delete(repo.namespace)
+  }
+
+  private read(deployment: string, namespace: string): Promise<RunResult> {
+    return this.runner(
+      'kubectl',
+      [
+        'get',
+        'configmap',
+        claimName(deployment),
+        '-n',
+        namespace,
+        '--ignore-not-found',
+        '-o',
+        'json',
+      ],
+      { timeoutMs: 15_000 },
+    )
+  }
+}
+
+function claimName(deployment: string): string {
+  return `devdock-owner-${createHash('sha256').update(deployment).digest('hex').slice(0, 32)}`
 }

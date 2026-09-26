@@ -14,17 +14,22 @@ its work is not silently moved elsewhere.
 The header shows connected instances, with a symbol shared by their repo rows.
 The sidebar is one global repository list, not a separate list per machine.
 Deployment actions, logs and terminals follow each workload's ownership claim.
-An offline owner stays visible and blocks actions; selecting another instance
-does not transfer ownership. Claims are read without acquiring them for display.
+An offline owner stays visible and blocks actions until it is moved. Claims are
+read without acquiring them for display.
 
 The header lists connected machines without selecting a global workspace.
-Unclaimed work has a `Run on` picker beside its actions. Host terminals have
+Each workload has a machine picker beside its name, listing machines with that
+checkout. For unclaimed work it picks where new work runs; for claimed work,
+picking another machine asks to move the deployment there (see below). Host terminals have
 their own machine picker; replicas choose their target in the creation dialog.
 Authentication and namespace controls identify the current action target or
 deployment owner. The instance menu shows connection and auth status only.
 Replica creation offers an explicit target selector. Branches and
 worktrees come from that target's checkout. No repositories or `.env` files are
 copied by linking. New replica IDs include an instance suffix to avoid collisions.
+
+The terminal panel appears only while a dev session runs; otherwise the logs
+take the whole pane.
 
 `Stop session` is available while a managed dev session exists, including while
 waiting for a pod in BUILDING. It stops that instance's tmux dev session and
@@ -53,6 +58,11 @@ OS account and bridge. MCP's ro/rw tool selection is not an OS security boundary
 
 Interactive sign-in still happens on the machine owning the auth flow. The
 directory reports it; linking does not transfer browser cookies or defeat expiry.
+The browser usually runs on the initiating machine, so while a linked machine
+waits on a sign-in, the initiating daemon forwards that sign-in's localhost
+callback port (kubelogin 8040, AWS 8010) over SSH. The forward exists only while
+the sign-in is pending, so the initiating machine's own sign-ins keep the ports
+otherwise. A busy local port is retried every 10 seconds.
 
 ## Deployment ownership
 
@@ -62,14 +72,25 @@ instance UUID and scoped deployment name. Kubernetes itself serializes creation;
 two machines racing to claim the same deployment cannot both win. A failed
 ownership read blocks the action. Existing managed sessions are claimed at boot.
 
-Claims do not expire, including after disconnect, restart, purge or unlink.
-Operate through the owner instance. Moving ownership is deliberately not automatic.
-An operator must stop the old controller and explicitly remove its claim before
-another instance can claim it. Do not remove claims while an old controller can
-still run. This guard covers DevDock, not arbitrary `devspace` commands in a shell.
-Both machines must run a guarded release before relying on the guarantee.
+Claims do not expire on disconnect, restart or unlink. A successful purge
+releases the claim, since nothing of that workload runs any more.
 
-The Kubernetes identity needs `get` and `create` on ConfigMaps in its namespace.
+Moving is explicit, from the workload's machine picker:
+
+- Owner online: the owner stops its dev session (pods keep running) and deletes
+  its claim (`POST /repos/:id/release`). If a dev session was live, the UI starts
+  dev on the target, which claims it. Otherwise the target's next verb claims it.
+- Owner unreachable: the target deletes the claim only while it still names that
+  owner, then claims it (`POST /repos/:id/take-over`). When the old owner returns,
+  its reconcile sees the claim names someone else, kills its tmux session and
+  pauses reconnects. It leaves the DevSpace session lock alone, since the new
+  owner's session holds it.
+
+Neither path deletes a claim held by any other instance. This guard covers
+DevDock, not arbitrary `devspace` commands in a shell.
+
+The Kubernetes identity needs `get`, `create` and `delete` on ConfigMaps in its
+namespace.
 No cluster-wide objects or new identity providers are needed.
 
 ## MCP
