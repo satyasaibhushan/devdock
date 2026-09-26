@@ -11,6 +11,7 @@
     workload,
     to,
     owner,
+    instances,
     busy = false,
     onconfirm,
     oncancel,
@@ -19,6 +20,7 @@
     workload?: string
     to: InstanceView
     owner?: InstanceView
+    instances: InstanceView[]
     busy?: boolean
     onconfirm: () => void
     oncancel: () => void
@@ -67,7 +69,7 @@
       <div class="plan">
         <div class="row">
           <span class="k">From</span>
-          <span class="machine"><span class="sym">{instanceSymbol(owner)}</span>{owner?.name ?? 'unlinked owner'}</span>
+          <span class="machine"><span class="sym">{instanceSymbol(owner, instances)}</span>{owner?.name ?? 'unlinked owner'}</span>
           {#if plan.from}
             <span class="rev"><Icon name="branch" size={12} /><span class="bname">{plan.from.branch ?? 'detached'}</span><code>@{short(plan.from.commit)}</code>{#if plan.from.dirty}<span class="flag">modified</span>{/if}</span>
           {:else}
@@ -76,7 +78,7 @@
         </div>
         <div class="row">
           <span class="k">To</span>
-          <span class="machine"><span class="sym">{instanceSymbol(to)}</span>{to.name}</span>
+          <span class="machine"><span class="sym">{instanceSymbol(to, instances)}</span>{to.name}</span>
           <span class="rev"><Icon name="branch" size={12} /><span class="bname">{plan.target.branch ?? 'detached'}</span><code>@{short(plan.target.commit)}</code>{#if plan.target.dirty}<span class="flag">modified</span>{/if}</span>
         </div>
       </div>

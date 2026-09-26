@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { InstanceView, RepoState } from './api'
-import { globalRepos, ownerInstanceIds, retainOwners } from './globalRepos'
+import { globalRepos, instanceSymbol, ownerInstanceIds, retainOwners } from './globalRepos'
 
 function state(owner?: string, namespace = 'sai'): RepoState {
   return {
@@ -118,5 +118,19 @@ describe('global repo directory', () => {
     expect(
       retainOwners([machine('box', state())], previous)[0]?.repos[0]?.workloads[0]?.ownerInstanceId,
     ).toBeUndefined()
+  })
+})
+
+describe('machine symbols', () => {
+  it("gives each machine its own symbol, the same in every machine's list order", () => {
+    const [mac, box] = [machine('mac'), machine('box')]
+    const fromMac = [mac, box].map((i) => instanceSymbol(i, [mac, box]))
+    const fromBox = [mac, box].map((i) => instanceSymbol(i, [box, mac]))
+    expect(fromMac[0]).not.toBe(fromMac[1])
+    expect(fromBox).toEqual(fromMac)
+  })
+
+  it('marks an unknown owner', () => {
+    expect(instanceSymbol(undefined, [machine('mac')])).toBe('?')
   })
 })

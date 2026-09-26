@@ -425,7 +425,7 @@
               aria-label="Machine"
               disabled={busy !== null || moveBusy || activeOperation !== null}
             >
-              {#each machines as item (item.id)}<option value={item.id} disabled={!item.online}>{instanceSymbol(item)} {item.name}{item.online ? '' : ' (offline)'}</option>{/each}
+              {#each machines as item (item.id)}<option value={item.id} disabled={!item.online}>{instanceSymbol(item, instances)} {item.name}{item.online ? '' : ' (offline)'}</option>{/each}
               {#if view?.ownerInstanceId && !owner}<option value={view.ownerInstanceId} disabled>? unlinked owner</option>{/if}
             </select>
             {#if family.length > 1}
@@ -601,6 +601,7 @@
       workload={wl}
       to={moveTarget}
       {owner}
+      {instances}
       busy={moveBusy}
       onconfirm={doMove}
       oncancel={() => (moveTarget = null)}

@@ -1,7 +1,13 @@
 import type { InstanceView, RepoState, WorkloadState } from './api'
 
-export const instanceSymbol = (instance: InstanceView | undefined) =>
-  !instance ? '?' : /devbox/i.test(instance.name) ? '◇' : '▣'
+// One mark per machine, assigned in UUID order rather than list order: each
+// daemon lists itself first, so list order would differ between machines' UIs.
+const SYMBOLS = ['▣', '◆', '●', '▲', '■', '◇', '○', '△']
+export function instanceSymbol(instance: InstanceView | undefined, instances: InstanceView[]) {
+  if (!instance) return '?'
+  const ids = [...new Set([...instances.map((i) => i.id), instance.id])].sort()
+  return SYMBOLS[ids.indexOf(instance.id) % SYMBOLS.length]
+}
 export const instanceEndpoint = (instance: InstanceView) => (instance.local ? '' : instance.id)
 
 export function retainOwners(next: InstanceView[], previous: InstanceView[]): InstanceView[] {

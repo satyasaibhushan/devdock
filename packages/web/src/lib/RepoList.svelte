@@ -156,7 +156,7 @@
               <span class="name">{r.repo.id}</span>
               {#each ownerInstanceIds(r) as id (id)}
                 {@const machine = instances.find((i) => i.id === id)}
-                <span class="owner" class:offline={!machine?.online} title="{machine?.name ?? 'Owner not connected'}{machine?.online ? '' : ' · offline'}">{instanceSymbol(machine)}</span>
+                <span class="owner" class:offline={!machine?.online} title="{machine?.name ?? 'Owner not connected'}{machine?.online ? '' : ' · offline'}">{instanceSymbol(machine, instances)}</span>
               {/each}
               {#if r.repo.branch}<span class="bpill" title="branch {r.repo.branch}">{r.repo.branch}</span>{/if}
             </span>

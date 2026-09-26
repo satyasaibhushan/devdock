@@ -33,7 +33,7 @@
     {#each instances as item (item.id)}
       <button class="chip" class:offline={!item.online} title="{item.name}: {item.online ? 'online' : 'offline'}. Connection details."
         onclick={() => expanded = !expanded} aria-expanded={expanded}>
-        <span class="symbol">{instanceSymbol(item)}</span>
+        <span class="symbol">{instanceSymbol(item, instances)}</span>
         <span class="cname">{shortName(item.name)}</span>
         <span class="dot" class:online={item.online}></span>
       </button>
@@ -48,7 +48,7 @@
           <article>
             <div class="row">
               <div class="name">
-                <span class="symbol">{instanceSymbol(item)}</span>
+                <span class="symbol">{instanceSymbol(item, instances)}</span>
                 <span class="dot" class:online={item.online}></span>
                 <span class="nm">{item.name}</span>
                 <small>{item.local ? 'this machine' : 'SSH'}</small>
