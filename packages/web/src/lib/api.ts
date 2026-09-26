@@ -277,6 +277,7 @@ export interface MovePlan {
 export interface MoveResult {
   plan: MovePlan
   claim: 'released' | 'taken_over' | 'unclaimed'
+  startupCopied: Array<{ repo: string; podType: string }>
   operation?: Operation
 }
 async function moveRequest<T>(path: string, init?: RequestInit): Promise<T> {

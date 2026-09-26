@@ -8,6 +8,7 @@ import Fastify, { type FastifyInstance, type FastifyReply } from 'fastify'
 import type { AccessGate } from './accessGate.js'
 import { type Instances, peerPathAllowed } from './instances.js'
 import { type InstanceCall, type MoveFollowUp, moveDeployment, planMove } from './move.js'
+import { copyStartupCommands } from './startup.js'
 
 const parseJson = (text: string): unknown => {
   try {
@@ -103,7 +104,17 @@ export function buildApp(
         if (typeof req.body?.host !== 'string' || typeof req.body?.endpoint !== 'string')
           return reply.code(400).send({ error: 'SSH host and endpoint required' })
         try {
-          return await instances.link(req.body.host, req.body.endpoint, req.body.terminals === true)
+          const link = await instances.link(
+            req.body.host,
+            req.body.endpoint,
+            req.body.terminals === true,
+          )
+          // Each machine keeps its own startup commands; a new link fills the
+          // gaps both ways. Linking succeeds regardless.
+          const local = instances.identity.id
+          await copyStartupCommands(call, local, link.id).catch(() => [])
+          await copyStartupCommands(call, link.id, local).catch(() => [])
+          return link
         } catch (error) {
           return reply
             .code(400)

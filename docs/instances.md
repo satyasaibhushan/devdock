@@ -26,7 +26,9 @@ Authentication and namespace controls identify the current action target or
 deployment owner. The instance menu shows connection and auth status only.
 Replica creation offers an explicit target selector. Branches and
 worktrees come from that target's checkout. No repositories or `.env` files are
-copied by linking. New replica IDs include an instance suffix to avoid collisions.
+copied by linking. Startup commands are per machine: linking copies each one a
+machine lacks from the other, for repos checked out on both, and never
+overwrites one it has. New replica IDs include an instance suffix to avoid collisions.
 
 The terminal panel appears only while a dev session runs; otherwise the logs
 take the whole pane.
@@ -84,7 +86,8 @@ previews it and `POST /instances/move` runs it.
   starts dev and claims it: plain start when both checkouts are at the same
   commit, build + start otherwise, since the running image came from the
   owner's code. Otherwise the target's next verb claims it. `followUp`
-  overrides this.
+  overrides this. Before that start, the target gets any of the owner's
+  startup commands for the repo that it lacks.
 - Owner unreachable: the target deletes the claim only while it still names that
   owner, then claims it (`POST /repos/:id/take-over`). When the old owner returns,
   its reconcile sees the claim names someone else, kills its tmux session and

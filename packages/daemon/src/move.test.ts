@@ -8,6 +8,7 @@ interface Machine {
   hasSession: boolean
   commit: string
   branch?: string
+  startup?: string
 }
 
 /** Two machines sharing one claim, each answering like a daemon's API. */
@@ -26,6 +27,7 @@ function fleet(machines: Record<string, Machine | undefined>, owner: string | un
         body: [
           {
             repo: { id: 'api', defaultWorkload: 'api' },
+            startupCommands: machine.startup ? { api: machine.startup } : {},
             workloads: [
               {
                 type: 'api',
@@ -51,6 +53,10 @@ function fleet(machines: Record<string, Machine | undefined>, owner: string | un
       claim = instance
       return { status: 200, body: { ok: true } }
     }
+    if (path === '/repos/api/startup' && method === 'PUT') {
+      machine.startup = (body as { command: string }).command
+      return { status: 200, body: { ok: true } }
+    }
     if (path === '/repos/api/operations') return { status: 202, body: { id: 'op1' } }
     return { status: 404, body: { error: 'not found' } }
   }
@@ -61,7 +67,7 @@ describe('moving a deployment', () => {
   it('carries a live session over and rebuilds when the target is at another commit', async () => {
     const f = fleet(
       {
-        [MAC]: { hasSession: true, commit: 'aaa' },
+        [MAC]: { hasSession: true, commit: 'aaa', startup: 'php artisan serve' },
         [BOX]: { hasSession: false, commit: 'bbb', branch: 'feature' },
       },
       MAC,
@@ -79,8 +85,11 @@ describe('moving a deployment', () => {
 
     const result = await moveDeployment(f.call, 'api', undefined, BOX)
     expect(result.claim).toBe('released')
-    expect(f.calls.filter((c) => c.includes('POST'))).toEqual([
+    expect(result.startupCopied).toEqual([{ repo: 'api', podType: 'api' }])
+    // The startup command lands before the start that queues it.
+    expect(f.calls.filter((c) => !c.includes('GET'))).toEqual([
       'mac POST /repos/api/release',
+      'box PUT /repos/api/startup {"command":"php artisan serve","workload":"api"}',
       'box POST /repos/api/operations {"action":"build_start"}',
     ])
   })

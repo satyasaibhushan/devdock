@@ -2,6 +2,8 @@
 // so the UI and MCP share one sequence: the owner releases (or, when it cannot
 // be reached, the target takes over), then the target optionally starts.
 
+import { type CopiedStartup, copyStartupCommands } from './startup.js'
+
 export interface CallResult {
   status: number
   body: unknown
@@ -9,7 +11,7 @@ export interface CallResult {
 /** A request to an instance's API: this daemon or a linked peer. */
 export type InstanceCall = (
   instance: string,
-  method: 'GET' | 'POST',
+  method: 'GET' | 'POST' | 'PUT',
   path: string,
   body?: unknown,
 ) => Promise<CallResult>
@@ -127,6 +129,8 @@ export interface MoveResult {
   plan: MovePlan
   /** How the claim moved; 'unclaimed' when there was nothing to move. */
   claim: 'released' | 'taken_over' | 'unclaimed'
+  /** Startup commands the target lacked, copied from the owner. */
+  startupCopied: CopiedStartup[]
   operation?: unknown
 }
 
@@ -152,10 +156,16 @@ export async function moveDeployment(
       throw errorOf(result, 'The target could not take the deployment over')
     claim = 'taken_over'
   }
+  // Before the follow-up, so its start queues the owner's startup command. A
+  // failed copy leaves the target's own commands and does not undo the move.
+  const startupCopied =
+    plan.owner && plan.ownerOnline
+      ? await copyStartupCommands(call, plan.owner, to, repo).catch(() => [])
+      : []
   const followUp = requested ?? plan.followUp
-  if (followUp === 'none') return { plan, claim }
+  if (followUp === 'none') return { plan, claim, startupCopied }
   const started = await call(to, 'POST', `${path}/operations`, { action: followUp, workload })
   if (started.status !== 202 && started.status !== 200)
     throw errorOf(started, `Moved, but ${followUp.replace('_', ' + ')} did not start on the target`)
-  return { plan, claim, operation: started.body }
+  return { plan, claim, startupCopied, operation: started.body }
 }
