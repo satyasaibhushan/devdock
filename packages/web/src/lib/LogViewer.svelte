@@ -55,7 +55,7 @@
     background: var(--term-bg);
     padding: 8px 16px;
     font-family: var(--mono);
-    font-size: 12px;
+    font-size: 13px;
     line-height: 1.5;
     color: #c9d6e2;
     white-space: pre-wrap;

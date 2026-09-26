@@ -50,7 +50,7 @@
   }
   .msg {
     margin: 0;
-    font-size: 12.5px;
+    font-size: 13.5px;
     line-height: 1.55;
     color: var(--ink-2);
   }

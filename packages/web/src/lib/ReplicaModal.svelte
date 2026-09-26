@@ -157,7 +157,7 @@
     display: flex;
     align-items: center;
     gap: 10px;
-    font-size: 12px;
+    font-size: 13px;
     color: var(--ink-2);
   }
   .target .sel {
@@ -219,7 +219,7 @@
     flex: 1;
     min-width: 0;
     font-family: var(--mono);
-    font-size: 12px;
+    font-size: 13px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -228,11 +228,11 @@
     flex: none;
     color: var(--muted);
     font-family: var(--mono);
-    font-size: 10.5px;
+    font-size: 11.5px;
   }
   .empty {
     color: var(--muted);
-    font-size: 12.5px;
+    font-size: 13.5px;
     padding: 16px 10px;
     margin: 0;
   }

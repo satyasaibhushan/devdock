@@ -93,7 +93,7 @@
   }
   .k {
     font-family: var(--mono);
-    font-size: 10px;
+    font-size: 11px;
     text-transform: uppercase;
     letter-spacing: 0.06em;
     color: var(--muted);
@@ -105,7 +105,7 @@
     width: 150px;
     height: 26px;
     font-family: var(--mono);
-    font-size: 12px;
+    font-size: 13px;
   }
   .spin {
     width: 10px;

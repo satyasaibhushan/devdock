@@ -158,13 +158,13 @@
   }
   .ptype {
     font-family: var(--mono);
-    font-size: 12px;
+    font-size: 13px;
     font-weight: 600;
   }
   nav small {
     grid-column: 2;
     color: var(--muted);
-    font-size: 10.5px;
+    font-size: 11.5px;
   }
   .status {
     width: 6px;
@@ -187,7 +187,7 @@
     align-items: center;
     gap: 7px;
     color: var(--muted);
-    font-size: 11px;
+    font-size: 12px;
   }
   .editorhead strong {
     padding: 1px 6px;
@@ -195,7 +195,7 @@
     background: color-mix(in srgb, var(--accent) 12%, transparent);
     border-radius: var(--r-1);
     font-family: var(--mono);
-    font-size: 11px;
+    font-size: 12px;
     font-weight: 600;
   }
   textarea {
@@ -208,7 +208,7 @@
     border-radius: var(--r-1);
     color: var(--ink);
     font-family: var(--mono);
-    font-size: 12.5px;
+    font-size: 13.5px;
     line-height: 1.55;
     padding: 10px;
     outline: none;
@@ -220,7 +220,7 @@
   .shortcut {
     align-self: flex-end;
     color: var(--muted);
-    font-size: 10.5px;
+    font-size: 11.5px;
   }
   @media (max-width: 560px) {
     .workspace {

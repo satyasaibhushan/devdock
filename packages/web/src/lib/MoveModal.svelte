@@ -110,7 +110,7 @@
     background: var(--bg-0);
     border: 1px solid var(--line);
     border-radius: var(--r-2);
-    font-size: 12px;
+    font-size: 13px;
   }
   .row {
     display: grid;
@@ -120,7 +120,7 @@
   }
   .k {
     color: var(--muted);
-    font-size: 11px;
+    font-size: 12px;
   }
   .machine {
     display: inline-flex;
@@ -141,7 +141,7 @@
     min-width: 0;
     color: var(--ink-2);
     font-family: var(--mono);
-    font-size: 11.5px;
+    font-size: 12.5px;
     white-space: nowrap;
   }
   /* A long branch name gives way; the commit and the dirty flag always show. */
@@ -164,14 +164,14 @@
   .flag {
     color: var(--warn);
     font-family: var(--sans);
-    font-size: 11px;
+    font-size: 12px;
   }
   .note {
     display: flex;
     align-items: center;
     gap: 7px;
     margin: 0;
-    font-size: 12px;
+    font-size: 13px;
   }
   .note.warn {
     color: var(--warn);

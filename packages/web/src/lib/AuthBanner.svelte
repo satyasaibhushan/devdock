@@ -96,7 +96,7 @@
     border: 1px solid color-mix(in srgb, var(--warn) 40%, transparent);
     background: color-mix(in srgb, var(--warn) 10%, transparent);
     color: var(--warn);
-    font-size: 12px;
+    font-size: 13px;
     white-space: nowrap;
     min-width: 0;
     flex: 0 1 auto;

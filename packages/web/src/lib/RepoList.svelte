@@ -143,7 +143,7 @@
         <span class="scount">{section.repos.length}</span>
       </button>
       {#each isOpen(section.title) ? section.repos : [] as r (r.repo.id)}
-        <div class="rowwrap" class:sel={r.repo.id === selectedId}>
+        <div class="rowwrap" class:current={r.repo.id === selectedId}>
           <button
             class="row"
             role="option"
@@ -315,13 +315,13 @@
     transform: rotate(90deg);
   }
   .stitle {
-    font-size: 10.5px;
+    font-size: 11.5px;
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.07em;
   }
   .scount {
-    font-size: 10.5px;
+    font-size: 11.5px;
     font-family: var(--mono);
     color: var(--muted);
     opacity: 0.8;
@@ -333,7 +333,7 @@
   .rowwrap:hover {
     background: var(--bg-2);
   }
-  .rowwrap.sel {
+  .rowwrap.current {
     background: var(--bg-3);
     box-shadow: inset 2px 0 0 var(--accent);
   }
@@ -343,7 +343,7 @@
     align-items: center;
     gap: 9px;
     width: 100%;
-    height: 30px;
+    height: 32px;
     text-align: left;
     background: none;
     border: none;
@@ -351,7 +351,7 @@
     padding: 0 8px 0 10px;
     color: var(--ink-2);
   }
-  .rowwrap.sel .row {
+  .rowwrap.current .row {
     color: var(--ink);
   }
   /* The action chips float over the right edge of the row on hover instead of
@@ -372,13 +372,18 @@
     pointer-events: none;
     transition: opacity 0.1s ease;
   }
-  .rowwrap.sel .actions {
+  .rowwrap.current .actions {
     background: linear-gradient(to right, transparent, var(--bg-3) 22px);
   }
   .rowwrap:hover .actions,
   .rowwrap:focus-within .actions {
     opacity: 1;
     pointer-events: auto;
+  }
+  /* The status sits under the actions; hide it so no clipped letters peek out. */
+  .rowwrap:hover .st,
+  .rowwrap:focus-within .st {
+    visibility: hidden;
   }
   .act {
     display: inline-flex;
@@ -438,7 +443,7 @@
     align-items: center;
     gap: 5px;
     min-width: 0;
-    font-size: 12.5px;
+    font-size: 13.5px;
     font-weight: 500;
   }
   .name {
@@ -450,13 +455,13 @@
   .rep {
     color: var(--accent);
     font-family: var(--mono);
-    font-size: 11px;
+    font-size: 12px;
     flex: none;
   }
   .owner {
     flex: none;
     color: var(--accent);
-    font-size: 12px;
+    font-size: 13px;
     line-height: 1;
   }
   .owner.offline {
@@ -466,7 +471,7 @@
     flex: 0 1 auto;
     min-width: 44px;
     font-family: var(--mono);
-    font-size: 10px;
+    font-size: 11px;
     padding: 1px 5px;
     border-radius: var(--r-1);
     background: color-mix(in srgb, var(--accent) 12%, transparent);
@@ -477,7 +482,7 @@
     text-overflow: ellipsis;
   }
   .st {
-    font-size: 10.5px;
+    font-size: 11.5px;
     text-transform: uppercase;
     letter-spacing: 0.04em;
     color: var(--muted);
@@ -511,7 +516,7 @@
   }
   .wpill {
     font-family: var(--mono);
-    font-size: 10px;
+    font-size: 11px;
     padding: 1px 5px;
     border-radius: var(--r-1);
     color: var(--muted);
@@ -550,7 +555,7 @@
   }
   .empty p {
     margin: 0;
-    font-size: 12.5px;
+    font-size: 13.5px;
   }
   .spin {
     width: 14px;

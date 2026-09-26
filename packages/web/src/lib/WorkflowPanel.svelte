@@ -87,7 +87,7 @@
 <style>
   .workflow {
     display: contents;
-    font-size: 12px;
+    font-size: 13px;
   }
   details {
     position: relative;
@@ -137,11 +137,11 @@
   }
   summary code {
     color: var(--muted);
-    font-size: 11px;
+    font-size: 12px;
   }
   .secs {
     font-family: var(--mono);
-    font-size: 11px;
+    font-size: 12px;
     color: var(--muted);
   }
   .card {
@@ -168,7 +168,7 @@
     overflow-wrap: anywhere;
   }
   .path {
-    font-size: 11px;
+    font-size: 12px;
     color: var(--ink-2);
   }
   .muted,
@@ -177,15 +177,15 @@
   }
   time {
     font-family: var(--mono);
-    font-size: 11px;
+    font-size: 12px;
   }
   .dirty {
     color: var(--warn);
-    font-size: 11px;
+    font-size: 12px;
   }
   .st {
     font-family: var(--mono);
-    font-size: 11px;
+    font-size: 12px;
     color: var(--ok);
   }
   .failed,

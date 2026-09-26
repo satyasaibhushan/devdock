@@ -43,7 +43,7 @@ body {
   background: var(--bg-0);
   color: var(--ink);
   font-family: var(--sans);
-  font-size: 13px;
+  font-size: 14px;
   line-height: 1.4;
   -webkit-font-smoothing: antialiased;
   font-feature-settings: "tnum";
@@ -116,7 +116,7 @@ button:disabled {
   gap: 6px;
   height: 26px;
   padding: 0 10px;
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 500;
   line-height: 1;
   white-space: nowrap;
@@ -175,7 +175,7 @@ button:disabled {
 .btn.sm {
   height: 22px;
   padding: 0 7px;
-  font-size: 11px;
+  font-size: 12px;
 }
 .btn.icon {
   width: 26px;
@@ -193,7 +193,7 @@ button:disabled {
   height: 26px;
   padding: 0 24px 0 8px;
   font: inherit;
-  font-size: 12px;
+  font-size: 13px;
   color: var(--ink);
   background: var(--bg-2)
     url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%237f8c99' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='m6 9 6 6 6-6'/></svg>")
@@ -213,13 +213,13 @@ button:disabled {
 }
 .sel.mono {
   font-family: var(--mono);
-  font-size: 11.5px;
+  font-size: 12.5px;
 }
 .field {
   height: 28px;
   padding: 0 9px;
   font: inherit;
-  font-size: 12.5px;
+  font-size: 13.5px;
   color: var(--ink);
   background: var(--bg-0);
   border: 1px solid var(--line-strong);
@@ -240,7 +240,7 @@ button:disabled {
   align-items: center;
   height: 20px;
   padding: 0 7px;
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 500;
   border-radius: var(--r-1);
   color: var(--muted);
@@ -301,12 +301,12 @@ button:disabled {
 }
 .modal > header h3 {
   margin: 0;
-  font-size: 14px;
+  font-size: 15px;
   font-weight: 600;
 }
 .modal > header code {
   color: var(--muted);
-  font-size: 11px;
+  font-size: 12px;
   max-width: 50%;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -329,7 +329,7 @@ button:disabled {
 .modal .hint {
   margin: 0;
   color: var(--muted);
-  font-size: 12px;
+  font-size: 13px;
   line-height: 1.55;
 }
 .modal .hint b {
@@ -338,7 +338,7 @@ button:disabled {
 }
 .modal .err {
   margin: 0;
-  font-size: 12px;
+  font-size: 13px;
   color: var(--danger);
 }
 

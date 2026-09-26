@@ -76,7 +76,7 @@
 <style>
   .instances {
     position: relative;
-    font-size: 12px;
+    font-size: 13px;
     min-width: 0;
     flex: 0 1 auto;
   }
@@ -104,7 +104,7 @@
     background: transparent;
     color: var(--ink-2);
     font: inherit;
-    font-size: 12px;
+    font-size: 13px;
     cursor: pointer;
   }
   .chip:hover,
@@ -127,7 +127,7 @@
   }
   .symbol {
     color: var(--accent);
-    font-size: 13px;
+    font-size: 14px;
     line-height: 1;
   }
   .cname {
@@ -142,7 +142,7 @@
   small,
   .meta {
     color: var(--muted);
-    font-size: 11px;
+    font-size: 12px;
   }
   .dot {
     display: inline-block;
@@ -176,7 +176,7 @@
     border-bottom: 1px solid var(--line);
   }
   .heading b {
-    font-size: 12px;
+    font-size: 13px;
     font-weight: 600;
   }
   .list {
@@ -224,7 +224,7 @@
   }
   .field.mono {
     font-family: var(--mono);
-    font-size: 12px;
+    font-size: 13px;
   }
   .check {
     display: flex;
@@ -239,7 +239,7 @@
     color: var(--muted);
     line-height: 1.5;
     margin: 0;
-    font-size: 11.5px;
+    font-size: 12.5px;
   }
   .formfoot {
     display: flex;

@@ -56,7 +56,7 @@
       // enforced by only forwarding wheel reports (below), and again daemon-side.
       term = new XTerm({
         fontFamily: monoStack(),
-        fontSize: 12,
+        fontSize: 13,
         cursorBlink: modeVal === 'rw',
         scrollback: 5000,
         theme: { background: '#0b0f14', foreground: '#c9d6e2' },
@@ -209,18 +209,18 @@
     margin: 0;
     color: var(--ink);
     font-weight: 600;
-    font-size: 13px;
+    font-size: 14px;
   }
   .msg {
     margin: 0;
     color: var(--danger);
     font-family: var(--mono);
-    font-size: 12px;
+    font-size: 13px;
   }
   .hint {
     margin: 6px 0 0;
     color: var(--muted);
-    font-size: 12px;
+    font-size: 13px;
     max-width: 420px;
   }
 </style>

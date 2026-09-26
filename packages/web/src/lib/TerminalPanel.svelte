@@ -257,7 +257,7 @@
     width: 100%;
     padding: 7px 8px;
     text-align: left;
-    font-size: 12px;
+    font-size: 13px;
     color: var(--ink-2);
     background: transparent;
     border: 0;
@@ -327,7 +327,7 @@
     border: none;
     background: none;
     color: var(--muted);
-    font-size: 12px;
+    font-size: 13px;
     padding: 0 8px;
     white-space: nowrap;
     border-radius: var(--r-1) var(--r-1) 0 0;
@@ -342,7 +342,7 @@
      scope-qualified id agents see. */
   .num {
     font-family: var(--mono);
-    font-size: 10px;
+    font-size: 11px;
     line-height: 1;
     padding: 2px 4px;
     border-radius: 3px;
@@ -411,7 +411,7 @@
   .modes button {
     height: 100%;
     padding: 0 8px;
-    font-size: 11px;
+    font-size: 12px;
     font-weight: 500;
     color: var(--muted);
     background: transparent;
@@ -458,11 +458,11 @@
   }
   .empty p {
     margin: 0;
-    font-size: 12.5px;
+    font-size: 13.5px;
   }
   .empty .err,
   .err {
-    font-size: 12px;
+    font-size: 13px;
     margin: 0;
     color: var(--danger);
     font-family: var(--mono);

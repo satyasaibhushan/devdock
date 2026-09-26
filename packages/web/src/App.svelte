@@ -625,7 +625,7 @@
   .brand {
     margin: 0 4px 0 0;
     font-family: var(--mono);
-    font-size: 15px;
+    font-size: 16px;
     font-weight: 600;
     letter-spacing: -0.02em;
     white-space: nowrap;
@@ -649,7 +649,7 @@
     align-items: center;
     gap: 6px;
     flex: none;
-    font-size: 11px;
+    font-size: 12px;
     color: var(--muted);
     white-space: nowrap;
   }
@@ -669,11 +669,11 @@
     flex: 1;
     min-height: 0;
     display: grid;
-    grid-template-columns: 280px minmax(0, 1fr);
+    grid-template-columns: 340px minmax(0, 1fr);
   }
   @media (max-width: 1100px) {
     main {
-      grid-template-columns: 240px minmax(0, 1fr);
+      grid-template-columns: 280px minmax(0, 1fr);
     }
     .conn {
       font-size: 0;
@@ -709,7 +709,7 @@
     border-top: 1px solid var(--line);
     background: none;
     color: var(--muted);
-    font-size: 12px;
+    font-size: 13px;
     font-weight: 500;
     text-align: left;
   }
@@ -750,7 +750,7 @@
   }
   .title h2 {
     margin: 0;
-    font-size: 15px;
+    font-size: 16px;
     font-weight: 600;
     letter-spacing: -0.01em;
     overflow: hidden;
@@ -778,12 +778,12 @@
     align-items: center;
     gap: 7px;
     color: var(--muted);
-    font-size: 12px;
+    font-size: 13px;
   }
   /* The active workload's type, shown when it isn't the plain `api` default. */
   .tag {
     font-family: var(--mono);
-    font-size: 10.5px;
+    font-size: 11.5px;
     padding: 2px 6px;
     border-radius: var(--r-1);
     background: color-mix(in srgb, var(--accent) 14%, transparent);
@@ -804,7 +804,7 @@
     flex-wrap: wrap;
     min-height: 32px;
     padding: 4px 16px;
-    font-size: 12px;
+    font-size: 13px;
     color: var(--muted);
     border-bottom: 1px solid var(--line);
     background: var(--bg-1);
@@ -817,7 +817,7 @@
   }
   .fact.mono {
     font-family: var(--mono);
-    font-size: 11.5px;
+    font-size: 12.5px;
   }
 
   .streams {
@@ -846,7 +846,7 @@
     height: 32px;
     padding: 0 16px;
     flex: none;
-    font-size: 11px;
+    font-size: 12px;
     font-weight: 600;
     letter-spacing: 0.04em;
     text-transform: uppercase;
@@ -880,7 +880,7 @@
   .placeholder p {
     margin: 0;
     max-width: 420px;
-    font-size: 13px;
+    font-size: 14px;
     line-height: 1.5;
   }
   .placeholder.warn {
@@ -918,7 +918,7 @@
     border-left: 3px solid var(--danger);
     border-radius: var(--r-2);
     color: var(--ink);
-    font-size: 12.5px;
+    font-size: 13.5px;
     line-height: 1.45;
     box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
   }
