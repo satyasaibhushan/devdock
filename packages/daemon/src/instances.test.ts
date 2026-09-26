@@ -3,7 +3,14 @@ import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { Instances, loadIdentity, peerPathAllowed, validateLink } from './instances.js'
+import {
+  Instances,
+  type PortForward,
+  loadIdentity,
+  peerPathAllowed,
+  signInPorts,
+  validateLink,
+} from './instances.js'
 
 const dirs: string[] = []
 function directory() {
@@ -139,5 +146,58 @@ describe('instance directory', () => {
     }
     writeFileSync(socket, 'not a socket')
     expect(() => instances.prepareReturn(id)).toThrow('not a socket')
+  })
+
+  it('reads sign-in callback ports only from localhost URLs', () => {
+    expect(
+      signInPorts({
+        loginUrl: 'http://localhost:8040',
+        awsLoginUrl:
+          'https://idp.example/oauth2/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A8010%2Foauth%2Fcallback',
+      }),
+    ).toEqual([8010, 8040])
+    expect(signInPorts({ loginUrl: 'https://idp.example:8443/login' })).toEqual([])
+    expect(signInPorts({ loginUrl: 'http://localhost:80' })).toEqual([])
+    expect(signInPorts({ loginUrl: 'not a url' })).toEqual([])
+    expect(signInPorts(undefined)).toEqual([])
+  })
+
+  it('forwards a peer sign-in callback only while that sign-in waits', async () => {
+    const root = directory()
+    const socket = join(root, 'peer.sock')
+    const identity = { id: '12345678-1234-1234-1234-123456789012', name: 'devbox', protocol: 1 }
+    let auth: Record<string, string> = { loginUrl: 'http://localhost:8040' }
+    const server = createServer((req, res) => {
+      res.setHeader('content-type', 'application/json')
+      res.end(JSON.stringify(req.url === '/instance' ? { ...identity, auth } : {}))
+    })
+    await new Promise<void>((resolve) => server.listen(socket, resolve))
+    const open: string[] = []
+    const forward = (host: string, port: number): PortForward => {
+      const key = `${host}:${port}`
+      open.push(key)
+      return {
+        done: new Promise(() => {}),
+        close: () => open.splice(open.indexOf(key), 1),
+      }
+    }
+    const instances = new Instances(
+      root,
+      () => ({ connect: async () => socket, close() {} }),
+      undefined,
+      forward,
+    )
+    try {
+      const link = await instances.link('devbox', '/run/user/1000/devdock/control.sock')
+      await instances.request(link.id, 'GET', '/repos')
+      await instances.request(link.id, 'GET', '/repos')
+      expect(open).toEqual(['devbox:8040'])
+      auth = {}
+      await instances.request(link.id, 'GET', '/repos')
+      expect(open).toEqual([])
+    } finally {
+      instances.close()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
   })
 })

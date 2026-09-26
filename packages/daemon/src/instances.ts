@@ -96,6 +96,65 @@ export function peerPathAllowed(path: string, terminals: boolean): boolean {
   )
 }
 
+/** Local callback ports of a peer's pending browser sign-ins. kubelogin's URL
+ *  is the callback server itself; the AWS authorize URL names it as redirect_uri. */
+export function signInPorts(auth: unknown): number[] {
+  if (!auth || typeof auth !== 'object') return []
+  const { loginUrl, awsLoginUrl } = auth as { loginUrl?: unknown; awsLoginUrl?: unknown }
+  const ports = new Set<number>()
+  for (const value of [loginUrl, awsLoginUrl]) {
+    if (typeof value !== 'string') continue
+    let url: URL
+    try {
+      url = new URL(value)
+    } catch {
+      continue
+    }
+    for (const candidate of [value, url.searchParams.get('redirect_uri')]) {
+      if (!candidate) continue
+      try {
+        const target = new URL(candidate)
+        const port = Number(target.port)
+        if (['localhost', '127.0.0.1'].includes(target.hostname) && port >= 1024) ports.add(port)
+      } catch {
+        /* not a URL */
+      }
+    }
+  }
+  return [...ports].sort((a, b) => a - b)
+}
+
+export interface PortForward {
+  /** Settles when the forward exits, e.g. because the local port is busy. */
+  readonly done: Promise<void>
+  close(): void
+}
+
+function sshPortForward(host: string, port: number): PortForward {
+  const child = spawn(
+    'ssh',
+    [
+      '-N',
+      '-T',
+      '-o',
+      'BatchMode=yes',
+      '-o',
+      'ExitOnForwardFailure=yes',
+      '-o',
+      'ConnectTimeout=8',
+      '-L',
+      `${port}:localhost:${port}`,
+      host,
+    ],
+    { stdio: 'ignore' },
+  )
+  const done = new Promise<void>((resolve) => {
+    child.once('error', () => resolve())
+    child.once('exit', () => resolve())
+  })
+  return { done, close: () => child.kill() }
+}
+
 export interface InstanceConnection {
   connect(): Promise<string>
   close(): void
@@ -264,6 +323,8 @@ export class Instances {
   readonly identity: InstanceIdentity
   private links = new Map<string, InstanceLink>()
   private tunnels = new Map<string, InstanceConnection>()
+  private signIns = new Map<string, PortForward>()
+  private signInRetryAt = new Map<string, number>()
   private timer?: NodeJS.Timeout
   private maintaining = false
   constructor(
@@ -271,6 +332,7 @@ export class Instances {
     private readonly connection: (link: ConnectionOptions) => InstanceConnection = (link) =>
       link.reverse ? { connect: async () => link.endpoint, close() {} } : new Tunnel(link),
     private readonly localEndpoint?: string,
+    private readonly portForward: (host: string, port: number) => PortForward = sshPortForward,
   ) {
     this.identity = loadIdentity(directory)
     const file = join(directory, 'instances.json')
@@ -393,7 +455,34 @@ export class Instances {
       throw error
     }
   }
+  /** The browser runs here, so a peer's sign-in callback must reach the peer's
+   *  localhost. Forward only while its sign-in waits: the same ports serve this
+   *  machine's own sign-ins the rest of the time. */
+  private syncSignIns(link: InstanceLink, ports: number[]): void {
+    const wanted = link.reverse ? [] : ports
+    for (const [key, forward] of this.signIns) {
+      const [id, port] = key.split(':')
+      if (id === link.id && !wanted.includes(Number(port))) {
+        forward.close()
+        this.signIns.delete(key)
+      }
+    }
+    for (const port of wanted) {
+      const key = `${link.id}:${port}`
+      // A busy local port fails fast; peer requests arrive every few seconds.
+      if (this.signIns.has(key) || (this.signInRetryAt.get(key) ?? 0) > Date.now()) continue
+      const forward = this.portForward(link.host, port)
+      this.signIns.set(key, forward)
+      void forward.done.then(() => {
+        if (this.signIns.get(key) !== forward) return
+        this.signIns.delete(key)
+        this.signInRetryAt.set(key, Date.now() + 10_000)
+      })
+    }
+  }
   unlink(id: string): void {
+    const link = this.links.get(id)
+    if (link) this.syncSignIns(link, [])
     this.tunnels.get(id)?.close()
     this.tunnels.delete(id)
     this.links.delete(id)
@@ -412,9 +501,10 @@ export class Instances {
     const socket = await tunnel.connect()
     // SSH authenticates the machine; pin the daemon identity too, including after reconnect.
     const response = await socketRequest(socket, 'GET', '/instance', undefined, 5000)
-    const identity = JSON.parse(response.body.toString()) as InstanceIdentity
+    const identity = JSON.parse(response.body.toString()) as InstanceIdentity & { auth?: unknown }
     if (response.status !== 200 || identity.id !== id || identity.protocol !== 1)
       throw new Error('Peer identity changed; relink explicitly')
+    this.syncSignIns(link, signInPorts(identity.auth))
     return socket
   }
   async request(id: string, method: string, path: string, body?: unknown): Promise<PeerResponse> {
@@ -447,6 +537,8 @@ export class Instances {
   close(): void {
     if (this.timer) clearInterval(this.timer)
     for (const tunnel of this.tunnels.values()) tunnel.close()
+    for (const forward of this.signIns.values()) forward.close()
+    this.signIns.clear()
   }
 }
 
