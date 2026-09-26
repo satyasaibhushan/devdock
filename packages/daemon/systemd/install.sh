@@ -123,6 +123,9 @@ fi
   fi
   printf 'Environment=AWS_PAGER=\n'
   printf 'RuntimeDirectory=devdock\nRuntimeDirectoryMode=0700\nUMask=0077\n'
+  # The daemon starts the tmux server that holds every dev session. Stop only
+  # the daemon, as launchd does, so a restart or reinstall keeps the sessions.
+  printf 'KillMode=process\n'
   printf 'Restart=on-failure\nRestartSec=5\n\n'
   printf '[Install]\nWantedBy=default.target\n'
 } > "$UNIT_TMP"

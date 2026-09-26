@@ -198,6 +198,8 @@ describe('systemd installer', () => {
     expect(unit).toContain('Environment=HTTPS_PROXY=http://127.0.0.1:18080')
     expect(unit).toContain('Environment=NO_PROXY=.amazonaws.com')
     expect(unit).toContain('Environment=DEVDOCK_SOCKET=%t/devdock/control.sock')
+    // A restart must not take the tmux server, and every dev session, with it.
+    expect(unit).toContain('KillMode=process')
     expect(readFileSync(m.log, 'utf8')).toContain('systemctl --user restart devdock')
   })
 

@@ -18,6 +18,7 @@ Environment=AWS_PAGER=
 RuntimeDirectory=devdock
 RuntimeDirectoryMode=0700
 UMask=0077
+KillMode=process
 Restart=on-failure
 RestartSec=5
 
