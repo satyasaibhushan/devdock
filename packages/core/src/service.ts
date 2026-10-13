@@ -1767,9 +1767,22 @@ export class Service {
     return [...names]
   }
 
+  /** Discovery only runs at startup, so a checkout deleted from disk would
+   *  otherwise stay listed until the daemon restarts. Persisted records
+   *  (replicas, startup flags) are left alone: rescan re-derives from them. */
+  private pruneMissingCheckouts(): void {
+    for (const [id, repo] of [...this.repos]) {
+      if (existsSync(repo.path)) continue
+      this.repos.delete(id)
+      this.states.delete(id)
+      this.purgeWorkloadState(id)
+    }
+  }
+
   async reconcileAll(): Promise<RepoState[]> {
     const authSync = this.auth.syncContext?.()
     if (authSync) await authSync.catch(() => undefined)
+    this.pruneMissingCheckouts()
     // Share one cluster snapshot + one session map across the pass — repos in
     // the same namespace reuse a single kubectl query instead of one each.
     const cache = newClusterCache()
