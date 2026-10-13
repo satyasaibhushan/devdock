@@ -342,6 +342,26 @@ describe('Service', () => {
     expect(svc.get('svc-a')?.status).toBe('RUNNING_MANAGED')
   })
 
+  it('drops a checkout deleted from disk on the next reconcile pass', async () => {
+    mkdirSync(join(root, 'svc-b'), { recursive: true })
+    writeFileSync(
+      join(root, 'svc-b', 'devspace.yaml'),
+      'name: svc-b\nnamespace: ns\ndeployments:\n  app: {}\n',
+    )
+    const svc = new Service(
+      { roots: [root], stateFile },
+      { runner: cannedRunner('{"items":[]}', false) },
+    )
+    svc.rescan()
+    await svc.reconcileAll()
+    expect(svc.list().map((s) => s.repo.id)).toEqual(['svc-a', 'svc-b'])
+
+    rmSync(join(root, 'svc-b'), { recursive: true, force: true })
+    await svc.reconcileAll()
+    expect(svc.listRepos().map((r) => r.id)).toEqual(['svc-a'])
+    expect(svc.list().map((s) => s.repo.id)).toEqual(['svc-a'])
+  })
+
   it('reports DEPLOYED when deployment objects exist but nothing runs', async () => {
     const deploymentsJson = JSON.stringify({
       items: [{ metadata: { name: 'svc-a' }, spec: { replicas: 0 }, status: {} }],
