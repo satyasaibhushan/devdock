@@ -181,6 +181,13 @@ export class Supervisor {
     return this.streamRunner(loginShell, args, {}, onLine)
   }
 
+  /** The effective config `devspace dev` would run with (imports merged,
+   *  profiles applied, vars resolved), invoked exactly like the other verbs. */
+  print(repo: Repo): Promise<RunResult> {
+    prepareWorkloadConfig(repo)
+    return this.runner(loginShell, [loginShellArgs, devspaceCommand(repo, 'print --skip-info')])
+  }
+
   /** Tear down: kill the tmux session first — devdock's own `devspace dev`
    *  inside it holds the project's namespace session lock, and a purge run
    *  under a live session fails on that lock — release the lock, then

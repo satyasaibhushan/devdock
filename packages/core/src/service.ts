@@ -22,6 +22,7 @@ import {
   ingressPathOf,
   nextReplicaId,
   replicaCheckoutPath,
+  replicaIsolationProblems,
 } from './replicas.js'
 import { type ReplicaRecord, StateStore } from './stateStore.js'
 import { type SessionState, type StreamRunner, Supervisor, verbLabel } from './supervisor.js'
@@ -1217,6 +1218,7 @@ export class Service {
       if (opts.ownImage) record.ownImage = true
       const repo = this.materializeReplica(record)
       if (!repo) throw new Error('generated replica configs failed to parse')
+      await this.assertReplicaIsolated(repo, id)
       // Every helm release the deploy can create, remembered for uninstall on
       // delete (uninstall is best-effort, so a superset is harmless).
       record.releases = [
@@ -1250,6 +1252,26 @@ export class Service {
     }
   }
 
+  /** Refuse a replica whose effective DevSpace config could attach to pods or
+   *  releases it does not own. Generation retargets the known shapes; this
+   *  checks what DevSpace itself resolves (imports, profiles, vars), so a
+   *  config shape generation misses fails here instead of syncing over the
+   *  parent's checkout. */
+  private async assertReplicaIsolated(repo: Repo, id: string): Promise<void> {
+    for (const type of workloadTypes(repo)) {
+      const scoped = scopeRepo(repo, type)
+      const printed = await this.supervisor.print(scoped)
+      const problems =
+        printed.code === 0
+          ? replicaIsolationProblems(printed.stdout, id)
+          : [`devspace print failed: ${printed.stderr.trim() || `exit ${printed.code}`}`]
+      if (!problems.length) continue
+      throw new Error(
+        `Refusing replica ${id}: cannot prove ${scoped.name} only targets its own workloads (${problems.join('; ')}). Make the parent's DevSpace selectors and release names derive from \${DEVSPACE_NAME} or \${WORKLOAD_NAME}.`,
+      )
+    }
+  }
+
   /** Delete a replica: stop its workloads, remove its alias ingress and its
    *  worktree, and purge every trace from the store. Works from stored paths
    *  even when the worktree or parent checkout has already gone. */
@@ -1263,6 +1285,13 @@ export class Service {
       throw new Error('Cannot verify ownership of a missing replica checkout')
     }
     if (repo) {
+      for (const type of workloadTypes(repo)) {
+        // Cancel any in-flight start (create's background kickoff, a
+        // reconnect) so it cannot launch `devspace dev` after the purge.
+        const key = workloadKey(id, type)
+        this.pausedSessions.add(key)
+        this.sessionGenerations.set(key, (this.sessionGenerations.get(key) ?? 0) + 1)
+      }
       for (const type of workloadTypes(repo)) {
         await this.stop(id, type).catch(() => undefined)
       }
@@ -1713,6 +1742,9 @@ export class Service {
       }
     }
     const state = assembleState(repo, workloads, Date.now())
+    // A pass that outlived its repo (replica deleted mid-pass) must not
+    // re-list it.
+    if (!this.repos.has(id)) return state
     this.applyStartupCommands(state)
     this.applyState(state)
     if (repo.parentId && state.pods.length > 0) {

@@ -48,8 +48,21 @@ function cannedRunner(podsJson: string, sessionExists: boolean, deploymentsJson 
       return { code: 0, stdout: sessionExists ? 'devdock-svc-a 0\n' : '', stderr: '' }
     if (cmd === 'kubectl' && args[0] === 'get')
       return { code: 0, stdout: args[1] === 'deployments' ? deploymentsJson : podsJson, stderr: '' }
+    if (cmd === loginShell && args[1]?.includes('devspace print'))
+      return { code: 0, stdout: fakeDevspacePrint(args[1]), stderr: '' }
     return { code: 0, stdout: '', stderr: '' }
   })
+}
+
+/** Stand-in for `devspace print`: the config in the command's directory with
+ *  the project-name vars resolved the way DevSpace resolves them. */
+function fakeDevspacePrint(command: string): string {
+  const dir = /cd '([^']+)'/.exec(command)?.[1] ?? ''
+  const text = readFileSync(join(dir, 'devspace.yaml'), 'utf8')
+  const name = /--override-name '([^']+)'/.exec(command)?.[1] ?? /^name: (.+)$/m.exec(text)?.[1]
+  return `version: v2beta1\n${text}`
+    .replaceAll('${WORKLOAD_NAME}', name ?? '')
+    .replaceAll('${DEVSPACE_NAME}', name ?? '')
 }
 
 /** Records streaming spawns (tail -F, kubectl logs -f) without real children. */
@@ -1404,7 +1417,9 @@ describe('Service replicas', () => {
           `  WORKLOAD_TYPE: ${type}`,
           '  INGRESS_PATH: parent',
           'dev:',
-          '  common: {}',
+          '  common:',
+          '    labelSelector:',
+          '      svc: ${WORKLOAD_NAME}',
         ].join('\n'),
       )
     }
@@ -1549,6 +1564,86 @@ describe('Service replicas', () => {
     expect(svc.listReplicas()).toEqual([])
   })
 
+  it("refuses a replica whose effective dev selector still matches the parent's pods", async () => {
+    // What DevSpace resolves (imports, profiles) can differ from the generated
+    // file; the guard must judge the resolved config, not the file.
+    const base = cannedRunner('{"items":[]}', false)
+    const runner = vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
+      if (cmd === loginShell && args[1]?.includes('devspace print'))
+        return {
+          code: 0,
+          stdout: 'version: v2beta1\ndev:\n  common:\n    labelSelector:\n      svc: svc-a\n',
+          stderr: '',
+        }
+      return base(cmd, args)
+    })
+    const { svc } = newService(runner)
+
+    await expect(svc.createReplica('svc-a', 'feature-x')).rejects.toThrow(
+      /Refusing replica svc-a-r1: .*dev\.common\.labelSelector \{svc=svc-a\}/,
+    )
+    expect(runner).toHaveBeenCalledWith('git', [
+      '-C',
+      join(root, 'svc-a'),
+      'worktree',
+      'remove',
+      '--force',
+      join(root, '.devdock-svc-a-r1'),
+    ])
+    expect(svc.listReplicas()).toEqual([])
+    expect(svc.listRepos().some((r) => r.id === 'svc-a-r1')).toBe(false)
+    const shellCmds = runner.mock.calls
+      .filter((c) => c[0] === loginShell)
+      .map((c) => (c[1] as string[])[1] ?? '')
+    expect(shellCmds.some((c) => /devspace (dev|deploy)/.test(c))).toBe(false)
+  })
+
+  it('refuses a replica when DevSpace cannot resolve its config', async () => {
+    const base = cannedRunner('{"items":[]}', false)
+    const runner = vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
+      if (cmd === loginShell && args[1]?.includes('devspace print'))
+        return { code: 1, stdout: '', stderr: 'fatal: error loading imports' }
+      return base(cmd, args)
+    })
+    const { svc } = newService(runner)
+
+    await expect(svc.createReplica('svc-a', 'feature-x')).rejects.toThrow(
+      /devspace print failed: fatal: error loading imports/,
+    )
+    expect(svc.listReplicas()).toEqual([])
+  })
+
+  it('deleteReplica cancels a start still in flight from create', async () => {
+    let releaseStart = () => {}
+    let warms = 0
+    const awsCreds = {
+      configured: () => false,
+      fresh: () => true,
+      // create's own gate passes; the background start parks on the second.
+      warm: () =>
+        ++warms === 1
+          ? Promise.resolve({ ok: true })
+          : new Promise((resolve) => {
+              releaseStart = () => resolve({ ok: true })
+            }),
+    } as unknown as AwsCreds
+    const runner = cannedRunner('{"items":[]}', false)
+    const svc = new Service(
+      { roots: [root], stateFile },
+      { runner, awsCreds, streamSpawner: fakeStreamSpawner().spawner },
+    )
+    svc.rescan()
+
+    await svc.createReplica('svc-a', 'feature-x')
+    await new Promise((r) => setTimeout(r, 10))
+    await svc.deleteReplica('svc-a-r1')
+    releaseStart()
+    await new Promise((r) => setTimeout(r, 10))
+
+    expect(runner.mock.calls.some((c) => c[0] === 'tmux' && c[1][0] === 'new-session')).toBe(false)
+    expect(svc.list().some((s) => s.repo.id === 'svc-a-r1')).toBe(false)
+  })
+
   it('ownImage pins a replica-owned tag and deploys (building) before dev', async () => {
     makeParent()
     const { svc, runner } = newService()
@@ -1691,6 +1786,8 @@ describe('Service replicas', () => {
           stdout: args[1] === 'deployments' ? '{"items":[]}' : podsJson,
           stderr: '',
         }
+      if (cmd === loginShell && args[1]?.includes('devspace print'))
+        return { code: 0, stdout: fakeDevspacePrint(args[1]), stderr: '' }
       return { code: 0, stdout: '', stderr: '' }
     })
     const { svc } = newService(runner)
