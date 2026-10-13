@@ -548,6 +548,9 @@ describe('daemon routes', () => {
         return { code: 0, stdout: 'main\t1700000000\nfeature-x\t1690000000\n', stderr: '' }
       if (cmd === 'tmux' && args[0] === 'has-session') return { code: 1, stdout: '', stderr: '' }
       if (cmd === 'kubectl') return { code: 0, stdout: '{"items":[]}', stderr: '' }
+      // The isolation check reads the resolved config; these have no dev targets.
+      if (args[1]?.includes('devspace print'))
+        return { code: 0, stdout: 'version: v2beta1\n', stderr: '' }
       return { code: 0, stdout: '', stderr: '' }
     })
     const svc = new Service({ roots: [root], stateFile: join(root, 'state.json') }, { runner })

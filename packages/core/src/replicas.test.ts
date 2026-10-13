@@ -6,6 +6,7 @@ import {
   ingressPathOf,
   nextReplicaId,
   replicaCheckoutPath,
+  replicaIsolationProblems,
 } from './replicas.js'
 
 // Verbatim excerpt of a real member config (career-service-agents-api) — the
@@ -111,6 +112,74 @@ dev:
       tier: 'frontend',
     })
     expect(generated.dev.common.container).toBe('career-service-ui-r1')
+  })
+})
+
+describe('replicaIsolationProblems', () => {
+  const effective = (dev: string, deployments = '') =>
+    `version: v2beta1\nname: career-service-ui-r1\ndev:\n${dev}${deployments}`
+
+  it('accepts selectors and releases the replica owns', () => {
+    const ui = effective(
+      '  common:\n    labelSelector:\n      svc: career-service-ui-r1\n',
+      'deployments:\n  web:\n    helm:\n      releaseName: career-service-ui-r1\n',
+    )
+    expect(replicaIsolationProblems(ui, 'career-service-ui-r1')).toEqual([])
+    // Backend workloads carry the type suffix (`${DEVSPACE_NAME}-api`).
+    const api = effective('  common:\n    labelSelector:\n      svc: svc-r1-api\n')
+    expect(replicaIsolationProblems(api, 'svc-r1')).toEqual([])
+  })
+
+  it("flags a selector that resolves to the parent's pods (the career-service-ui incident)", () => {
+    const yaml = effective(
+      '  common:\n    labelSelector:\n      svc: career-service-ui\n    container: career-service-ui\n',
+    )
+    expect(replicaIsolationProblems(yaml, 'career-service-ui-r1')).toEqual([
+      'dev.common.labelSelector {svc=career-service-ui} matches pods the replica does not own',
+    ])
+  })
+
+  it('treats one owned label as enough, since labels are ANDed', () => {
+    const yaml = effective('  common:\n    labelSelector:\n      tier: web\n      svc: svc-r1\n')
+    expect(replicaIsolationProblems(yaml, 'svc-r1')).toEqual([])
+  })
+
+  it('does not mistake a sibling replica or the parent for an owner', () => {
+    for (const svc of ['svc-r10', 'svc', 'svc-r', 'x-svc-r1']) {
+      const yaml = effective(`  common:\n    labelSelector:\n      svc: ${svc}\n`)
+      expect(replicaIsolationProblems(yaml, 'svc-r1')).toHaveLength(1)
+    }
+  })
+
+  it("flags an imageSelector on the parent's image and a target with no selector", () => {
+    const yaml = effective(
+      '  web:\n    imageSelector: ecr/devspace:ns-svc\n  worker:\n    container: svc\n',
+    )
+    expect(replicaIsolationProblems(yaml, 'svc-r1')).toEqual([
+      "dev.web.imageSelector ecr/devspace:ns-svc can match the parent's pods",
+      'dev.worker has no labelSelector or imageSelector',
+    ])
+    const own = effective('  web:\n    imageSelector: ecr/devspace:ns-svc-r1-api\n')
+    expect(replicaIsolationProblems(own, 'svc-r1')).toEqual([])
+  })
+
+  it("flags a helm release that is the parent's, including the key-name default", () => {
+    const yaml = effective(
+      '  common:\n    labelSelector:\n      svc: svc-r1\n',
+      'deployments:\n  app:\n    helm:\n      releaseName: svc\n  web:\n    helm: {}\n',
+    )
+    expect(replicaIsolationProblems(yaml, 'svc-r1')).toEqual([
+      "deployments.app helm release svc is not the replica's",
+      "deployments.web helm release web is not the replica's",
+    ])
+  })
+
+  it('skips login-shell noise before the config and fails closed on junk', () => {
+    const noisy = `motd line\n${effective('  common:\n    labelSelector:\n      svc: svc-r1\n')}`
+    expect(replicaIsolationProblems(noisy, 'svc-r1')).toEqual([])
+    expect(replicaIsolationProblems('', 'svc-r1')).toEqual([
+      'effective DevSpace config could not be read',
+    ])
   })
 })
 

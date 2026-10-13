@@ -64,6 +64,68 @@ export function generateReplicaConfig(
   return doc.toString()
 }
 
+/** Why a replica's effective DevSpace config (`devspace print` output: imports
+ *  merged, profiles applied, vars resolved) could reach workloads it does not
+ *  own; empty when isolated. `devspace dev` replaces and syncs into whatever
+ *  its dev selector matches, so a selector resolving to the parent's labels
+ *  attaches to the parent's dev pod and two bidirectional syncs fight over one
+ *  /app. Fails closed: anything not provably replica-owned is a problem. */
+export function replicaIsolationProblems(effectiveYaml: string, replicaId: string): string[] {
+  // Login shells may print noise before the config; it starts at `version:`.
+  const start = effectiveYaml.search(/^version:/m)
+  let config: unknown
+  try {
+    config = parseDocument(start > 0 ? effectiveYaml.slice(start) : effectiveYaml).toJS()
+  } catch {
+    config = undefined
+  }
+  if (!isRecord(config)) return ['effective DevSpace config could not be read']
+
+  const ownsLabel = (value: unknown) =>
+    typeof value === 'string' && (value === replicaId || value.startsWith(`${replicaId}-`))
+  // Image refs embed the name inside a tag (`repo:<ns>-<replicaId>-api`).
+  const ownedImage = new RegExp(`(^|[^A-Za-z0-9])${escapeRegExp(replicaId)}($|-)`)
+  const problems: string[] = []
+  for (const [name, target] of Object.entries(isRecord(config.dev) ? config.dev : {})) {
+    if (!isRecord(target)) continue
+    const labels = isRecord(target.labelSelector) ? target.labelSelector : undefined
+    const image = target.imageSelector
+    if (!labels && image === undefined) {
+      problems.push(`dev.${name} has no labelSelector or imageSelector`)
+      continue
+    }
+    // Labels are ANDed, so one replica-owned label confines the match.
+    if (labels && !Object.values(labels).some(ownsLabel)) {
+      const shown = Object.entries(labels)
+        .map(([key, value]) => `${key}=${String(value)}`)
+        .join(', ')
+      problems.push(`dev.${name}.labelSelector {${shown}} matches pods the replica does not own`)
+    }
+    if (image !== undefined && !(typeof image === 'string' && ownedImage.test(image))) {
+      problems.push(`dev.${name}.imageSelector ${String(image)} can match the parent's pods`)
+    }
+  }
+  for (const [name, deployment] of Object.entries(
+    isRecord(config.deployments) ? config.deployments : {},
+  )) {
+    if (!isRecord(deployment) || !isRecord(deployment.helm)) continue
+    // DevSpace defaults the release name to the deployment key.
+    const release = deployment.helm.releaseName ?? name
+    if (!ownsLabel(release)) {
+      problems.push(`deployments.${name} helm release ${String(release)} is not the replica's`)
+    }
+  }
+  return problems
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
 /** The URL path segment a config's chart-created ingress serves it under:
  *  `vars.INGRESS_PATH` (plain or `{ default: … }` form), else the project
  *  name. */
