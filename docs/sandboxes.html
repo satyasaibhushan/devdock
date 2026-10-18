@@ -132,7 +132,7 @@
 }
 <span class="k">interface</span> ActivityEntry { at: number, actor: string, action: string, detail?: string }</pre>
   <ul>
-    <li><b>Power</b> (<code>awake | asleep | partial</code>) is derived from the cluster on each reconcile, never stored.</li>
+    <li><b>Power</b> (<code>awake | asleep | partial</code>; <code>unknown</code> when cluster reads fail) is derived from the cluster on each reconcile, never stored.</li>
     <li><b>actor</b> is required on every mutation: <code>you</code>, <code>agent:&lt;name&gt;</code>, <code>poller</code>, <code>sleeper</code>, <code>expiry</code>.</li>
     <li><b>Personal sandbox</b>: the kube context namespace (<code>saibhushan</code>) is shown as a sandbox whose members are today's repos in <code>dev</code> mode. It is a view over existing repo state, not a record, and keeps today's runtime behaviour exactly.</li>
     <li>Workers and crons default to 0 replicas: they would consume UAT's SQS messages. A member must name them explicitly.</li>
@@ -141,7 +141,7 @@
   <h2 id="slots">4 · Namespace slots</h2>
   <ul>
     <li>The pool is <code>DEVDOCK_SANDBOX_NAMESPACES</code> (comma list), e.g. <code>saibhushan-sb1,saibhushan-sb2</code>. Infra creates them once with <code>dev-env env:create &lt;slot&gt; --owner_uid &lt;email&gt;</code>.</li>
-    <li>A sandbox leases one free slot on create or rebuild. The lease is a ConfigMap <code>devdock-sandbox</code> in the slot holding <code>{key, instanceId, members, shas}</code>. A slot whose ConfigMap names another key is busy.</li>
+    <li>A sandbox leases one free slot on create or rebuild. The lease is a ConfigMap <code>devdock-sandbox</code> in the slot holding <code>{key, instanceId, members, shas}</code>. A slot whose ConfigMap names another key is busy. An operation claim in the same ConfigMap serializes lifecycle mutations across instances using resourceVersion compare-and-swap. It is separate from controller leadership.</li>
     <li>Pool size caps concurrent sandboxes, ECR tags (<code>IMAGE_TAG</code> is <code>&lt;slot&gt;-&lt;workload&gt;</code>, overwritten per build) and cost.</li>
     <li>The personal namespace may be listed as a slot for trials. A member whose release is held by a live dev session there is refused, never clobbered.</li>
     <li>URLs are read from the slot's Ingress objects (authoritative), e.g. <code>dashboard-&lt;slot&gt;.vmock.dev</code>, <code>api-&lt;slot&gt;-&lt;team&gt;.vmock.dev/&lt;svc&gt;</code>. The UI shows ticket → URL, so slot names never matter to the reader.</li>
@@ -149,8 +149,8 @@
 
   <h2 id="build">5 · Building a member</h2>
   <ol>
-    <li>Worktree: detached checkout at <code>headSha</code> beside the parent checkout (same placement rule as replicas: outside any sync root), path <code>../.devdock-sb-&lt;slot&gt;-&lt;repo&gt;</code>. PR heads are fetched as <code>pull/&lt;n&gt;/head</code> from the PR's repo, so fork PRs work.</li>
-    <li>Env: <code>devspace run sync-env</code> in the worktree with <code>--var ENVIRONMENT_NAME=&lt;slot&gt;</code>, so <code>prepare_local_env</code> rewrites hosts for the slot.</li>
+    <li>Worktree: detached checkout at <code>headSha</code> beside the parent checkout (same placement rule as replicas: outside any sync root), path <code>../.devdock-sb-&lt;slot&gt;-&lt;member-hash&gt;</code> (a stable hash of repo + workload, so two workloads of one repo can use different heads). PR heads are fetched as <code>pull/&lt;n&gt;/head</code> from the PR's repo, so fork PRs work.</li>
+    <li>Env: <code>devspace run-pipeline sync-env</code> in the worktree with <code>--var ENVIRONMENT_NAME=&lt;slot&gt;</code>, so <code>prepare_local_env</code> rewrites hosts for the slot.</li>
     <li>Deploy: <code>devspace deploy -n &lt;slot&gt; -p persistent</code> with vars <code>ENVIRONMENT_NAME=&lt;slot&gt;</code>, <code>WORKLOAD_TYPE=&lt;workload&gt;</code>, <code>API_PERSISTENT_REPLICAS</code>/<code>WEB_PERSISTENT_REPLICAS</code> = current power (0 asleep, 1 awake), <code>CRON_/WORKER_PERSISTENT_REPLICAS=0</code> unless named.</li>
     <li>Placement: the <code>persistent</code> profile pins <code>nodeSelector: workload: products</code> (the UAT nodegroup). A generated, untracked config in the worktree adds a values file setting <code>workload: development</code> so sandboxes never consume UAT capacity.</li>
     <li>Same tag every build, so an awake member gets a <code>rollout restart</code> after a successful deploy.</li>
@@ -171,7 +171,7 @@
    any state ──(explicit delete by agent or you)──▶ gone</pre>
   <ul>
     <li><b>Used</b> = wake, build, or any mutating MCP/UI call. Request traffic is not tracked.</li>
-    <li><b>Expire</b>: reset every member release in the slot to its default (UAT proxy for api, purge for others; the same as <code>devspace purge</code>), delete the slot ConfigMap, remove worktrees, free the slot. Keep key, members, last shas, activity.</li>
+    <li><b>Expire</b>: reset every member release in the slot to its default (UAT proxy for api, purge for others; a generated reset pipeline runs <code>create_deployments default</code> for api and <code>purge_deployments</code> for other members; the shared UI purge pipeline restores a proxy, so it cannot implement the non-api rule directly), delete the slot ConfigMap, remove worktrees, free the slot. Keep key, members, last shas, activity.</li>
     <li><b>Rebuild</b>: lease a slot, build every member at current head, leave asleep unless asked to wake.</li>
     <li><b>Merged PRs</b>: member gets <code>merged: true</code> and stops building. Never auto-deletes. When all members are merged, status says so for an agent to act on.</li>
     <li><b>Delete</b>: explicit only. Expires first if active, then removes the record.</li>
@@ -195,11 +195,13 @@
     <tr><td><code>devdock_sandbox_build {key, repo?, force?, actor}</code></td><td>/mcp/rw</td><td>stale members, or all with force; on an expired sandbox this is the rebuild</td></tr>
     <tr><td><code>devdock_sandbox_wake</code> / <code>_sleep {key, actor}</code></td><td>/mcp/rw</td><td>wake may build first</td></tr>
     <tr><td><code>devdock_sandbox_delete {key, actor}</code></td><td>/mcp/rw</td><td>the only deleting call</td></tr>
+    <tr><td><code>devdock_sandbox_expire {key, actor}</code></td><td>/mcp/rw</td><td>Free the slot and retain the record; also callable by the later controller.</td></tr>
+    <tr><td><code>devdock_sandbox_head {key, repo, workload, sha, merged?, actor}</code></td><td>/mcp/rw</td><td>Record an observed head and optional merged state without starting a build.</td></tr>
   </table>
-  <p>Logs and exec reuse <code>devdock_logs</code> / <code>devdock_exec</code> with an optional <code>sandbox</code> param. A test asserts every public sandbox method on the core service has an MCP tool, so the MCP surface cannot drift behind the UI.</p>
+  <p>Logs and exec reuse <code>devdock_logs</code> / <code>devdock_exec</code> with an optional <code>sandbox</code> param. Sandbox exec also requires <code>actor</code> and runs in the member deployment through kubectl instead of a dev session. A test asserts every public sandbox method on the core service has an MCP tool, so the MCP surface cannot drift behind the UI.</p>
 
   <h2 id="http">10 · HTTP</h2>
-  <p><code>GET /sandboxes</code>, <code>GET /sandboxes/:key</code>, <code>POST /sandboxes</code>, <code>PATCH /sandboxes/:key</code>, <code>POST /sandboxes/:key/{build,wake,sleep}</code>, <code>DELETE /sandboxes/:key</code>. Sandbox changes are pushed over the existing websocket as <code>sandbox</code> events.</p>
+  <p><code>GET /sandboxes</code>, <code>GET /sandboxes/:key</code>, <code>POST /sandboxes</code>, <code>PATCH /sandboxes/:key</code>, <code>POST /sandboxes/:key/{build,wake,sleep}</code>, <code>DELETE /sandboxes/:key</code>. Read-only discovery is <code>GET /sandboxes/:key/discover</code>; controller parity adds <code>POST /sandboxes/:key/{expire,head}</code>. Every mutating body requires <code>actor</code>. Sandbox changes are pushed over the existing websocket as <code>sandbox</code> events.</p>
 
   <h2 id="controller">11 · Controller</h2>
   <ul>

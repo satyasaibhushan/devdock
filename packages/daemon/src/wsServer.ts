@@ -110,9 +110,12 @@ function send(ws: WebSocket, obj: unknown): void {
 function handleEvents(ws: WebSocket, service: Service): void {
   const onStatus = (s: RepoState) => send(ws, { type: 'status', state: s })
   const onCrash = (e: CrashEvent) => send(ws, { type: 'crash', event: e })
+  const onSandbox = (sandbox: unknown) => send(ws, { type: 'sandbox', sandbox })
+  service.events.on('sandbox', onSandbox)
   service.events.on('status', onStatus)
   service.events.on('crash', onCrash)
   ws.on('close', () => {
+    service.events.off('sandbox', onSandbox)
     service.events.off('status', onStatus)
     service.events.off('crash', onCrash)
   })

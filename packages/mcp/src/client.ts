@@ -14,6 +14,11 @@ import type {
   ReplicaRecord,
   RepoState,
   RunOutcome,
+  SandboxBuild,
+  SandboxCreate,
+  SandboxMemberInput,
+  SandboxUpdate,
+  SandboxView,
   TermInfo,
   WaitResult,
   WorkflowAction,
@@ -51,6 +56,7 @@ export interface TermOpenOpts {
 }
 
 export interface LogQueryOpts {
+  sandbox?: string
   workload?: string
   source?: LogSource
   cursor?: string
@@ -70,6 +76,21 @@ export interface WaitOpts {
 
 /** The subset of the daemon HTTP contract the MCP tools call. */
 export interface DaemonClient {
+  sandboxList?(): Promise<SandboxView[]>
+  sandboxStatus?(key: string): Promise<SandboxView>
+  sandboxDiscover?(key: string): Promise<SandboxMemberInput[]>
+  sandboxCreate?(input: SandboxCreate): Promise<{ operationId: string }>
+  sandboxUpdate?(key: string, input: SandboxUpdate): Promise<{ operationId: string }>
+  sandboxBuild?(key: string, input: SandboxBuild): Promise<{ operationId: string }>
+  sandboxAction?(
+    key: string,
+    action: 'wake' | 'sleep' | 'expire' | 'delete',
+    actor: string,
+  ): Promise<{ operationId: string }>
+  sandboxHead?(
+    key: string,
+    input: { repo: string; workload: string; sha: string; actor: string; merged?: boolean },
+  ): Promise<void>
   beginOperation?(repo: string, action: WorkflowAction, workload?: string): Promise<Operation>
   operations?(repo?: string): Promise<Operation[]>
   operation?(id: string): Promise<Operation>
@@ -89,10 +110,16 @@ export interface DaemonClient {
   runIn(
     id: string,
     command: string,
-    opts?: { workload?: string; timeoutMs?: number },
+    opts?: { workload?: string; timeoutMs?: number; sandbox?: string; actor?: string },
   ): Promise<WorkloadRunResult>
   wait(id: string, opts: WaitOpts): Promise<WaitResult>
-  exec(id: string, command: string, workload?: string): Promise<ExecResult>
+  exec(
+    id: string,
+    command: string,
+    workload?: string,
+    sandbox?: string,
+    actor?: string,
+  ): Promise<ExecResult>
   setStartup(id: string, command: string, workload?: string): Promise<void>
   namespace(): Promise<NamespaceInfo>
   setNamespace(ns: string): Promise<NamespaceInfo>
@@ -207,6 +234,26 @@ export function daemonClient(send: DaemonTransport, prefix = ''): DaemonClient {
   })
 
   return {
+    sandboxList: () => request('/sandboxes'),
+    sandboxStatus: (key) => request(`/sandboxes/${id(key)}`),
+    sandboxDiscover: (key) => request(`/sandboxes/${id(key)}/discover`),
+    sandboxCreate: (input) => post('/sandboxes', input),
+    sandboxUpdate: (key, input) =>
+      request(`/sandboxes/${id(key)}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(input),
+      }),
+    sandboxBuild: (key, input) => post(`/sandboxes/${id(key)}/build`, input),
+    sandboxAction: (key, action, actor) =>
+      action === 'delete'
+        ? request(`/sandboxes/${id(key)}`, {
+            method: 'DELETE',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ actor }),
+          })
+        : post(`/sandboxes/${id(key)}/${action}`, { actor }),
+    sandboxHead: (key, input) => post(`/sandboxes/${id(key)}/head`, input),
     beginOperation: (repo, action, workload) =>
       post(`/repos/${id(repo)}/operations`, { action, workload }),
     operations: (repo) => request(`/operations${repo ? `?repo=${id(repo)}` : ''}`),
@@ -246,8 +293,11 @@ export function daemonClient(send: DaemonTransport, prefix = ''): DaemonClient {
     runIn: (i, command, opts = {}) =>
       post<WorkloadRunResult>(`/repos/${id(i)}/run`, { command, ...opts }),
     wait: (i, opts) => post<WaitResult>(`/repos/${id(i)}/wait`, opts),
-    exec: async (i, command, workload) => {
-      const r = await post<Partial<ExecResult>>(`/repos/${id(i)}/exec${wl(workload)}`, { command })
+    exec: async (i, command, workload, sandbox, actor) => {
+      const r = await post<Partial<ExecResult>>(
+        `/repos/${id(i)}/exec?${new URLSearchParams({ ...(workload ? { workload } : {}), ...(sandbox ? { sandbox } : {}) })}`,
+        { command, ...(actor !== undefined ? { actor } : {}) },
+      )
       return { ...asVerb(r), stdout: r.stdout ?? '' }
     },
     setStartup: async (i, command, workload) => {

@@ -177,6 +177,9 @@ describe('toolsForScope', () => {
   it('ro scope exposes only the read tools', () => {
     const names = toolsForScope(fakeClient(), 'ro').map((t) => t.name)
     expect(names).toEqual([
+      'devdock_sandbox_list',
+      'devdock_sandbox_status',
+      'devdock_sandbox_discover',
       'devdock_operation_status',
       'devdock_operations',
       'devdock_checkout',
@@ -196,6 +199,17 @@ describe('toolsForScope', () => {
   it('rw scope adds every verb, exec, namespace/auth/startup writes and terminal control', () => {
     const names = toolsForScope(fakeClient(), 'rw').map((t) => t.name)
     expect(names).toEqual([
+      'devdock_sandbox_list',
+      'devdock_sandbox_status',
+      'devdock_sandbox_discover',
+      'devdock_sandbox_create',
+      'devdock_sandbox_update',
+      'devdock_sandbox_build',
+      'devdock_sandbox_wake',
+      'devdock_sandbox_sleep',
+      'devdock_sandbox_expire',
+      'devdock_sandbox_delete',
+      'devdock_sandbox_head',
       'devdock_operation_start',
       'devdock_operation_status',
       'devdock_operations',

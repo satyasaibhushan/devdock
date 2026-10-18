@@ -8,6 +8,7 @@ import Fastify, { type FastifyInstance, type FastifyReply } from 'fastify'
 import type { AccessGate } from './accessGate.js'
 import { type Instances, peerPathAllowed } from './instances.js'
 import { type InstanceCall, type MoveFollowUp, moveDeployment, planMove } from './move.js'
+import { sandboxRoutes } from './sandboxRoutes.js'
 import { copyStartupCommands } from './startup.js'
 
 const parseJson = (text: string): unknown => {
@@ -380,11 +381,36 @@ export function buildApp(
 
   app.post('/replicas/gc', async () => ({ deleted: await service.gcReplicas() }))
 
+  app.register(async (sandboxApp) => {
+    sandboxApp.addHook('preValidation', async (req, reply) => {
+      if (req.method === 'GET') return
+      const body = req.body as { actor?: unknown } | undefined
+      if (typeof body?.actor !== 'string' || !body.actor.trim())
+        return reply.code(400).send({ error: 'actor required' })
+    })
+    sandboxApp.setErrorHandler((error, _req, reply) => {
+      const message = error instanceof Error ? error.message : String(error)
+      const status = message.includes('unknown sandbox')
+        ? 404
+        : /required|Invalid|Duplicate|unknown workload|unknown repo/.test(message)
+          ? 400
+          : 409
+      reply.code(status).send({ error: message })
+    })
+    sandboxRoutes(sandboxApp, service)
+  })
+
   // One-shot command in the workload's pod with a REAL exit code (kubectl
   // exec) — the agent-loop counterpart to /exec's fire-and-forget send-keys.
   app.post<{
     Params: { id: string }
-    Body: { command?: string; workload?: string; timeoutMs?: number }
+    Body: {
+      command?: string
+      workload?: string
+      timeoutMs?: number
+      sandbox?: string
+      actor?: string
+    }
   }>('/repos/:id/run', async (req, reply) => {
     const command = req.body?.command
     if (typeof command !== 'string' || !command.trim()) {
@@ -394,6 +420,8 @@ export function buildApp(
       return await service.runInWorkload(req.params.id, command, {
         workload: req.body?.workload,
         timeoutMs: req.body?.timeoutMs,
+        sandbox: req.body?.sandbox,
+        actor: req.body?.actor,
       })
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
@@ -406,6 +434,7 @@ export function buildApp(
   app.get<{
     Params: { id: string }
     Querystring: {
+      sandbox?: string
       source?: string
       cursor?: string
       tail?: string
@@ -421,6 +450,7 @@ export function buildApp(
     try {
       return await service.queryLogs(req.params.id, {
         source: source as 'auto' | 'application' | 'container' | 'devdock' | undefined,
+        sandbox: req.query.sandbox,
         cursor,
         contains,
         workload,
@@ -477,14 +507,29 @@ export function buildApp(
 
   app.post<{
     Params: { id: string }
-    Querystring: { workload?: string }
-    Body: { command?: string }
+    Querystring: { workload?: string; sandbox?: string }
+    Body: { command?: string; actor?: string }
   }>('/repos/:id/exec', async (req, reply) => {
     const command = req.body?.command
     if (typeof command !== 'string' || !command.trim()) {
       return reply.code(400).send({ error: 'command required' })
     }
     try {
+      if (req.query.sandbox) {
+        if (typeof req.body.actor !== 'string' || !req.body.actor.trim())
+          return reply.code(400).send({ error: 'actor required' })
+        const result = await service.runInWorkload(req.params.id, command, {
+          workload: req.query.workload,
+          sandbox: req.query.sandbox,
+          actor: req.body.actor,
+        })
+        return {
+          ok: result.ok,
+          code: result.exitCode,
+          stdout: result.stdout,
+          stderr: result.stderr,
+        }
+      }
       const result = await service.exec(req.params.id, command, req.query.workload)
       return {
         ok: result.code === 0,

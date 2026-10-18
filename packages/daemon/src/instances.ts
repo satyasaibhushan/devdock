@@ -77,11 +77,14 @@ export function peerPathAllowed(path: string, terminals: boolean): boolean {
       '/auth/clear',
       '/namespace',
       '/repos',
+      '/sandboxes',
       '/replicas',
       '/replicas/gc',
       '/events',
     ].includes(pathname)
   )
+    return true
+  if (/^\/sandboxes\/[^/]+(?:\/(?:discover|build|wake|sleep|expire|head))?$/.test(pathname))
     return true
   if (
     /^\/repos\/[a-zA-Z0-9_.-]+(?:\/(?:checkout|prerequisites|operations|pods|logs(?:\/query)?|branches|replicas|run|wait|exec|startup|start|build|build-start|restart|destroy|adopt|clear|stop-session|release|take-over))?$/.test(
@@ -337,11 +340,11 @@ export class Instances {
     this.identity = loadIdentity(directory)
     const file = join(directory, 'instances.json')
     if (existsSync(file)) {
-      for (const link of JSON.parse(readFileSync(file, 'utf8')) as InstanceLink[]) {
+      for (let link of JSON.parse(readFileSync(file, 'utf8')) as InstanceLink[]) {
         validateLink(link.host, link.endpoint)
         if (!localEndpoint) {
-          delete link.returnId
-          delete link.returnEndpoint
+          const { returnId: _returnId, returnEndpoint: _returnEndpoint, ...outbound } = link
+          link = outbound
         }
         this.links.set(
           link.id,
