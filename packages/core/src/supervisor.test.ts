@@ -453,3 +453,33 @@ describe('shellQuote', () => {
     expect(shellQuote("a'b")).toBe("'a'\\''b'")
   })
 })
+
+it('runs sandbox pipelines with slot vars, persistent placement, and only the selected replicas', async () => {
+  const calls: string[] = []
+  const supervisor = new Supervisor(async (_cmd, args) => {
+    calls.push(args.join(' '))
+    return { code: 0, stdout: '', stderr: '' }
+  })
+  const repo = {
+    id: 'app',
+    name: 'app',
+    path: '/tmp/app',
+    configPath: '/tmp/app/devspace.yaml',
+    ports: [],
+    session: 'app',
+    namespace: 'slot1',
+    varDefaults: { ENVIRONMENT_NAME: 'slot1', WORKLOAD_TYPE: 'worker', QUESTION: 'default' },
+  }
+  await supervisor.sandbox(repo, 'sync')
+  await supervisor.sandbox(repo, 'deploy', true)
+  await supervisor.sandbox(repo, 'reset')
+  expect(calls[0]).toContain('run-pipeline sync-env')
+  expect(calls[1]).toContain('deploy -p persistent -p sandbox')
+  expect(calls[1]).toContain("'WORKER_PERSISTENT_REPLICAS=1'")
+  expect(calls[1]).toContain("'API_PERSISTENT_REPLICAS=0'")
+  expect(calls[1]).toContain("'CRON_PERSISTENT_REPLICAS=0'")
+  expect(calls[1]).toContain("'ENVIRONMENT_NAME=slot1'")
+  expect(calls[1]).toContain("'QUESTION=default'")
+  expect(calls[1]).toContain("-n 'slot1'")
+  expect(calls[2]).toContain('run-pipeline sandbox-reset')
+})

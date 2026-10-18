@@ -11,6 +11,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { dirname } from 'node:path'
+import type { Sandbox } from './sandboxes.js'
 import type { RepoStatus, TermMode } from './types.js'
 
 /** A persisted read-write grant for a repo's terminal (spec §2, §8). */
@@ -52,6 +53,7 @@ export interface ReplicaRecord {
 }
 
 interface Persisted {
+  sandboxes: Record<string, Sandbox>
   /** last-known status per repo id, keyed for fast lookup across restarts. */
   status: Record<string, RepoStatus>
   grants: Grant[]
@@ -77,6 +79,7 @@ interface Persisted {
 }
 
 const EMPTY: Persisted = {
+  sandboxes: {},
   status: {},
   grants: [],
   startup: {},
@@ -99,6 +102,7 @@ export class StateStore {
     try {
       const parsed = JSON.parse(readFileSync(file, 'utf8')) as Partial<Persisted>
       return {
+        sandboxes: parsed.sandboxes ?? {},
         status: parsed.status ?? {},
         grants: parsed.grants ?? [],
         startup: parsed.startup ?? {},
@@ -246,6 +250,29 @@ export class StateStore {
   setSessionNamespace(key: string, ns: string | undefined): void {
     if (ns) this.data.sessionNamespaces[key] = ns
     else delete this.data.sessionNamespaces[key]
+    this.flush()
+  }
+
+  listSandboxes(): Sandbox[] {
+    return Object.values(this.data.sandboxes)
+  }
+
+  getSandbox(key: string): Sandbox | undefined {
+    return Object.hasOwn(this.data.sandboxes, key) ? this.data.sandboxes[key] : undefined
+  }
+
+  setSandbox(sandbox: Sandbox): void {
+    Object.defineProperty(this.data.sandboxes, sandbox.key, {
+      value: sandbox,
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    })
+    this.flush()
+  }
+
+  removeSandbox(key: string): void {
+    delete this.data.sandboxes[key]
     this.flush()
   }
 

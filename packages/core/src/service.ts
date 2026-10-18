@@ -24,6 +24,13 @@ import {
   replicaCheckoutPath,
   replicaIsolationProblems,
 } from './replicas.js'
+import {
+  type SandboxBuild,
+  type SandboxCreate,
+  type SandboxUpdate,
+  Sandboxes,
+  requireActor,
+} from './sandboxes.js'
 import { type ReplicaRecord, StateStore } from './stateStore.js'
 import { type SessionState, type StreamRunner, Supervisor, verbLabel } from './supervisor.js'
 import { type RunOutcome, type TermInfo, type TermKind, TermRegistry } from './termRegistry.js'
@@ -88,6 +95,7 @@ const NAMESPACE_RE = /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/
 export type LogSource = 'auto' | 'application' | 'container' | 'devdock'
 
 export interface LogQueryOptions {
+  sandbox?: string
   workload?: string
   source?: LogSource
   /** Opaque cursor from a previous query — returns only what happened since. */
@@ -242,6 +250,7 @@ export class Service {
   private readonly awsCreds: AwsCreds
   /** All terminals: id → live PTY session + scrollback (spec §8). */
   private readonly terms = new TermRegistry()
+  private readonly sandboxes: Sandboxes
   private readonly operations: Operations
   private readonly operationTasks = new Map<string, Promise<void>>()
   private stopped = false
@@ -310,6 +319,96 @@ export class Service {
     this.streamSpawner = deps.streamSpawner ?? spawnStream
     this.store = new StateStore(this.opts.stateFile)
     this.operations = new Operations(`${this.opts.stateFile}.operations`)
+    this.sandboxes = new Sandboxes({
+      store: this.store,
+      operations: this.operations,
+      runner: this.runner,
+      kubectl: this.kubectl,
+      supervisor: this.supervisor,
+      instanceId: opts.instanceId ?? '',
+      repos: () => [...this.repos.values()],
+      namespace: () => this.contextNamespace(),
+      emit: (sandbox) => this.events.emit('sandbox', sandbox),
+      authorize: async (id, build = true) => {
+        const denied =
+          (await this.ensureAuth(id)) ?? (build ? await this.ensureAwsCreds(id) : undefined)
+        if (denied) throw new Error(denied.stderr || 'auth required')
+      },
+      assertAvailable: async (repo, namespace) => {
+        if (namespace !== (await this.contextNamespace())) return
+        const owners = this.ownership ? await this.ownership.owners(namespace) : {}
+        const state = await this.reconciler.reconcileWorkload(
+          { ...repo, namespace },
+          await this.supervisor.hasSession(repo),
+          newClusterCache(),
+          repo.workloadType ?? '',
+        )
+        if (
+          state.unreachable ||
+          state.hasSession ||
+          state.pods.some((pod) => pod.name.includes('-devspace')) ||
+          owners[repo.name]
+        )
+          throw new Error(`Live dev session holds ${repo.name} in personal namespace`)
+      },
+    })
+  }
+
+  private async sandboxTarget(key: string, id: string, workload?: string): Promise<Repo> {
+    const sandbox = await this.sandboxes.status(key)
+    if (sandbox.personal) throw new Error('Use ordinary repo tools for personal dev sessions')
+    if (!sandbox.slot) throw new Error('Sandbox expired; rebuild first')
+    const matches = sandbox.members.filter(
+      (m) => m.repo === id && (workload === undefined || m.workload === workload),
+    )
+    const member = matches[0]
+    if (!member || matches.length !== 1) throw new Error('Select one sandbox member workload')
+    const parent = this.repoOrThrow(id)
+    const repo =
+      parent.workloads?.length || parent.members?.length
+        ? scopeRepo(parent, member.workload)
+        : parent
+    return { ...repo, namespace: sandbox.slot }
+  }
+
+  listSandboxes() {
+    return this.sandboxes.list()
+  }
+  sandboxStatus(key: string) {
+    return this.sandboxes.status(key)
+  }
+  discoverSandbox(key: string) {
+    return this.sandboxes.discover(key)
+  }
+  createSandbox(input: SandboxCreate) {
+    return this.sandboxes.create(input)
+  }
+  updateSandbox(key: string, input: SandboxUpdate) {
+    return this.sandboxes.update(key, input)
+  }
+  buildSandbox(key: string, input: SandboxBuild) {
+    return this.sandboxes.build(key, input)
+  }
+  wakeSandbox(key: string, actor: string) {
+    return this.sandboxes.wake(key, actor)
+  }
+  sleepSandbox(key: string, actor: string) {
+    return this.sandboxes.sleep(key, actor)
+  }
+  expireSandbox(key: string, actor: string) {
+    return this.sandboxes.expire(key, actor)
+  }
+  deleteSandbox(key: string, actor: string) {
+    return this.sandboxes.delete(key, actor)
+  }
+  recordHead(
+    key: string,
+    member: { repo: string; workload: string },
+    sha: string,
+    actor: string,
+    merged?: boolean,
+  ) {
+    return this.sandboxes.recordHead(key, member, sha, actor, merged)
   }
 
   async checkout(id: string, workload?: string) {
@@ -477,6 +576,7 @@ export class Service {
 
   private recoverOperations(): void {
     for (const op of this.operations.list().filter((r) => r.state === 'active')) {
+      if (op.repo.startsWith('sandbox:')) continue
       const state = this.states.get(op.repo)?.workloads.find((w) => w.type === op.workload)
       let namespace: string | undefined
       try {
@@ -1929,8 +2029,38 @@ export class Service {
   async runInWorkload(
     id: string,
     command: string,
-    opts: { workload?: string; timeoutMs?: number } = {},
+    opts: { workload?: string; timeoutMs?: number; sandbox?: string; actor?: string } = {},
   ): Promise<WorkloadRunResult> {
+    if (opts.sandbox) {
+      requireActor(opts.actor ?? '')
+      const repo = await this.sandboxTarget(opts.sandbox, id, opts.workload)
+      await this.sandboxes.recordExec(opts.sandbox, opts.actor as string)
+      const r = await this.kubectl(
+        'kubectl',
+        [
+          'exec',
+          `deployment/${repo.name}`,
+          '-n',
+          repo.namespace as string,
+          '--',
+          'sh',
+          '-c',
+          command,
+        ],
+        {
+          timeoutMs: Math.min(opts.timeoutMs ?? RUN_TIMEOUT_DEFAULT_MS, RUN_TIMEOUT_MAX_MS),
+          maxOutputBytes: RUN_MAX_OUTPUT_BYTES,
+        },
+      )
+      return {
+        ok: r.code === 0,
+        exitCode: r.code,
+        stdout: r.stdout,
+        stderr: r.stderr,
+        timedOut: r.timedOut === true,
+        truncated: r.truncated === true,
+      }
+    }
     const { repo, type, key } = this.scoped(id, opts.workload)
     await this.claimOwnership(repo)
     const fail = (infraError: string, pod?: string): WorkloadRunResult => ({
@@ -1972,6 +2102,24 @@ export class Service {
    *  unparseable cursor resyncs from the tail (flagged via `resync`) instead
    *  of erroring — mirrors the Kubernetes watch 410 Gone pattern. */
   async queryLogs(id: string, opts: LogQueryOptions = {}): Promise<LogQueryResult> {
+    if (opts.sandbox) {
+      if (opts.source && opts.source !== 'auto' && opts.source !== 'container')
+        throw new Error('Sandbox logs require container source')
+      const repo = await this.sandboxTarget(opts.sandbox, id, opts.workload)
+      const cursor = decodeCursor(opts.cursor)
+      const now = new Date().toISOString()
+      const args = ['logs', `deployment/${repo.name}`, '-n', repo.namespace as string]
+      if (cursor?.kind === 'container') args.push(`--since-time=${cursor.sinceTime}`)
+      else args.push('--tail', String(Math.min(Math.max(opts.tail ?? 200, 0), 2000)))
+      const r = await this.kubectl('kubectl', args, { timeoutMs: 30_000 })
+      if (r.code !== 0) throw new Error(`kubectl logs failed: ${r.stderr}`)
+      return {
+        source: 'container',
+        lines: nonEmptyLines(r.stdout).filter((l) => !opts.contains || l.includes(opts.contains)),
+        cursor: encodeCursor({ kind: 'container', sinceTime: now }),
+        resync: opts.cursor !== undefined && cursor?.kind !== 'container',
+      }
+    }
     const { type, key } = this.scoped(id, opts.workload)
     const tail = Math.min(Math.max(opts.tail ?? 200, 0), 2000)
     const cursor = decodeCursor(opts.cursor)
@@ -2316,6 +2464,7 @@ export class Service {
     this.rescan()
     await this.reconcileAll()
     this.stopped = false
+    await this.sandboxes.recover()
     this.recoverOperations()
     // Record ownership for already-running managed sessions after discovery.
     for (const state of this.list()) {

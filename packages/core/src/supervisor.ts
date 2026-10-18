@@ -172,6 +172,29 @@ export class Supervisor {
     return r.code === 0 && r.stdout.trim() === '1'
   }
 
+  sandbox(repo: Repo, action: 'sync' | 'deploy' | 'reset', awake = false): Promise<RunResult> {
+    prepareWorkloadConfig(repo)
+    const replicas = awake ? '1' : '0'
+    const type = repo.varDefaults?.WORKLOAD_TYPE
+    const target = {
+      ...repo,
+      varDefaults: {
+        ...repo.varDefaults,
+        API_PERSISTENT_REPLICAS: type === 'api' ? replicas : '0',
+        WEB_PERSISTENT_REPLICAS: type === 'ui' ? replicas : '0',
+        WORKER_PERSISTENT_REPLICAS: type === 'worker' ? replicas : '0',
+        CRON_PERSISTENT_REPLICAS: type === 'cron' ? replicas : '0',
+      },
+    }
+    const verb =
+      action === 'sync'
+        ? 'run-pipeline sync-env'
+        : action === 'reset'
+          ? 'run-pipeline sandbox-reset'
+          : 'deploy -p persistent -p sandbox'
+    return this.runner(loginShell, [loginShellArgs, devspaceCommand(target, verb)])
+  }
+
   /** Build & deploy without entering dev mode: `devspace deploy`, through a
    *  login shell so docker/kubectl resolve (see devspaceCommand). */
   build(repo: Repo, onLine?: LineSink): Promise<RunResult> {
