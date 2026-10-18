@@ -21,6 +21,8 @@
     | 'unplug'
     | 'inbox'
     | 'layers'
+    | 'copy'
+    | 'box'
 
   // Stroke geometry on a 24-unit grid. `play` and `stop` are filled so the
   // lifecycle verbs read as solid glyphs at 12px next to outlined ones.
@@ -47,6 +49,8 @@
     unplug: '<path d="M18.4 5.6 5.6 18.4"/><path d="m8 8 2 2M16 16l-2-2"/><path d="M9 3 6 6a4 4 0 0 0 0 5.7l1.5 1.5L13.2 7.5 11.7 6A4 4 0 0 0 9 3z"/><path d="m15 21 3-3a4 4 0 0 0 0-5.7l-1.5-1.5-5.7 5.7 1.5 1.5a4 4 0 0 0 2.7 0z"/>',
     inbox: '<path d="M3 13h5l2 3h4l2-3h5"/><path d="M5 4h14l2 9v7H3v-7z"/>',
     layers: '<path d="m12 3 9 5-9 5-9-5z"/><path d="m3 13 9 5 9-5"/>',
+    copy: '<rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
+    box: '<path d="M21 8 12 3 3 8v8l9 5 9-5z"/><path d="m3 8 9 5 9-5M12 13v8"/>',
   }
   const FILLED = new Set<IconName>(['play', 'stop'])
 </script>
