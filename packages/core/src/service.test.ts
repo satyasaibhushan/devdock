@@ -669,6 +669,23 @@ describe('Service', () => {
     await expect(svc.start('nope')).rejects.toThrow(/unknown repo/)
   })
 
+  it('discovers a repo cloned after startup when it is named', async () => {
+    const svc = new Service(
+      { roots: [root], stateFile },
+      { runner: cannedRunner('{"items":[]}', false) },
+    )
+    svc.rescan()
+    mkdirSync(join(root, 'svc-b'), { recursive: true })
+    writeFileSync(join(root, 'svc-b', 'devspace.yaml'), 'name: svc-b\ndeployments:\n  app: {}\n')
+    expect(svc.get('svc-b')).toBeUndefined()
+
+    const state = await svc.lookup('svc-b')
+    expect(state?.repo.id).toBe('svc-b')
+    expect(state?.status).toBe('STOPPED')
+    expect(svc.listRepos().map((r) => r.id)).toEqual(['svc-a', 'svc-b'])
+    expect(await svc.lookup('nope')).toBeUndefined()
+  })
+
   it('terminal falls back to a devspace-enter pod shell for external deployments', async () => {
     const podsJson = JSON.stringify({
       items: [

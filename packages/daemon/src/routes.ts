@@ -331,13 +331,13 @@ export function buildApp(
   )
 
   app.get<{ Params: { id: string } }>('/repos/:id', async (req, reply) => {
-    const state = service.get(req.params.id)
+    const state = await service.lookup(req.params.id)
     if (!state) return reply.code(404).send({ error: 'unknown repo' })
     return state
   })
 
   app.get<{ Params: { id: string } }>('/repos/:id/pods', async (req, reply) => {
-    const state = service.get(req.params.id)
+    const state = await service.lookup(req.params.id)
     if (!state) return reply.code(404).send({ error: 'unknown repo' })
     return state.pods
   })
@@ -345,7 +345,8 @@ export function buildApp(
   app.get<{ Params: { id: string }; Querystring: { tail?: string; workload?: string } }>(
     '/repos/:id/logs',
     async (req, reply) => {
-      if (!service.get(req.params.id)) return reply.code(404).send({ error: 'unknown repo' })
+      if (!(await service.lookup(req.params.id)))
+        return reply.code(404).send({ error: 'unknown repo' })
       const tail = Number(req.query.tail ?? 200)
       return service.logs(req.params.id, Number.isFinite(tail) ? tail : 200, req.query.workload)
     },
