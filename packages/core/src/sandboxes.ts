@@ -133,10 +133,11 @@ export class Sandboxes {
     if (!this.deps.store.health().ok) throw new Error('Cannot persist sandbox state')
     this.deps.emit(structuredClone(s))
   }
-  private touch(s: Sandbox, actor: string, action: string, detail?: string): void {
+  private touch(s: Sandbox, actor: string, action: string, detail?: string, touch = true): void {
     requireActor(actor)
-    s.lastUsedAt = Date.now()
-    s.activity = [...s.activity, { at: s.lastUsedAt, actor, action, detail }].slice(-200)
+    const now = Date.now()
+    if (touch) s.lastUsedAt = now
+    s.activity = [...s.activity, { at: now, actor, action, detail }].slice(-200)
     this.save(s)
   }
   private repo(m: SandboxMemberInput): Repo {
@@ -550,6 +551,7 @@ export class Sandboxes {
     sha: string,
     actor: string,
     merged?: boolean,
+    options: { touch?: boolean } = {},
   ): Promise<void> {
     requireActor(actor)
     if (!/^[a-f0-9]{7,64}$/i.test(sha)) throw new Error('Invalid head SHA')
@@ -560,7 +562,7 @@ export class Sandboxes {
     if (merged !== undefined) m.merged = merged
     if (m.deployedSha !== sha && !m.merged && m.build.state !== 'building')
       m.build = { state: 'queued' }
-    this.touch(s, actor, 'head', `${identity(m)} ${sha}`)
+    this.touch(s, actor, 'head', `${identity(m)} ${sha}`, options.touch ?? true)
     if (s.slot) await this.mirror(s)
   }
   async recordExec(key: string, actor: string): Promise<void> {

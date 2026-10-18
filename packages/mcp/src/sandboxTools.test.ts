@@ -26,9 +26,25 @@ it('keeps every public sandbox service method and MCP tool in parity', () => {
 })
 
 describe('sandbox MCP', () => {
+  it('reads controller status through its static HTTP route', async () => {
+    const send = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({ holder: 'one', isLeader: true, lastPollAt: 123, lastError: null }),
+        ),
+    )
+    const tool = allTools(daemonClient(send)).find((t) => t.name === 'devdock_sandbox_controller')
+    expect(tool?.scope).toBe('ro')
+    expect(JSON.parse((await tool?.handler({})) as string)).toMatchObject({
+      holder: 'one',
+      isLeader: true,
+    })
+    expect(send).toHaveBeenCalledWith('/sandboxes/controller', undefined)
+  })
   it('exposes reads at ro and requires a nonblank actor for every mutation', async () => {
     const ro = toolsForScope(client, 'ro').filter((t) => t.name.startsWith('devdock_sandbox_'))
     expect(ro.map((t) => t.name).sort()).toEqual([
+      'devdock_sandbox_controller',
       'devdock_sandbox_discover',
       'devdock_sandbox_list',
       'devdock_sandbox_status',

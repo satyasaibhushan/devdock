@@ -152,6 +152,26 @@ function fixture(instanceId = 'machine1') {
 }
 
 describe('sandbox lifecycle', () => {
+  it('records controller heads without extending idle or expiry clocks', async () => {
+    const f = fixture()
+    await f.done(await f.core.create({ key: 'SULF-1', actor: 'you', members: [input] }))
+    const record = f.store.getSandbox('SULF-1')
+    if (!record) throw new Error('missing sandbox')
+    record.lastUsedAt = 123
+    f.store.setSandbox(record)
+    await f.core.recordHead('SULF-1', input, sha2, 'controller', false, { touch: false })
+    expect(f.store.getSandbox('SULF-1')?.lastUsedAt).toBe(123)
+    expect(f.store.getSandbox('SULF-1')?.activity.at(-1)).toMatchObject({
+      actor: 'controller',
+      action: 'head',
+    })
+    const mirrored = JSON.parse(f.leases.get('slot1')?.data.sandbox ?? '{}') as {
+      lastUsedAt: number
+    }
+    expect(mirrored.lastUsedAt).toBe(123)
+    await f.core.recordHead('SULF-1', input, sha1, 'you')
+    expect(f.store.getSandbox('SULF-1')?.lastUsedAt).toBeGreaterThan(123)
+  })
   it('leases before building, defaults asleep, derives URLs and wakes only explicit members', async () => {
     const f = fixture()
     expect(

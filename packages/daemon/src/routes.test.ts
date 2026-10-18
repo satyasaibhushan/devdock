@@ -644,6 +644,12 @@ it('serves sandbox reads on the development socket and validates actors on every
   vi.spyOn(svc, 'sandboxStatus').mockRejectedValue(new Error('unknown sandbox: missing'))
   try {
     expect((await app.inject({ method: 'GET', url: '/sandboxes' })).statusCode).toBe(200)
+    expect((await app.inject({ method: 'GET', url: '/sandboxes/controller' })).json()).toEqual({
+      holder: null,
+      isLeader: false,
+      lastPollAt: null,
+      lastError: null,
+    })
     expect((await app.inject({ method: 'GET', url: '/sandboxes/missing' })).statusCode).toBe(404)
     const writes = [
       { method: 'POST' as const, url: '/sandboxes' },

@@ -1,5 +1,6 @@
 // service — the one brain (spec §19.1). Composes the core modules and exposes
 // transport-free verbs that the daemon (HTTP/WS) and MCP both call.
+import { randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 import { hostname } from 'node:os'
@@ -24,6 +25,7 @@ import {
   replicaCheckoutPath,
   replicaIsolationProblems,
 } from './replicas.js'
+import { SandboxController, type SandboxControllerStatus } from './sandboxController.js'
 import {
   type SandboxBuild,
   type SandboxCreate,
@@ -250,6 +252,7 @@ export class Service {
   private readonly awsCreds: AwsCreds
   /** All terminals: id → live PTY session + scrollback (spec §8). */
   private readonly terms = new TermRegistry()
+  private readonly sandboxController: SandboxController
   private readonly sandboxes: Sandboxes
   private readonly operations: Operations
   private readonly operationTasks = new Map<string, Promise<void>>()
@@ -352,6 +355,19 @@ export class Service {
           throw new Error(`Live dev session holds ${repo.name} in personal namespace`)
       },
     })
+    this.sandboxController = new SandboxController({
+      sandboxes: this.sandboxes,
+      operations: this.operations,
+      runner: this.runner,
+      kubectl: this.kubectl,
+      instanceId: opts.instanceId ?? randomUUID(),
+      namespace: () => this.contextNamespace(),
+      repos: () => [...this.repos.values()],
+    })
+  }
+
+  sandboxControllerStatus(): SandboxControllerStatus {
+    return this.sandboxController.status()
   }
 
   private async sandboxTarget(key: string, id: string, workload?: string): Promise<Repo> {
@@ -2466,6 +2482,7 @@ export class Service {
     this.stopped = false
     await this.sandboxes.recover()
     this.recoverOperations()
+    await this.sandboxController.start()
     // Record ownership for already-running managed sessions after discovery.
     for (const state of this.list()) {
       for (const workload of state.workloads) {
@@ -2495,6 +2512,7 @@ export class Service {
 
   stopLoop(): void {
     this.stopped = true
+    this.sandboxController.stop()
     if (this.timer) clearInterval(this.timer)
     this.timer = undefined
     if (this.authTimer) clearInterval(this.authTimer)

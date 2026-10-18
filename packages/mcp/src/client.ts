@@ -15,6 +15,7 @@ import type {
   RepoState,
   RunOutcome,
   SandboxBuild,
+  SandboxControllerStatus,
   SandboxCreate,
   SandboxMemberInput,
   SandboxUpdate,
@@ -77,6 +78,7 @@ export interface WaitOpts {
 /** The subset of the daemon HTTP contract the MCP tools call. */
 export interface DaemonClient {
   sandboxList?(): Promise<SandboxView[]>
+  sandboxController?(): Promise<SandboxControllerStatus>
   sandboxStatus?(key: string): Promise<SandboxView>
   sandboxDiscover?(key: string): Promise<SandboxMemberInput[]>
   sandboxCreate?(input: SandboxCreate): Promise<{ operationId: string }>
@@ -234,6 +236,7 @@ export function daemonClient(send: DaemonTransport, prefix = ''): DaemonClient {
   })
 
   return {
+    sandboxController: () => request('/sandboxes/controller'),
     sandboxList: () => request('/sandboxes'),
     sandboxStatus: (key) => request(`/sandboxes/${id(key)}`),
     sandboxDiscover: (key) => request(`/sandboxes/${id(key)}/discover`),

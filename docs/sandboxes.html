@@ -213,6 +213,8 @@
     <li>Builds may run on any instance that has the repo checked out, Docker and ECR auth; the leader assigns, a caller may pin an instance.</li>
   </ul>
 
+  <p>Controller implementation deviations: every action records actor <code>controller</code>. Leadership has no preferred host; any instance in <code>DEVDOCK_CONTROLLER=auto</code> (default) may acquire it, while <code>off</code> disables acquisition. Builds run locally on the leader through the existing lifecycle, without assignment or instance pinning. Branch heads are polled alongside PR heads. Scheduling runs on the 30s renewal tick, so a quiet period may finish up to 30s before a build starts. Failed heads require an explicit retry or a new head; controller head observations preserve idle and expiry clocks.</p>
+
   <h2 id="ui">12 · UI</h2>
 <pre class="ascii">┌ devdock ───────────────────────── instances · auth · ● connected ┐
 │ SANDBOXES          + │  ● SULF-1234  [awake · sleeps in 22m]      │

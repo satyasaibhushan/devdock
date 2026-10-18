@@ -22,6 +22,7 @@ const actor = { actor: z.string().trim().min(1) }
 /** Mapping is checked against the service prototype so new public methods need a tool. */
 export const sandboxMethods = {
   listSandboxes: 'list',
+  sandboxControllerStatus: 'controller',
   sandboxStatus: 'status',
   discoverSandbox: 'discover',
   createSandbox: 'create',
@@ -41,6 +42,7 @@ export function sandboxTools(client: DaemonClient): ToolDef[] {
     schema: z.ZodRawShape
     call: (a: Record<string, unknown>) => Promise<unknown> | undefined
   }[] = [
+    { name: 'controller', scope: 'ro', schema: {}, call: () => client.sandboxController?.() },
     { name: 'list', scope: 'ro', schema: {}, call: () => client.sandboxList?.() },
     {
       name: 'status',

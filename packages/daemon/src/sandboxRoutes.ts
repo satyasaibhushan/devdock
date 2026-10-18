@@ -2,6 +2,7 @@ import type { SandboxBuild, SandboxCreate, SandboxUpdate, Service } from '@devdo
 import type { FastifyInstance } from 'fastify'
 
 export function sandboxRoutes(app: FastifyInstance, service: Service): void {
+  app.get('/sandboxes/controller', () => service.sandboxControllerStatus())
   app.get('/sandboxes', () => service.listSandboxes())
   app.get<{ Params: { key: string } }>('/sandboxes/:key', (req) =>
     service.sandboxStatus(req.params.key),
