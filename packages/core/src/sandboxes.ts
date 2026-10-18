@@ -774,11 +774,11 @@ export class Sandboxes {
     await this.owned(s)
     await this.deps.assertAvailable(this.repo(m), s.slot as string)
     await this.deps.authorize(m.repo, false)
-    const { path } = this.checkout(s, m)
-    // Reset does not require the build machine's worktree; the local checked-out config suffices.
-    const original = this.repo(m)
-    const resetRoot = existsSync(path) ? path : (original.root ?? original.path)
-    const repo = this.config(s, m, resetRoot)
+    const { root, path } = this.checkout(s, m)
+    // Generated configs must never land in the main checkout; a worktree built elsewhere is
+    // recreated at HEAD here, and callers remove it after the reset.
+    if (!existsSync(path)) await this.checked('git', ['worktree', 'add', '--detach', path], root)
+    const repo = this.config(s, m, path)
     const result = await this.deps.supervisor.sandbox(repo, 'reset')
     if (result.code !== 0) throw new Error(result.stderr || 'Sandbox release reset failed')
   }

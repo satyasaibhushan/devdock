@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -171,6 +171,17 @@ describe('sandbox lifecycle', () => {
       expect.objectContaining({ namespace: 'slot1' }),
       'deploy',
       false,
+    )
+  })
+  it('resets in a fresh worktree when the build worktree lives on another machine', async () => {
+    const f = fixture()
+    await f.done(await f.core.create({ key: 'SULF-1', members: [input], actor: 'you' }))
+    for (const [cmd, args] of f.runner.mock.calls)
+      if (cmd === 'git' && args[0] === 'worktree' && args[1] === 'add')
+        rmSync(args[3] as string, { recursive: true, force: true })
+    expect((await f.done(f.core.expire('SULF-1', 'you'))).state).toBe('succeeded')
+    expect(readdirSync(join(root, 'app')).filter((n) => n.startsWith('.devdock-sandbox'))).toEqual(
+      [],
     )
   })
   it('fails when all slots are occupied without deploying', async () => {
