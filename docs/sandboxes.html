@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+  :root{
+    --bg:#0f1419; --panel:#161c24; --panel2:#1b232d; --ink:#e6edf3; --muted:#9aa7b4;
+    --line:#2a3441; --accent:#3fa7ff; --accent2:#46d39a; --warn:#f0b34a; --danger:#f06b6b;
+    --code:#0b0f14; --mono:"SF Mono",ui-monospace,"JetBrains Mono",Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.6;font-size:15px}
+  .wrap{display:grid;grid-template-columns:260px 1fr;max-width:1400px;margin:0 auto}
+  /* sidebar */
+  nav{position:sticky;top:0;align-self:start;height:100vh;overflow-y:auto;padding:28px 20px;border-right:1px solid var(--line);background:var(--panel)}
+  nav .brand{font-family:var(--mono);font-weight:700;font-size:20px;letter-spacing:.5px;color:var(--ink);margin-bottom:2px}
+  nav .brand b{color:var(--accent)}
+  nav .tag{color:var(--muted);font-size:12px;margin-bottom:22px}
+  nav a{display:block;color:var(--muted);text-decoration:none;padding:5px 10px;border-radius:6px;font-size:13.5px;margin:1px 0}
+  nav a:hover{background:var(--panel2);color:var(--ink)}
+  nav .sec{color:#5d6b78;text-transform:uppercase;font-size:10.5px;letter-spacing:1px;margin:18px 0 6px 10px;font-weight:700}
+  /* content */
+  main{padding:48px 56px;max-width:980px}
+  h1{font-size:34px;margin:0 0 6px;letter-spacing:-.5px}
+  h1 .sub{display:block;font-size:15px;color:var(--muted);font-weight:400;margin-top:8px;letter-spacing:0}
+  h2{font-size:23px;margin:52px 0 14px;padding-bottom:8px;border-bottom:1px solid var(--line)}
+  h3{font-size:17px;margin:30px 0 8px;color:var(--accent)}
+  h4{font-size:14px;margin:20px 0 6px;color:var(--accent2);font-family:var(--mono)}
+  p{margin:10px 0}
+  code{font-family:var(--mono);background:var(--panel2);padding:1.5px 6px;border-radius:4px;font-size:12.5px;color:#cde3ff}
+  pre{background:var(--code);border:1px solid var(--line);border-radius:10px;padding:18px;overflow-x:auto;font-family:var(--mono);font-size:12.5px;line-height:1.5;color:#c9d6e2}
+  pre .c{color:#5d6b78}/*comment*/
+  pre .k{color:#7fd1ff}/*key*/
+  pre .g{color:#46d39a}/*green*/
+  pre .y{color:#f0b34a}/*yellow*/
+  table{width:100%;border-collapse:collapse;margin:16px 0;font-size:13.5px}
+  th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--muted);font-size:11.5px;text-transform:uppercase;letter-spacing:.5px;background:var(--panel)}
+  tr:hover td{background:var(--panel)}
+  .box{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:8px;padding:14px 18px;margin:18px 0}
+  .box.warn{border-left-color:var(--warn)}
+  .box.ok{border-left-color:var(--accent2)}
+  .box.danger{border-left-color:var(--danger)}
+  .box .t{font-weight:700;font-size:13px;margin-bottom:4px;font-family:var(--mono)}
+  .pill{display:inline-block;background:var(--panel2);border:1px solid var(--line);border-radius:20px;padding:2px 11px;font-size:11.5px;font-family:var(--mono);margin:2px 4px 2px 0;color:var(--accent2)}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px}
+  .card h4{margin-top:0}
+  .lead{font-size:17px;color:var(--ink);border-left:3px solid var(--accent2);padding-left:16px;margin:18px 0}
+  ul,ol{margin:10px 0;padding-left:22px}
+  li{margin:5px 0}
+  .kbd{font-family:var(--mono);background:#0b0f14;border:1px solid var(--line);border-bottom-width:2px;border-radius:5px;padding:1px 7px;font-size:12px}
+  .foot{margin:60px 0 20px;padding-top:18px;border-top:1px solid var(--line);color:#5d6b78;font-size:12.5px}
+  hr{border:0;border-top:1px solid var(--line);margin:36px 0}
+  .ascii{font-size:11.5px;line-height:1.35}
+  a.ref{color:var(--accent)}
+  @media(max-width:900px){.wrap{grid-template-columns:1fr}nav{display:none}main{padding:28px 20px}.grid2{grid-template-columns:1fr}}
+</style>
+<title>devdock: sandboxes</title>
+</head>
+<body>
+<div class="wrap">
+<nav>
+  <div class="brand">dev<b>dock</b></div>
+  <div class="tag">sandboxes spec</div>
+  <div class="sec">Model</div>
+  <a href="#why">1 · Why</a>
+  <a href="#rbac">2 · Constraints found</a>
+  <a href="#model">3 · Model</a>
+  <a href="#slots">4 · Namespace slots</a>
+  <a href="#build">5 · Building a member</a>
+  <a href="#power">6 · Wake and sleep</a>
+  <a href="#life">7 · Lifecycle and expiry</a>
+  <a href="#state">8 · State and recovery</a>
+  <div class="sec">Surfaces</div>
+  <a href="#mcp">9 · MCP</a>
+  <a href="#http">10 · HTTP</a>
+  <a href="#controller">11 · Controller</a>
+  <a href="#ui">12 · UI</a>
+  <div class="sec">Plan</div>
+  <a href="#replicas">13 · Replicas</a>
+  <a href="#asks">14 · Infra asks</a>
+  <a href="#prs">15 · PR plan</a>
+  <a href="#open">16 · Unverified</a>
+</nav>
+<main>
+  <h1>Sandboxes
+    <span class="sub">Vercel-style previews for a ticket that spans several repos. The ticket's changed services run its code; every other service falls through to UAT.</span>
+  </h1>
+
+  <div class="box">
+    <div class="t">TL;DR</div>
+    A <b>sandbox</b> is a ticket key bound to a <b>namespace slot</b> plus a list of <b>members</b> (repo + workload + PR or branch). Members are built as <code>persistent</code> images from detached git worktrees and helm-upgraded over the slot's UAT proxy releases. Short in-cluster service names resolve inside the slot, so members call each other and everything else proxies to <code>uat-us</code>. Pods sleep at 0 replicas until woken. Unused for 24h, a sandbox <b>expires</b>: its slot is reset and freed, the record stays for a one-click rebuild. Nothing is deleted except by an explicit agent or human call.
+  </div>
+
+  <h2 id="why">1 · Why</h2>
+  <p>One ticket often lands as PRs in 3 to 4 repos. Reviewing it today means merging into <code>-uat</code> branches or hand-running dev pods. Dev namespaces already proxy every API to UAT through <code>ExternalName</code> services (<code>dev-env env:create</code> in <code>vmockinc/devops</code>), and <code>devspace deploy</code> swaps a proxy for real code on the same release name. Sandboxes automate exactly that, per ticket.</p>
+
+  <h2 id="rbac">2 · Constraints found</h2>
+  <p>Checked with <code>kubectl auth can-i</code> as the developer account (2026-10-19):</p>
+  <table>
+    <tr><th>Action</th><th>Allowed</th><th>Consequence</th></tr>
+    <tr><td>create / delete namespaces</td><td>no</td><td>devdock cannot make a namespace per ticket. It leases from a pool of pre-provisioned slots (§4).</td></tr>
+    <tr><td>deployments, services, ingresses, configmaps, secrets, jobs in own namespace</td><td>yes</td><td>helm upgrade, replica patching and ConfigMap records all work inside a slot the developer owns.</td></tr>
+    <tr><td><code>deployments/scale</code> subresource</td><td>no</td><td>Wake/sleep patches <code>spec.replicas</code> on the deployment instead of <code>kubectl scale</code>.</td></tr>
+    <tr><td>leases.coordination.k8s.io</td><td>no</td><td>Controller leadership uses a ConfigMap with resourceVersion compare-and-swap (§11).</td></tr>
+    <tr><td>priorityclasses</td><td>no</td><td>Low-priority scheduling is an infra ask (§14). Until then the pool size is the cost cap.</td></tr>
+  </table>
+  <p>Cluster sleep facts that shape the design: the <code>devspace-sleep</code> CronJobs only scale deployments labelled <code>devspace.sh/replaced=true</code> (dev mode). Persistent deploys never carry that label, so sandboxes are untouched by them. The UAT nodegroup ASG goes to 0 from 01:00 to 09:00 IST; awake sandbox pods simply reschedule when nodes return.</p>
+
+  <h2 id="model">3 · Model</h2>
+<pre><span class="k">interface</span> Sandbox {
+  key: string                 <span class="c">// ticket key as typed: 'SULF-1234'</span>
+  title?: string
+  slot?: string               <span class="c">// namespace currently leased; unset while expired</span>
+  state: 'creating' | 'active' | 'expired' | 'failed'
+  createdAt, lastUsedAt: number
+  members: SandboxMember[]
+  activity: ActivityEntry[]   <span class="c">// newest last, capped at 200</span>
+}
+<span class="k">interface</span> SandboxMember {
+  repo: string                <span class="c">// devdock repo id</span>
+  workload: string            <span class="c">// 'api' | 'ui' | 'worker' | 'cron' …</span>
+  source: { kind: 'pr', repoSlug, number, url } | { kind: 'branch', ref }
+  mode: 'built' | 'dev'
+  headSha?, deployedSha?: string
+  build: { state: 'idle'|'queued'|'building'|'failed', instanceId?, startedAt?, error? }
+  merged?: boolean
+}
+<span class="k">interface</span> ActivityEntry { at: number, actor: string, action: string, detail?: string }</pre>
+  <ul>
+    <li><b>Power</b> (<code>awake | asleep | partial</code>) is derived from the cluster on each reconcile, never stored.</li>
+    <li><b>actor</b> is required on every mutation: <code>you</code>, <code>agent:&lt;name&gt;</code>, <code>poller</code>, <code>sleeper</code>, <code>expiry</code>.</li>
+    <li><b>Personal sandbox</b>: the kube context namespace (<code>saibhushan</code>) is shown as a sandbox whose members are today's repos in <code>dev</code> mode. It is a view over existing repo state, not a record, and keeps today's runtime behaviour exactly.</li>
+    <li>Workers and crons default to 0 replicas: they would consume UAT's SQS messages. A member must name them explicitly.</li>
+  </ul>
+
+  <h2 id="slots">4 · Namespace slots</h2>
+  <ul>
+    <li>The pool is <code>DEVDOCK_SANDBOX_NAMESPACES</code> (comma list), e.g. <code>saibhushan-sb1,saibhushan-sb2</code>. Infra creates them once with <code>dev-env env:create &lt;slot&gt; --owner_uid &lt;email&gt;</code>.</li>
+    <li>A sandbox leases one free slot on create or rebuild. The lease is a ConfigMap <code>devdock-sandbox</code> in the slot holding <code>{key, instanceId, members, shas}</code>. A slot whose ConfigMap names another key is busy.</li>
+    <li>Pool size caps concurrent sandboxes, ECR tags (<code>IMAGE_TAG</code> is <code>&lt;slot&gt;-&lt;workload&gt;</code>, overwritten per build) and cost.</li>
+    <li>The personal namespace may be listed as a slot for trials. A member whose release is held by a live dev session there is refused, never clobbered.</li>
+    <li>URLs are read from the slot's Ingress objects (authoritative), e.g. <code>dashboard-&lt;slot&gt;.vmock.dev</code>, <code>api-&lt;slot&gt;-&lt;team&gt;.vmock.dev/&lt;svc&gt;</code>. The UI shows ticket → URL, so slot names never matter to the reader.</li>
+  </ul>
+
+  <h2 id="build">5 · Building a member</h2>
+  <ol>
+    <li>Worktree: detached checkout at <code>headSha</code> beside the parent checkout (same placement rule as replicas: outside any sync root), path <code>../.devdock-sb-&lt;slot&gt;-&lt;repo&gt;</code>. PR heads are fetched as <code>pull/&lt;n&gt;/head</code> from the PR's repo, so fork PRs work.</li>
+    <li>Env: <code>devspace run sync-env</code> in the worktree with <code>--var ENVIRONMENT_NAME=&lt;slot&gt;</code>, so <code>prepare_local_env</code> rewrites hosts for the slot.</li>
+    <li>Deploy: <code>devspace deploy -n &lt;slot&gt; -p persistent</code> with vars <code>ENVIRONMENT_NAME=&lt;slot&gt;</code>, <code>WORKLOAD_TYPE=&lt;workload&gt;</code>, <code>API_PERSISTENT_REPLICAS</code>/<code>WEB_PERSISTENT_REPLICAS</code> = current power (0 asleep, 1 awake), <code>CRON_/WORKER_PERSISTENT_REPLICAS=0</code> unless named.</li>
+    <li>Placement: the <code>persistent</code> profile pins <code>nodeSelector: workload: products</code> (the UAT nodegroup). A generated, untracked config in the worktree adds a values file setting <code>workload: development</code> so sandboxes never consume UAT capacity.</li>
+    <li>Same tag every build, so an awake member gets a <code>rollout restart</code> after a successful deploy.</li>
+    <li>One build per (sandbox, member). A newer <code>headSha</code> marks the running build stale; it restarts from the new head when done (latest wins).</li>
+  </ol>
+
+  <h2 id="power">6 · Wake and sleep</h2>
+  <ul>
+    <li><b>Wake</b>: if any member is stale (<code>deployedSha ≠ headSha</code>) build it first, then patch <code>spec.replicas=1</code> on each member's api/ui deployment. Typical 20 to 60s when nothing is stale.</li>
+    <li><b>Sleep</b>: patch <code>spec.replicas=0</code>. Images and releases stay.</li>
+    <li>Both are any-machine operations: only builds and dev sessions are tied to a machine.</li>
+  </ul>
+
+  <h2 id="life">7 · Lifecycle and expiry</h2>
+<pre class="ascii">creating ──▶ active ──(unused DEVDOCK_SANDBOX_TTL_HOURS, default 24)──▶ expired
+                 ▲                                                     │
+                 └──────────────── rebuild (new slot lease) ◀──────────┘
+   any state ──(explicit delete by agent or you)──▶ gone</pre>
+  <ul>
+    <li><b>Used</b> = wake, build, or any mutating MCP/UI call. Request traffic is not tracked.</li>
+    <li><b>Expire</b>: reset every member release in the slot to its default (UAT proxy for api, purge for others; the same as <code>devspace purge</code>), delete the slot ConfigMap, remove worktrees, free the slot. Keep key, members, last shas, activity.</li>
+    <li><b>Rebuild</b>: lease a slot, build every member at current head, leave asleep unless asked to wake.</li>
+    <li><b>Merged PRs</b>: member gets <code>merged: true</code> and stops building. Never auto-deletes. When all members are merged, status says so for an agent to act on.</li>
+    <li><b>Delete</b>: explicit only. Expires first if active, then removes the record.</li>
+  </ul>
+
+  <h2 id="state">8 · State and recovery</h2>
+  <ul>
+    <li><code>stateStore</code> gains <code>sandboxes: Record&lt;key, Sandbox&gt;</code> (same atomic JSON file).</li>
+    <li>The slot ConfigMap mirrors key, members and deployed shas, so a lost state file is rebuilt from the cluster on boot, matching devdock's rule that the cluster is the source of truth.</li>
+    <li>Long work (create, build, rebuild, expire) runs as durable <code>Operations</code>; interrupted ones are marked interrupted, never replayed.</li>
+  </ul>
+
+  <h2 id="mcp">9 · MCP</h2>
+  <table>
+    <tr><th>Tool</th><th>Endpoint</th><th>Notes</th></tr>
+    <tr><td><code>devdock_sandbox_list</code></td><td>/mcp</td><td>key, state, power, slot, member summary, urls, lastUsedAt, expiresAt</td></tr>
+    <tr><td><code>devdock_sandbox_status {key}</code></td><td>/mcp</td><td>full members with shas, build state and errors, urls, last 50 activity entries, allMerged</td></tr>
+    <tr><td><code>devdock_sandbox_discover {key}</code></td><td>/mcp</td><td>open PRs whose head branch contains the key, across repos devdock knows</td></tr>
+    <tr><td><code>devdock_sandbox_create {key, members?, discover?, wake?, actor}</code></td><td>/mcp/rw</td><td>returns operationId</td></tr>
+    <tr><td><code>devdock_sandbox_update {key, add?, remove?, actor}</code></td><td>/mcp/rw</td><td>membership; removal resets that release</td></tr>
+    <tr><td><code>devdock_sandbox_build {key, repo?, force?, actor}</code></td><td>/mcp/rw</td><td>stale members, or all with force; on an expired sandbox this is the rebuild</td></tr>
+    <tr><td><code>devdock_sandbox_wake</code> / <code>_sleep {key, actor}</code></td><td>/mcp/rw</td><td>wake may build first</td></tr>
+    <tr><td><code>devdock_sandbox_delete {key, actor}</code></td><td>/mcp/rw</td><td>the only deleting call</td></tr>
+  </table>
+  <p>Logs and exec reuse <code>devdock_logs</code> / <code>devdock_exec</code> with an optional <code>sandbox</code> param. A test asserts every public sandbox method on the core service has an MCP tool, so the MCP surface cannot drift behind the UI.</p>
+
+  <h2 id="http">10 · HTTP</h2>
+  <p><code>GET /sandboxes</code>, <code>GET /sandboxes/:key</code>, <code>POST /sandboxes</code>, <code>PATCH /sandboxes/:key</code>, <code>POST /sandboxes/:key/{build,wake,sleep}</code>, <code>DELETE /sandboxes/:key</code>. Sandbox changes are pushed over the existing websocket as <code>sandbox</code> events.</p>
+
+  <h2 id="controller">11 · Controller</h2>
+  <ul>
+    <li><b>Leadership</b>: ConfigMap <code>devdock-controller</code> in the personal namespace, <code>{holder, renewedAt}</code>, renewed every 30s via resourceVersion CAS; another instance takes over after 90s of silence. Default holder: vmockbox (inside the network, no VPN). The Mac takes over when it is down.</li>
+    <li><b>Poller</b> (60s): for each active sandbox, read PR head sha and merged state with <code>gh</code>; record new heads with actor <code>poller</code>.</li>
+    <li><b>Debounced builds</b>: build a stale member after 5 min of quiet while asleep, 30s while awake.</li>
+    <li><b>Idle sleep</b>: awake sandbox with no use for 30 min goes to sleep (actor <code>sleeper</code>).</li>
+    <li><b>Expiry</b>: hourly sweep per §7 (actor <code>expiry</code>).</li>
+    <li>Builds may run on any instance that has the repo checked out, Docker and ECR auth; the leader assigns, a caller may pin an instance.</li>
+  </ul>
+
+  <h2 id="ui">12 · UI</h2>
+<pre class="ascii">┌ devdock ───────────────────────── instances · auth · ● connected ┐
+│ SANDBOXES          + │  ● SULF-1234  [awake · sleeps in 22m]      │
+│ ● saibhushan   2 dev │  Brand colour for org portal               │
+│ ● SULF-1234  3 awake │        [Wake] [Sleep] [Build] [⋯ Delete]   │
+│ ○ PROJACS-746 expired│  dashboard ↗  admin ↗  api-cmc ↗           │
+│                      │  repo         workload branch  sha   state │
+│ ⌨ All terminals      │  acs-org      api  SULF-1234 a1f3 ✓ current│
+│                      │  org-ui       ui   SULF-1234 44d0 ✗ failed │
+│                      │  + add member                              │
+│                      │  Activity            │ Logs (selected)     │
+└──────────────────────┴─────────────────────────────────────────────┘</pre>
+  <ul>
+    <li>The sidebar lists sandboxes only. The personal sandbox is pinned first and selected by default; its detail is today's repo detail (verbs, logs, terminal, machine picker) with repos as rows and <b>+ add repo</b> searching discovered repos.</li>
+    <li>The namespace picker leaves the top bar: choosing a sandbox chooses its namespace.</li>
+    <li>Ticket detail: header actions, URL chips, members table (deployed → head sha, build state, owning machine), activity feed with actors, log pane for the selected member.</li>
+    <li>New sandbox: type a key, discovered PRs come pre-ticked, Create starts one operation shown in the existing WorkflowPanel.</li>
+  </ul>
+
+  <h2 id="replicas">13 · Replicas</h2>
+  <p>Unchanged in this round. A one-repo sandbox supersedes a replica (own hostname, callers reach it). Replicas are removed after a live proof confirms sandboxes work end to end.</p>
+
+  <h2 id="asks">14 · Infra asks</h2>
+  <ol>
+    <li>Create 2 to 3 slots: <code>dev-env env:create saibhushan-sb&lt;n&gt; --owner_uid &lt;email&gt;</code>.</li>
+    <li>A PriorityClass below the autoscaler's expendable cutoff (value &lt; -10) so sandbox pods only use spare capacity and never add a node.</li>
+  </ol>
+
+  <h2 id="prs">15 · PR plan</h2>
+  <ol>
+    <li><b>Core</b>: this spec, model, slots, builds, wake/sleep, expiry/rebuild/delete, recovery, HTTP and MCP with the parity test.</li>
+    <li><b>Controller</b>: leadership, poller, debounced builds, idle sleep, expiry sweep.</li>
+    <li><b>UI</b>: sandbox-first sidebar, personal sandbox, ticket detail.</li>
+  </ol>
+
+  <h2 id="open">16 · Unverified</h2>
+  <ul>
+    <li>Whether <code>env:create</code> also runs UIs in a slot with slot env. If not, UI members are added from the base branch.</li>
+    <li>Real image sizes, readiness timings, and whether the Dockerfiles cache composer/npm layers.</li>
+    <li>Whether any UAT traffic still goes through the older ECS services (S3 env files still name <code>*.vmock.com</code> hosts).</li>
+    <li>Pull policy of the service chart (decides whether <code>rollout restart</code> pulls the new image).</li>
+  </ul>
+
+  <div class="foot">Written 2026-10-19. Supersedes the replica-centric preview idea.</div>
+</main>
+</div>
+</body>
+</html>
