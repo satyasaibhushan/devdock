@@ -507,7 +507,7 @@ export class Service {
    *  their persisted records — never from the scanner, which would re-register
    *  the parent's own configs found inside each worktree. */
   rescan(): Repo[] {
-    const found = scanRepos(this.opts.roots.length ? { roots: this.opts.roots } : {})
+    const found = this.scanRoots()
     const next = new Map<string, Repo>()
     for (const r of found) next.set(r.id, r)
     for (const rec of this.store.listReplicas()) {
@@ -522,6 +522,31 @@ export class Service {
     this.repos.clear()
     for (const [id, repo] of next) this.repos.set(id, repo)
     return this.listRepos()
+  }
+
+  private scanRoots(): Repo[] {
+    return scanRepos(this.opts.roots.length ? { roots: this.opts.roots } : {})
+  }
+
+  /** Discovery otherwise runs only at startup, so a checkout cloned later would
+   *  read as unknown until restart. On a miss, scan the roots and adopt just
+   *  that repo: a full rescan would swap the map under a running reconcile. */
+  private discoverOnMiss(id: string): Repo | undefined {
+    const known = this.repos.get(id)
+    if (known) return known
+    const found = this.scanRoots().find((r) => r.id === id)
+    if (!found) return undefined
+    this.repos.set(id, found)
+    return found
+  }
+
+  /** `get`, but a repo cloned since startup is discovered and reconciled once
+   *  instead of reading as unknown. */
+  async lookup(id: string): Promise<RepoState | undefined> {
+    const state = this.get(id)
+    if (state) return state
+    if (!this.discoverOnMiss(id)) return undefined
+    return this.reconcileOne(id)
   }
 
   listRepos(): Repo[] {
@@ -568,7 +593,7 @@ export class Service {
   }
 
   private repoOrThrow(id: string): Repo {
-    const repo = this.repos.get(id)
+    const repo = this.discoverOnMiss(id)
     if (!repo) throw new Error(`unknown repo: ${id}`)
     return repo
   }
