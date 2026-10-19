@@ -83,11 +83,13 @@ export interface DaemonClient {
   sandboxDiscover?(key: string): Promise<SandboxMemberInput[]>
   sandboxCreate?(input: SandboxCreate): Promise<{ operationId: string }>
   sandboxUpdate?(key: string, input: SandboxUpdate): Promise<{ operationId: string }>
+  sandboxSnapshot?(key: string, input: SandboxBuild): Promise<{ operationId: string }>
   sandboxBuild?(key: string, input: SandboxBuild): Promise<{ operationId: string }>
   sandboxAction?(
     key: string,
     action: 'wake' | 'sleep' | 'expire' | 'delete',
     actor: string,
+    options?: { evict?: boolean },
   ): Promise<{ operationId: string }>
   sandboxHead?(
     key: string,
@@ -247,15 +249,16 @@ export function daemonClient(send: DaemonTransport, prefix = ''): DaemonClient {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(input),
       }),
+    sandboxSnapshot: (key, input) => post(`/sandboxes/${id(key)}/snapshot`, input),
     sandboxBuild: (key, input) => post(`/sandboxes/${id(key)}/build`, input),
-    sandboxAction: (key, action, actor) =>
+    sandboxAction: (key, action, actor, options) =>
       action === 'delete'
         ? request(`/sandboxes/${id(key)}`, {
             method: 'DELETE',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ actor }),
+            body: JSON.stringify({ actor, ...options }),
           })
-        : post(`/sandboxes/${id(key)}/${action}`, { actor }),
+        : post(`/sandboxes/${id(key)}/${action}`, { actor, ...options }),
     sandboxHead: (key, input) => post(`/sandboxes/${id(key)}/head`, input),
     beginOperation: (repo, action, workload) =>
       post(`/repos/${id(repo)}/operations`, { action, workload }),

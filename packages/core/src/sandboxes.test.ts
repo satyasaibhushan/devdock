@@ -1,6 +1,15 @@
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { Operations } from './operations.js'
 import { type SandboxMemberInput, Sandboxes, isExpired, staleMembers } from './sandboxes.js'
@@ -157,9 +166,16 @@ function fixture(instanceId = 'machine1') {
     available,
     emit,
     done,
+    repoPath,
     setHead: (sha: string) => {
       head = sha
     },
+    imagePresent: () =>
+      sandbox.mockImplementation(async (repo, action) =>
+        action === 'image'
+          ? { code: 0, stdout: `SANDBOX_IMAGE=sha256:${'d'.repeat(64)}\n`, stderr: '' }
+          : sandboxResult(repo, action),
+      ),
   }
 }
 
@@ -650,4 +666,222 @@ it('names the image and tag when an ECR lookup fails', async () => {
     /lookup failed for .*\/devspace:sb-[a-f0-9]+-persistent/,
   )
   expect(f.sandbox.mock.calls.some((c) => c[1] === 'deploy')).toBe(false)
+})
+
+describe('snapshots', () => {
+  it('bakes a worktree with its uncommitted files, leaves the checkout alone and records dirty paths', async () => {
+    const f = fixture()
+    const wt = join(root, 'wt')
+    mkdirSync(join(wt, 'src'), { recursive: true })
+    const git = (...args: string[]) =>
+      execFileSync('git', args, {
+        cwd: wt,
+        stdio: 'pipe',
+        env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' },
+      })
+        .toString()
+        .trim()
+    git('init', '-q')
+    git('config', 'user.email', 'x@example.com')
+    git('config', 'user.name', 'x')
+    writeFileSync(join(wt, 'devspace.yaml'), 'version: v2beta1\nname: app\n')
+    writeFileSync(join(wt, 'Dockerfile'), 'FROM scratch\nCOPY . .\n')
+    writeFileSync(join(wt, '.gitignore'), '*.log\n')
+    writeFileSync(join(wt, 'src', 'a.ts'), 'old\n')
+    writeFileSync(join(wt, 'src', 'gone.ts'), 'bye\n')
+    git('add', '-A')
+    git('commit', '-q', '-m', 'base')
+    const head = git('rev-parse', 'HEAD')
+    writeFileSync(join(wt, 'src', 'a.ts'), 'new\n')
+    writeFileSync(join(wt, 'src', 'b.ts'), 'untracked\n')
+    writeFileSync(join(wt, 'debug.log'), 'ignored\n')
+    rmSync(join(wt, 'src', 'gone.ts'))
+    const mocked = f.runner.getMockImplementation()
+    f.runner.mockImplementation(async (cmd, args, options) =>
+      cmd === 'git' && options?.cwd === wt
+        ? { code: 0, stdout: git(...args), stderr: '' }
+        : (mocked as NonNullable<typeof mocked>)(cmd, args, options),
+    )
+    const seen: Record<string, boolean | string> = {}
+    f.sandbox.mockImplementation(async (repo, action) => {
+      if (action === 'deploy') {
+        seen.root = repo.root
+        seen.a = readFileSync(join(repo.root, 'src', 'a.ts'), 'utf8')
+        seen.b = existsSync(join(repo.root, 'src', 'b.ts'))
+        seen.log = existsSync(join(repo.root, 'debug.log'))
+        seen.gone = existsSync(join(repo.root, 'src', 'gone.ts'))
+      }
+      return f.sandboxResult(repo, action)
+    })
+    const member: SandboxMemberInput = { ...input, source: { kind: 'worktree', path: wt } }
+    const result = await f.done(
+      await f.core.create({ key: 'SULF-1', actor: 'agent', members: [member] }),
+    )
+    expect(result.state).toBe('succeeded')
+    expect(seen).toEqual({
+      root: expect.stringContaining('.devdock-sb-slot1-'),
+      a: 'new\n',
+      b: true,
+      log: false,
+      gone: false,
+    })
+    expect(existsSync(seen.root as string)).toBe(false)
+    expect(readdirSync(wt).filter((n) => n.startsWith('.devdock'))).toEqual([])
+    expect(f.store.getSandbox('SULF-1')?.snapshot).toMatchObject({
+      actor: 'agent',
+      members: [
+        {
+          repo: 'app',
+          workload: 'api',
+          sha: head,
+          dirtyFiles: ['src/a.ts', 'src/b.ts', 'src/gone.ts'],
+          image: expect.stringContaining('/devspace:sb-'),
+        },
+      ],
+    })
+    const view = await f.core.status('SULF-1')
+    expect(view.link).toBe('http://127.0.0.1:7717/s/SULF-1')
+    expect(view.markdown).toContain(`app api ${head} (+3 uncommitted files)`)
+    await expect(
+      f.core.create({
+        key: 'SULF-2',
+        actor: 'agent',
+        members: [{ ...input, source: { kind: 'worktree', path: 'relative' } }],
+      }),
+    ).rejects.toThrow('absolute')
+  })
+  it('rejects a worktree with a submodule and removes its partial build copy', async () => {
+    const f = fixture()
+    const wt = join(root, 'wt')
+    mkdirSync(join(wt, 'vendor', 'lib'), { recursive: true })
+    const mocked = f.runner.getMockImplementation()
+    f.runner.mockImplementation(async (cmd, args, options) =>
+      cmd === 'git' && options?.cwd === wt
+        ? {
+            code: 0,
+            stdout: args[0] === 'rev-parse' ? sha1 : 'Dockerfile\0vendor/lib\0',
+            stderr: '',
+          }
+        : (mocked as NonNullable<typeof mocked>)(cmd, args, options),
+    )
+    writeFileSync(join(wt, 'Dockerfile'), 'FROM scratch\n')
+    writeFileSync(join(wt, 'devspace.yaml'), 'version: v2beta1\nname: app\n')
+    const member: SandboxMemberInput = { ...input, source: { kind: 'worktree', path: wt } }
+    const result = await f.done(
+      await f.core.create({ key: 'SULF-1', actor: 'agent', members: [member] }),
+    )
+    expect(result.state).toBe('failed')
+    expect(result.logs.at(-1)?.message).toBe(
+      'app:api: Submodules are not supported in worktree members: vendor/lib',
+    )
+    expect(readdirSync(dirname(f.repoPath)).filter((n) => n.includes('-build-'))).toEqual([])
+  })
+  it('records a snapshot after every full build and renders PR markdown against the source head', async () => {
+    const f = fixture()
+    await f.done(await f.core.create({ key: 'SULF-1', actor: 'you', members: [input] }))
+    const saved = f.store.getSandbox('SULF-1')?.snapshot
+    expect(saved).toMatchObject({
+      actor: 'you',
+      members: [{ sha: sha1, dirtyFiles: [], image: expect.stringContaining('-persistent') }],
+    })
+    let view = await f.core.status('SULF-1')
+    expect(view.ribbon).toBe('asleep')
+    expect(view.pool).toEqual([{ slot: 'slot1', key: 'SULF-1' }, { slot: 'slot2' }])
+    expect(view.markdown).toBe(
+      [
+        'Sandbox SULF-1: asleep',
+        'Stable link: http://127.0.0.1:7717/s/SULF-1',
+        'Live URL: https://slot.example/app',
+        '',
+        '```',
+        `app api ${sha1} = ticket head`,
+        '```',
+      ].join('\n'),
+    )
+    await f.core.recordHead('SULF-1', input, sha2, 'poller')
+    view = await f.core.status('SULF-1')
+    expect(view.markdown).toContain(`app api ${sha1} vs ticket head ${sha2}`)
+    f.setHead(sha2)
+    await f.done(f.core.snapshot('SULF-1', { actor: 'again' }))
+    expect(f.store.getSandbox('SULF-1')?.snapshot).toMatchObject({
+      actor: 'again',
+      members: [{ sha: sha2 }],
+    })
+    expect(f.store.getSandbox('SULF-1')?.activity.map((a) => a.action)).toContain('snapshot')
+  })
+  it('restores an expired snapshot into a free slot from recorded images without rebuilding', async () => {
+    const f = fixture()
+    await f.done(await f.core.create({ key: 'SULF-1', actor: 'you', members: [input] }))
+    const image = f.store.getSandbox('SULF-1')?.snapshot?.members[0]?.image
+    await f.done(f.core.expire('SULF-1', 'expiry'))
+    expect((await f.core.status('SULF-1')).ribbon).toBe('expired restorable')
+    f.sandbox.mockClear()
+    // A tag pruned from ECR inside the TTL fails the restore instead of deploying a dead image.
+    let result = await f.done(f.core.wake('SULF-1', 'link'))
+    expect(result.state).toBe('failed')
+    expect(result.logs.at(-1)?.message).toBe(`Snapshot image ${image} is gone; rebuild the sandbox`)
+    expect(f.sandbox.mock.calls.some((c) => c[1] === 'deploy')).toBe(false)
+    expect(f.store.getSandbox('SULF-1')).toMatchObject({ state: 'expired', slot: undefined })
+    expect(f.leases.has('slot1')).toBe(false)
+    expect((await f.core.status('SULF-1')).ribbon).toBe('expired restorable')
+    f.imagePresent()
+    f.sandbox.mockClear()
+    result = await f.done(f.core.wake('SULF-1', 'link'))
+    expect(result.state).toBe('succeeded')
+    const deploy = f.sandbox.mock.calls.find((c) => c[1] === 'deploy')
+    expect(deploy?.slice(1)).toEqual(['deploy', true, true])
+    expect(readFileSync(deploy?.[0].configPath as string, 'utf8')).toContain(`value: ${image}`)
+    expect(f.store.getSandbox('SULF-1')).toMatchObject({ state: 'active', slot: 'slot1' })
+    expect(f.deployments.get('app-api')).toBe(1)
+    expect(f.store.getSandbox('SULF-1')?.activity).toContainEqual(
+      expect.objectContaining({ action: 'restore', actor: 'link' }),
+    )
+  })
+  it('refuses to wake an expired sandbox without a snapshot and drops aged snapshots', async () => {
+    const f = fixture()
+    await f.done(await f.core.create({ key: 'SULF-1', actor: 'you', members: [input] }))
+    await f.done(f.core.expire('SULF-1', 'expiry'))
+    const record = f.store.getSandbox('SULF-1')
+    if (!record) throw new Error('missing sandbox')
+    record.expiredAt = Date.now() - 31 * 86_400_000
+    f.store.setSandbox(record)
+    expect((await f.core.status('SULF-1')).ribbon).toBe('expired')
+    expect(f.store.getSandbox('SULF-1')?.snapshot).toBeUndefined()
+    expect(() => f.core.wake('SULF-1', 'link')).toThrow('rebuild first')
+  })
+  it('names the least recently used asleep sandbox when the pool is full and evicts it on request', async () => {
+    const f = fixture()
+    await f.done(await f.core.create({ key: 'SULF-1', actor: 'you', members: [input] }))
+    await f.done(f.core.expire('SULF-1', 'expiry'))
+    await f.done(await f.core.create({ key: 'SULF-2', actor: 'you', members: [input] }))
+    await f.done(await f.core.create({ key: 'SULF-3', actor: 'you', members: [input] }))
+    const second = f.store.getSandbox('SULF-2')
+    if (!second) throw new Error('missing sandbox')
+    second.lastUsedAt -= 60_000
+    f.store.setSandbox(second)
+    f.imagePresent()
+    // No deployments yet means nothing provably asleep, so nothing to evict.
+    let result = await f.done(f.core.wake('SULF-1', 'link'))
+    expect(result.state).toBe('failed')
+    expect(result.logs.at(-1)?.message).toContain('no asleep sandbox to evict')
+    f.deployments.set('app-api', 0)
+    expect((await f.core.status('SULF-1')).evictionCandidate).toBe('SULF-2')
+    result = await f.done(f.core.wake('SULF-1', 'link'))
+    expect(result.state).toBe('failed')
+    expect(result.logs.at(-1)?.message).toBe(
+      'Sandbox namespace pool full; evict asleep sandbox SULF-2 to restore',
+    )
+    expect(f.store.getSandbox('SULF-1')?.state).toBe('expired')
+    expect(f.store.getSandbox('SULF-2')?.state).toBe('active')
+    // An awake sandbox is never a candidate.
+    f.deployments.set('app-api', 1)
+    result = await f.done(f.core.wake('SULF-1', 'link', { evict: true }))
+    expect(result.logs.at(-1)?.message).toContain('no asleep sandbox to evict')
+    f.deployments.set('app-api', 0)
+    result = await f.done(f.core.wake('SULF-1', 'link', { evict: true }))
+    expect(result.state).toBe('succeeded')
+    expect(f.store.getSandbox('SULF-2')).toMatchObject({ state: 'expired', slot: undefined })
+    expect(f.store.getSandbox('SULF-1')).toMatchObject({ state: 'active', slot: 'slot1' })
+    expect(f.store.getSandbox('SULF-3')?.slot).toBe('slot2')
+  })
 })

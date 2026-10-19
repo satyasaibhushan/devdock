@@ -241,7 +241,8 @@
           <td class="mono">
             {#if m.source.kind === 'pr'}
               <a href={m.source.url} target="_blank" rel="noreferrer" title={m.source.url}>{sourceLabel(m.source)}</a>
-            {:else}<span title="branch {m.source.ref}">{m.source.ref}</span>{/if}
+            {:else if m.source.kind === 'branch'}<span title="branch {m.source.ref}">{m.source.ref}</span>
+            {:else}<span title={m.source.path}>{sourceLabel(m.source)}</span>{/if}
             {#if m.merged}<span class="merged">merged</span>{/if}
           </td>
           <td class="mono"><span title={m.headSha}>{shortSha(m.headSha) || '·'}</span></td>

@@ -87,6 +87,8 @@ const AUTH_MAINTAIN_MS = 5 * 60 * 1000
  *  deleted by the hourly GC pass. */
 const REPLICA_TTL_MS = 2 * 24 * 60 * 60 * 1000
 const REPLICA_GC_MS = 60 * 60 * 1000
+/** Floor between filesystem scans triggered by unknown repo ids. */
+const MISS_SCAN_INTERVAL_MS = 10_000
 
 /** RFC 1123 label — what Kubernetes accepts as a namespace name. */
 const NAMESPACE_RE = /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/
@@ -218,6 +220,7 @@ export class Service {
   private readonly streamSpawner: SpawnFn
   private readonly store: StateStore
   private readonly repos = new Map<string, Repo>()
+  private missScanAt = 0
   private scanWarnings: string[] = []
   private readonly states = new Map<string, RepoState>()
   /** One log stream per workload: pod logs + verb activity. The `devspace dev`
@@ -407,8 +410,11 @@ export class Service {
   buildSandbox(key: string, input: SandboxBuild) {
     return this.sandboxes.build(key, input)
   }
-  wakeSandbox(key: string, actor: string) {
-    return this.sandboxes.wake(key, actor)
+  snapshotSandbox(key: string, input: SandboxBuild) {
+    return this.sandboxes.snapshot(key, input)
+  }
+  wakeSandbox(key: string, actor: string, options: { evict?: boolean } = {}) {
+    return this.sandboxes.wake(key, actor, options)
   }
   sleepSandbox(key: string, actor: string) {
     return this.sandboxes.sleep(key, actor)
@@ -638,15 +644,8 @@ export class Service {
       this.scanWarnings.push(warning)
       console.warn(warning)
     }
-    const preferredPaths = this.store.repoPaths()
-    for (const repo of this.repos.values()) preferredPaths.set(repo.id, repo.path)
     const replicas = this.store.listReplicas()
-    for (const rec of replicas) preferredPaths.set(rec.id, rec.path)
-    const found = scanRepos({
-      roots: this.opts.roots.length ? this.opts.roots : undefined,
-      preferredPaths,
-      onWarning,
-    })
+    const found = this.scanRoots(replicas, onWarning)
     const next = new Map<string, Repo>()
     for (const r of found) next.set(r.id, r)
     for (const rec of replicas) {
@@ -664,6 +663,48 @@ export class Service {
     this.repos.clear()
     for (const [id, repo] of next) this.repos.set(id, repo)
     return this.listRepos()
+  }
+
+  private scanRoots(replicas: ReplicaRecord[], onWarning: (warning: string) => void): Repo[] {
+    const preferredPaths = this.store.repoPaths()
+    for (const repo of this.repos.values()) preferredPaths.set(repo.id, repo.path)
+    for (const rec of replicas) preferredPaths.set(rec.id, rec.path)
+    return scanRepos({
+      roots: this.opts.roots.length ? this.opts.roots : undefined,
+      preferredPaths,
+      onWarning,
+    })
+  }
+
+  /** Discovery otherwise runs only at startup, so a checkout cloned later would
+   *  read as unknown until restart. On a miss, scan the roots and adopt just
+   *  that repo: a full rescan would swap the map under a running reconcile. */
+  private discoverOnMiss(id: string): Repo | undefined {
+    const known = this.repos.get(id)
+    if (known) return known
+    const replicas = this.store.listReplicas()
+    // A replica record owns its id even when its checkout is missing.
+    if (replicas.some((rec) => rec.id === id)) return undefined
+    // The scan is synchronous; a caller polling a stale id must not block the loop on every call.
+    const now = Date.now()
+    if (now - this.missScanAt < MISS_SCAN_INTERVAL_MS) return undefined
+    this.missScanAt = now
+    const found = this.scanRoots(replicas, (warning) => console.warn(warning)).find(
+      (r) => r.id === id,
+    )
+    if (!found) return undefined
+    this.store.rememberRepoPaths([found])
+    this.repos.set(id, found)
+    return found
+  }
+
+  /** `get`, but a repo cloned since startup is discovered and reconciled once
+   *  instead of reading as unknown. */
+  async lookup(id: string): Promise<RepoState | undefined> {
+    const state = this.get(id)
+    if (state) return state
+    if (!this.discoverOnMiss(id)) return undefined
+    return this.reconcileOne(id)
   }
 
   listRepos(): Repo[] {
@@ -710,7 +751,7 @@ export class Service {
   }
 
   private repoOrThrow(id: string): Repo {
-    const repo = this.repos.get(id)
+    const repo = this.discoverOnMiss(id)
     if (!repo) throw new Error(`unknown repo: ${id}`)
     return repo
   }

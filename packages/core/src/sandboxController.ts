@@ -215,7 +215,7 @@ export class SandboxController {
   private async poll(sandbox: SandboxView): Promise<void> {
     for (const member of sandbox.members) {
       if (!this.leader()) return
-      if (member.merged) continue
+      if (member.merged || member.source.kind === 'worktree') continue
       let sha: string
       let merged = false
       if (member.source.kind === 'pr') {

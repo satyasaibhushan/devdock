@@ -84,7 +84,9 @@ export function peerPathAllowed(path: string, terminals: boolean): boolean {
     ].includes(pathname)
   )
     return true
-  if (/^\/sandboxes\/[^/]+(?:\/(?:discover|build|wake|sleep|expire|head))?$/.test(pathname))
+  if (
+    /^\/sandboxes\/[^/]+(?:\/(?:discover|build|snapshot|wake|sleep|expire|head))?$/.test(pathname)
+  )
     return true
   if (
     /^\/repos\/[a-zA-Z0-9_.-]+(?:\/(?:checkout|prerequisites|operations|pods|logs(?:\/query)?|branches|replicas|run|wait|exec|startup|start|build|build-start|restart|destroy|adopt|clear|stop-session|release|take-over))?$/.test(
