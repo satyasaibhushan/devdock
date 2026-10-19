@@ -3,8 +3,8 @@
   import Icon from './Icon.svelte'
   import SandboxCard from './SandboxCard.svelte'
 
-  // Every sandbox as a card, personal first, under a thin rail of the namespace
-  // pool. Wake and restore run from here; anything deeper opens the sandbox page.
+  // Every sandbox as a card, personal first, under a thin rail of personal-namespace
+  // slots. Wake and restore run from here; anything deeper opens the sandbox page.
   let {
     sandboxes,
     instance,
@@ -56,13 +56,13 @@
   <button class="btn primary" onclick={onnew}><Icon name="plus" size={12} />New sandbox</button>
 </div>
 <div class="rail">
-  <span class="lbl">pool</span>
+  <span class="lbl">slots</span>
   {#each pool as entry (entry.slot)}
     <span class="sq" class:free={!entry.key} title={entry.key ? `${entry.slot} held by ${entry.key}` : `${entry.slot} is free`}>
       {entry.slot}{entry.key ? ` · ${entry.key}` : ' · free'}
     </span>
   {:else}
-    <span class="sq free">no slots configured</span>
+    <span class="sq free">loading slots</span>
   {/each}
 </div>
 {#if error || actionError}

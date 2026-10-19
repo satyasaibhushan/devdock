@@ -140,6 +140,7 @@ export function applySandboxEvent(list: SandboxView[], event: SandboxEvent): San
   const next: SandboxView = {
     ...previous,
     ...event,
+    ribbon: event.state === 'failed' ? 'failed' : previous.ribbon,
     expiresAt: previous.personal ? previous.expiresAt : event.lastUsedAt + ttl,
   }
   return list.map((s) => (s.key === event.key ? next : s))

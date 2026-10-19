@@ -144,3 +144,14 @@ describe('selectedMember', () => {
     expect(selectedMember([], 'removed:api')).toBeNull()
   })
 })
+
+it('shows failed immediately when a creating sandbox fails before leasing', () => {
+  const creating = view({ state: 'creating', ribbon: 'asleep', slot: undefined })
+  const [next] = applySandboxEvent([creating], {
+    ...creating,
+    state: 'failed',
+    error: 'All 5 sandbox slots are in use',
+  })
+  expect(next?.state).toBe('failed')
+  expect(next?.ribbon).toBe('failed')
+})

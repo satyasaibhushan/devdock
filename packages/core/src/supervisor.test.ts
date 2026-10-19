@@ -467,8 +467,14 @@ it('runs sandbox pipelines with slot vars, persistent placement, and only the se
     configPath: '/tmp/app/devspace.yaml',
     ports: [],
     session: 'app',
-    namespace: 'slot1',
-    varDefaults: { ENVIRONMENT_NAME: 'slot1', WORKLOAD_TYPE: 'worker', QUESTION: 'default' },
+    namespace: 'personal',
+    varDefaults: {
+      ENVIRONMENT_NAME: 'personal',
+      WORKLOAD_TYPE: 'worker',
+      WORKLOAD_NAME: 'app-sb1-worker',
+      INGRESS_HOSTNAME: 'api-personal-sb1-team.vmock.dev',
+      QUESTION: 'default',
+    },
   }
   await supervisor.sandbox(repo, 'sync')
   await supervisor.sandbox(repo, 'deploy', true)
@@ -478,9 +484,11 @@ it('runs sandbox pipelines with slot vars, persistent placement, and only the se
   expect(calls[1]).toContain("'WORKER_PERSISTENT_REPLICAS=1'")
   expect(calls[1]).toContain("'API_PERSISTENT_REPLICAS=0'")
   expect(calls[1]).toContain("'CRON_PERSISTENT_REPLICAS=0'")
-  expect(calls[1]).toContain("'ENVIRONMENT_NAME=slot1'")
+  expect(calls[1]).toContain("'ENVIRONMENT_NAME=personal'")
   expect(calls[1]).toContain("'QUESTION=default'")
-  expect(calls[1]).toContain("-n 'slot1'")
+  expect(calls[1]).toContain("-n 'personal'")
+  expect(calls[1]).toContain("'WORKLOAD_NAME=app-sb1-worker'")
+  expect(calls[1]).toContain("'INGRESS_HOSTNAME=api-personal-sb1-team.vmock.dev'")
   expect(calls[2]).toContain('run-pipeline sandbox-reset')
 })
 

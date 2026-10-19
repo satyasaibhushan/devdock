@@ -53,7 +53,7 @@ export function sandboxTools(client: DaemonClient): ToolDef[] {
     {
       name: 'create',
       scope: 'rw',
-      description: `Create a ticket sandbox and build its members. ${memberHelp} Records actor; returns operationId.`,
+      description: `Create a ticket sandbox in the personal namespace using the lowest free sb<n> suffix, up to DEVDOCK_SANDBOX_MAX (default 5), and build its members. ${memberHelp} Records actor; returns operationId.`,
       schema: {
         ...key,
         ...actor,
@@ -89,6 +89,14 @@ export function sandboxTools(client: DaemonClient): ToolDef[] {
     },
     ...(['wake', 'sleep', 'expire', 'delete'] as const).map((action) => ({
       name: action,
+      description:
+        action === 'expire'
+          ? 'Uninstall suffixed sandbox releases and routing ingresses, free the slot, retain the snapshot and TLS certificate.'
+          : action === 'delete'
+            ? 'Delete the sandbox, its suffixed releases, routing and unused slot TLS resources.'
+            : action === 'wake'
+              ? 'Wake suffixed deployments, or restore recorded images in their original slot. Rebuild if that slot is occupied.'
+              : 'Scale only this sandbox’s suffixed deployments to zero.',
       scope: 'rw' as const,
       schema: { ...key, ...actor, ...(action === 'wake' ? { evict: z.boolean().optional() } : {}) },
       call: (a: Record<string, unknown>) =>

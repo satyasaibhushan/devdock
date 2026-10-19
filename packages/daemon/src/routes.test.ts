@@ -27,6 +27,8 @@ function makeService(start = vi.fn(), instanceId?: string) {
       // `config view` reads the context namespace; `set-context` switches it
       return { code: 0, stdout: args[1] === 'view' ? 'testns' : '', stderr: '' }
     }
+    if (cmd === 'kubectl' && args[1] === 'configmap' && args[2]?.startsWith('devdock-sandbox-'))
+      return { code: 0, stdout: '', stderr: '' }
     if (cmd === 'kubectl' && args.includes('configmap'))
       return {
         code: 0,
