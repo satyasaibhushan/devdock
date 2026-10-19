@@ -103,6 +103,7 @@ export function parsePods(json: string): PodInfo[] {
     const status = (item as { status?: Record<string, unknown> }).status ?? {}
     type ContainerStatus = {
       ready?: boolean
+      imageID?: string
       restartCount?: number
       state?: { waiting?: { reason?: string }; terminated?: { exitCode?: number } }
     }
@@ -123,7 +124,14 @@ export function parsePods(json: string): PodInfo[] {
     )
     const restartCount = containers.reduce((sum, c) => sum + (c.restartCount ?? 0), 0)
     const ready = containers.length > 0 && containers.every((c) => c.ready === true)
+    const spec = (item as { spec?: { nodeName?: string } }).spec
+    const scheduled = spec?.nodeName !== undefined ? !!spec.nodeName : undefined
+    const imagePulled =
+      containers.length > 0 &&
+      containers.every((c) => typeof c.imageID === 'string' && c.imageID.length > 0)
     pods.push({
+      ...(scheduled !== undefined ? { scheduled } : {}),
+      ...(imagePulled ? { imagePulled: true } : {}),
       name: meta?.name ?? '<unknown>',
       phase: typeof status.phase === 'string' ? status.phase : 'Unknown',
       ready,

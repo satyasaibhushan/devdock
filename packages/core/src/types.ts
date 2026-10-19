@@ -98,6 +98,8 @@ export interface WorkloadState {
 
 /** A pod observed in the cluster during reconciliation. */
 export interface PodInfo {
+  scheduled?: boolean
+  imagePulled?: boolean
   /** A current container failure, not historical restart counts. */
   crashing?: boolean
   name: string
