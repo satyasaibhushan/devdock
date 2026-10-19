@@ -16,7 +16,7 @@ import { type Operation, type OperationStage, Operations } from './operations.js
 import { DeploymentOwnership } from './ownership.js'
 import { PtyBroker } from './ptyBroker.js'
 import { type ClusterCache, Reconciler, newClusterCache } from './reconciler.js'
-import { parseDevspaceConfig, scanRepos, sessionName } from './registry.js'
+import { duplicateRepoWarning, parseDevspaceConfig, scanRepos, sessionName } from './registry.js'
 import {
   aliasIngressManifest,
   generateReplicaConfig,
@@ -217,6 +217,7 @@ export class Service {
   private readonly streamSpawner: SpawnFn
   private readonly store: StateStore
   private readonly repos = new Map<string, Repo>()
+  private scanWarnings: string[] = []
   private readonly states = new Map<string, RepoState>()
   /** One log stream per workload: pod logs + verb activity. The `devspace dev`
    *  pane itself is deliberately NOT fed in here — the Terminal panel already
@@ -623,18 +624,34 @@ export class Service {
    *  their persisted records — never from the scanner, which would re-register
    *  the parent's own configs found inside each worktree. */
   rescan(): Repo[] {
-    const found = scanRepos(this.opts.roots.length ? { roots: this.opts.roots } : {})
+    this.scanWarnings = []
+    const onWarning = (warning: string) => {
+      this.scanWarnings.push(warning)
+      console.warn(warning)
+    }
+    const preferredPaths = this.store.repoPaths()
+    for (const repo of this.repos.values()) preferredPaths.set(repo.id, repo.path)
+    const replicas = this.store.listReplicas()
+    for (const rec of replicas) preferredPaths.set(rec.id, rec.path)
+    const found = scanRepos({
+      roots: this.opts.roots.length ? this.opts.roots : undefined,
+      preferredPaths,
+      onWarning,
+    })
     const next = new Map<string, Repo>()
     for (const r of found) next.set(r.id, r)
-    for (const rec of this.store.listReplicas()) {
-      const repo = this.materializeReplica(rec)
-      if (!repo) continue
-      const existing = next.get(repo.id)
-      if (existing && existing.path !== repo.path) {
-        throw new Error(`duplicate repo id "${repo.id}": ${existing.path} and ${repo.path}`)
+    for (const rec of replicas) {
+      const existing = next.get(rec.id)
+      // A replica record owns its id even when its checkout is missing. Never
+      // attach its sessions/startup commands to an unrelated scanned checkout.
+      if (existing && existing.path !== rec.path) {
+        onWarning(duplicateRepoWarning(rec.id, rec.path, existing.path))
       }
-      next.set(repo.id, repo)
+      next.delete(rec.id)
+      const repo = this.materializeReplica(rec)
+      if (repo) next.set(repo.id, repo)
     }
+    this.store.rememberRepoPaths([...next.values()])
     this.repos.clear()
     for (const [id, repo] of next) this.repos.set(id, repo)
     return this.listRepos()
@@ -678,9 +695,9 @@ export class Service {
     return this.states.get(id)
   }
 
-  health(): { ok: boolean; state: { ok: boolean; error?: string } } {
+  health(): { ok: boolean; state: { ok: boolean; error?: string }; warnings: string[] } {
     const state = this.store.health()
-    return { ok: state.ok, state }
+    return { ok: state.ok, state, warnings: [...this.scanWarnings] }
   }
 
   private repoOrThrow(id: string): Repo {

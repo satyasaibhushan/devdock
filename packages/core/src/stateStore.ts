@@ -53,6 +53,8 @@ export interface ReplicaRecord {
 }
 
 interface Persisted {
+  /** Last registered paths disambiguate repo ids across daemon restarts. */
+  repoPaths: Record<string, string>
   sandboxes: Record<string, Sandbox>
   /** last-known status per repo id, keyed for fast lookup across restarts. */
   status: Record<string, RepoStatus>
@@ -79,6 +81,7 @@ interface Persisted {
 }
 
 const EMPTY: Persisted = {
+  repoPaths: {},
   sandboxes: {},
   status: {},
   grants: [],
@@ -102,6 +105,7 @@ export class StateStore {
     try {
       const parsed = JSON.parse(readFileSync(file, 'utf8')) as Partial<Persisted>
       return {
+        repoPaths: parsed.repoPaths ?? {},
         sandboxes: parsed.sandboxes ?? {},
         status: parsed.status ?? {},
         grants: parsed.grants ?? [],
@@ -158,6 +162,22 @@ export class StateStore {
 
   health(): { ok: boolean; error?: string } {
     return this.lastError ? { ok: false, error: this.lastError } : { ok: true }
+  }
+
+  repoPaths(): Map<string, string> {
+    return new Map(Object.entries(this.data.repoPaths))
+  }
+
+  rememberRepoPaths(repos: { id: string; path: string }[]): void {
+    for (const repo of repos) {
+      Object.defineProperty(this.data.repoPaths, repo.id, {
+        value: repo.path,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      })
+    }
+    this.flush()
   }
 
   getStatus(repo: string): RepoStatus | undefined {

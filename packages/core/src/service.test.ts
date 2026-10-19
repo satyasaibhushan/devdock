@@ -76,6 +76,81 @@ function fakeStreamSpawner() {
 }
 
 describe('Service', () => {
+  it('starts and rescans with duplicates while retaining the registered path across restarts', async () => {
+    const known = join(root, 'svc-a')
+    const ignored = join(root, 'a', 'svc-a')
+    const options = { roots: [root], stateFile }
+    const deps = {
+      runner: cannedRunner('{"items":[]}', false),
+      streamSpawner: fakeStreamSpawner().spawner,
+    }
+    const original = new Service(options, deps)
+    original.rescan()
+    original.setStartupCommand('svc-a', 'echo ready')
+    mkdirSync(ignored, { recursive: true })
+    writeFileSync(join(ignored, 'devspace.yaml'), 'name: unrelated\n')
+    const warning = `duplicate repo id "svc-a": keeping ${known}; ${ignored} is ignored`
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    try {
+      expect(original.rescan().find((repo) => repo.id === 'svc-a')?.path).toBe(known)
+      const restarted = new Service(options, deps)
+      try {
+        await expect(restarted.startLoop()).resolves.toBeUndefined()
+        expect(restarted.rescan().find((repo) => repo.id === 'svc-a')?.path).toBe(known)
+        expect(restarted.health().warnings).toEqual([warning])
+        expect(restarted.getStartupCommand('svc-a')).toBe('echo ready')
+        expect(warn).toHaveBeenCalledWith(warning)
+        rmSync(ignored, { recursive: true })
+        restarted.rescan()
+        expect(restarted.health().warnings).toEqual([])
+      } finally {
+        restarted.stopLoop()
+      }
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  it.each([false, true])(
+    'reserves replica identity when its checkout is missing: %s',
+    (missing) => {
+      const path = join(root, '.devdock-svc-a-r1')
+      const config = join(path, 'devspace.yaml')
+      const ignored = join(root, 'svc-a-r1')
+      mkdirSync(ignored, { recursive: true })
+      writeFileSync(join(ignored, 'devspace.yaml'), 'name: unrelated\n')
+      if (!missing) {
+        mkdirSync(path, { recursive: true })
+        writeFileSync(config, 'name: svc-a-r1\n')
+      }
+      const store = new StateStore(stateFile)
+      store.addReplica({
+        id: 'svc-a-r1',
+        parentId: 'svc-a',
+        branch: 'feature',
+        path,
+        configPaths: [config],
+        createdAt: Date.now(),
+      })
+      const svc = new Service(
+        { roots: [root], stateFile },
+        { runner: cannedRunner('{"items":[]}', false) },
+      )
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+      try {
+        const replica = svc.rescan().find((repo) => repo.id === 'svc-a-r1')
+        if (missing) expect(replica).toBeUndefined()
+        else expect(replica).toMatchObject({ path, parentId: 'svc-a', branch: 'feature' })
+        expect(svc.health().warnings).toEqual([
+          `duplicate repo id "svc-a-r1": keeping ${path}; ${ignored} is ignored`,
+        ])
+        expect(svc.listReplicas()).toEqual(store.listReplicas())
+      } finally {
+        warn.mockRestore()
+      }
+    },
+  )
+
   it('completes the deploy-dev-verify workflow only after readiness and a matching HTTP response', async () => {
     writeFileSync(
       join(root, 'workflow.json'),

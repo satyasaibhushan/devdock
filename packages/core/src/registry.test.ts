@@ -1,6 +1,6 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { parseDevspaceConfig, scanRepos, sessionName } from './registry.js'
 
@@ -189,13 +189,43 @@ describe('scanRepos', () => {
     expect(repos.find((r) => r.id === 'jobs-api')?.codeArea).toBe('backend')
   })
 
-  it('fails instead of overwriting two repos with the same id', () => {
-    for (const area of ['backend', 'frontend']) {
-      mkdirSync(join(root, area, 'shared-name'), { recursive: true })
-      writeFileSync(join(root, area, 'shared-name', 'devspace.yaml'), 'name: shared-name\n')
+  it('keeps the first sorted path regardless of root order and warns about ignored duplicates', () => {
+    const backend = join(root, 'backend', 'shared-name')
+    const frontend = join(root, 'frontend', 'shared-name')
+    for (const path of [frontend, backend]) {
+      mkdirSync(path, { recursive: true })
+      writeFileSync(join(path, 'devspace.yaml'), 'name: shared-name\n')
     }
-    expect(() => scanRepos({ roots: [join(root, 'backend'), join(root, 'frontend')] })).toThrow(
-      /duplicate repo id "shared-name"/,
-    )
+    for (const roots of [
+      [dirname(frontend), dirname(backend)],
+      [dirname(backend), dirname(frontend)],
+    ]) {
+      const warnings: string[] = []
+      const repos = scanRepos({ roots, onWarning: (warning) => warnings.push(warning) })
+      expect(repos.map((repo) => repo.path)).toEqual([backend])
+      expect(warnings).toEqual([
+        `duplicate repo id "shared-name": keeping ${backend}; ${frontend} is ignored`,
+      ])
+    }
+  })
+
+  it('prefers a known path over the first sorted path', () => {
+    const first = join(root, 'a', 'shared-name')
+    const known = join(root, 'z', 'shared-name')
+    for (const path of [first, known]) {
+      mkdirSync(path, { recursive: true })
+      writeFileSync(join(path, 'devspace.yaml'), 'name: shared-name\n')
+    }
+    const warnings: string[] = []
+    expect(
+      scanRepos({
+        roots: [root],
+        preferredPaths: new Map([['shared-name', known]]),
+        onWarning: (warning) => warnings.push(warning),
+      }).map((repo) => repo.path),
+    ).toEqual([known])
+    expect(warnings).toEqual([
+      `duplicate repo id "shared-name": keeping ${known}; ${first} is ignored`,
+    ])
   })
 })

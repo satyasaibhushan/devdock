@@ -41,12 +41,50 @@ trap cleanup EXIT
   "$PNPM_BIN" --filter @devdock/mcp exec tsc -b tsconfig.json --force
   "$PNPM_BIN" --filter @devdock/web build
 
-  mkdir -p "$STAGING/packages"
-  "$PNPM_BIN" --filter @devdock/daemon deploy --prod --legacy "$STAGING/packages/daemon"
-  "$PNPM_BIN" --filter @devdock/mcp deploy --prod --legacy "$STAGING/packages/mcp"
+  # Hoisting adds workspace self-links back to the checkout. Keep only the
+  # deployed dependency links, which are relative to each portable package.
+  DEPLOYED="$STAGING/.deployed"
+  mkdir -p "$DEPLOYED/packages"
+  "$PNPM_BIN" --filter @devdock/daemon deploy --prod --legacy --config.hoist=false "$DEPLOYED/packages/daemon"
+  "$PNPM_BIN" --filter @devdock/mcp deploy --prod --legacy --config.hoist=false "$DEPLOYED/packages/mcp"
+  # pnpm hardlinks local workspace files even with package-import-method=copy.
+  # A fresh copy breaks those inodes without dereferencing internal symlinks.
+  cp -R "$DEPLOYED/packages" "$STAGING/packages"
+  rm -rf "$DEPLOYED"
   mkdir -p "$STAGING/packages/web"
   cp -R "$REPO_ROOT/packages/web/dist" "$STAGING/packages/web/dist"
 )
+
+# Reject checkout/store links and shared files before importing or handing over.
+"$NODE_BIN" --input-type=module - "$STAGING" <<'NODE'
+import { lstatSync, readdirSync, realpathSync } from 'node:fs'
+import { join, relative, isAbsolute } from 'node:path'
+
+const root = realpathSync(process.argv[2])
+function verify(directory) {
+  for (const name of readdirSync(directory)) {
+    const path = join(directory, name)
+    const stat = lstatSync(path)
+    if (stat.isSymbolicLink()) {
+      let target
+      try {
+        target = realpathSync(path)
+      } catch {
+        throw new Error(`portable release symlink is broken: ${path}`)
+      }
+      const resolved = relative(root, target)
+      if (resolved === '..' || resolved.startsWith('../') || isAbsolute(resolved)) {
+        throw new Error(`portable release symlink escapes staging: ${path} -> ${target}`)
+      }
+    } else if (stat.isDirectory()) {
+      verify(path)
+    } else if (stat.isFile() && stat.nlink !== 1) {
+      throw new Error(`portable release file has hardlinks: ${path}`)
+    }
+  }
+}
+verify(root)
+NODE
 
 STAGED_DAEMON="$STAGING/packages/daemon/dist/index.js"
 STAGED_CORE="$STAGING/packages/daemon/node_modules/@devdock/core/dist/index.js"

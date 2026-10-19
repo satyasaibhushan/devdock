@@ -148,7 +148,31 @@ describe('daemon routes', () => {
     const { svc } = makeService()
     const app = buildApp(svc)
     const res = await app.inject({ method: 'GET', url: '/health' })
-    expect(res.json()).toEqual({ ok: true, state: { ok: true } })
+    expect(res.json()).toEqual({ ok: true, state: { ok: true }, warnings: [] })
+  })
+
+  it('reports ignored duplicate configs through /health without failing health checks', async () => {
+    const { svc } = makeService()
+    const ignored = join(root, 'templates', 'svc-a')
+    mkdirSync(ignored, { recursive: true })
+    writeFileSync(join(ignored, 'devspace.yaml'), 'name: template\n')
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    const app = buildApp(svc)
+    try {
+      svc.rescan()
+      const res = await app.inject({ method: 'GET', url: '/health' })
+      expect(res.statusCode).toBe(200)
+      expect(res.json()).toEqual({
+        ok: true,
+        state: { ok: true },
+        warnings: [
+          `duplicate repo id "svc-a": keeping ${join(root, 'svc-a')}; ${ignored} is ignored`,
+        ],
+      })
+    } finally {
+      warn.mockRestore()
+      await app.close()
+    }
   })
 
   it('applies ingress authority before routes run', async () => {
