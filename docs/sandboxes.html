@@ -70,7 +70,7 @@
   <a href="#why">1 · Why</a>
   <a href="#rbac">2 · Constraints found</a>
   <a href="#model">3 · Model</a>
-  <a href="#slots">4 · Namespace slots</a>
+  <a href="#slots">4 · Personal namespace slots</a>
   <a href="#build">5 · Building a member</a>
   <a href="#power">6 · Wake and sleep</a>
   <a href="#life">7 · Lifecycle and expiry</a>
@@ -93,21 +93,21 @@
 
   <div class="box">
     <div class="t">TL;DR</div>
-    A <b>sandbox</b> is a ticket key bound to a <b>namespace slot</b> plus a list of <b>members</b> (repo + workload + an optional checkout path). Members are built as <code>persistent</code> images from a checkout's current files, uncommitted edits included, and helm-upgraded over the slot's UAT proxy releases. Short in-cluster service names resolve inside the slot, so members call each other and everything else proxies to <code>uat-us</code>. Pods sleep at 0 replicas until woken. Unused for 24h, a sandbox <b>expires</b>: its slot is reset and freed, the record stays for a one-click rebuild. Nothing is deleted except by an explicit agent or human call.
+    A <b>sandbox</b> is a ticket key bound to an <code>sb&lt;n&gt;</code> suffix inside the personal namespace plus a list of members. Persistent images build from current checkout files, including uncommitted edits. Suffixed releases coexist with personal releases. Member URLs route to sandbox members; other URLs keep using personal services. Pods start asleep. Expiry uninstalls sandbox releases and frees the suffix while retaining the record, snapshot and TLS certificate.
   </div>
 
   <h2 id="why">1 · Why</h2>
-  <p>One ticket often lands as PRs in 3 to 4 repos. Reviewing it today means merging into <code>-uat</code> branches or hand-running dev pods. Dev namespaces already proxy every API to UAT through <code>ExternalName</code> services (<code>dev-env env:create</code> in <code>vmockinc/devops</code>), and <code>devspace deploy</code> swaps a proxy for real code on the same release name. Sandboxes automate exactly that, per ticket.</p>
+  <p>One ticket often lands as PRs in several repos. Sandboxes deploy those members together inside the existing personal namespace without creating namespaces, role bindings or service accounts.</p>
 
   <h2 id="rbac">2 · Constraints found</h2>
   <p>Checked with <code>kubectl auth can-i</code> as the developer account (2026-10-19):</p>
   <table>
     <tr><th>Action</th><th>Allowed</th><th>Consequence</th></tr>
-    <tr><td>create / delete namespaces</td><td>no</td><td>devdock cannot make a namespace per ticket. It leases from a pool of pre-provisioned slots (§4).</td></tr>
+    <tr><td>create / delete namespaces</td><td>no</td><td>devdock cannot make a namespace per ticket. It allocates suffixes inside the personal namespace (§4).</td></tr>
     <tr><td>deployments, services, ingresses, configmaps, secrets, jobs in own namespace</td><td>yes</td><td>helm upgrade, replica patching and ConfigMap records all work inside a slot the developer owns.</td></tr>
     <tr><td><code>deployments/scale</code> subresource</td><td>no</td><td>Wake/sleep patches <code>spec.replicas</code> on the deployment instead of <code>kubectl scale</code>.</td></tr>
     <tr><td>leases.coordination.k8s.io</td><td>no</td><td>Controller leadership uses a ConfigMap with resourceVersion compare-and-swap (§11).</td></tr>
-    <tr><td>priorityclasses</td><td>no</td><td>Low-priority scheduling is an infra ask (§14). Until then the pool size is the cost cap.</td></tr>
+    <tr><td>priorityclasses</td><td>no</td><td>Low-priority scheduling is an infra ask (§14). The sandbox maximum caps concurrent slots.</td></tr>
   </table>
   <p>Cluster sleep facts that shape the design: the <code>devspace-sleep</code> CronJobs only scale deployments labelled <code>devspace.sh/replaced=true</code> (dev mode). Persistent deploys never carry that label, so sandboxes are untouched by them. The UAT nodegroup ASG goes to 0 from 01:00 to 09:00 IST; awake sandbox pods simply reschedule when nodes return.</p>
 
@@ -115,7 +115,7 @@
 <pre><span class="k">interface</span> Sandbox {
   key: string                 <span class="c">// ticket key as typed: 'SULF-1234'</span>
   title?: string
-  slot?: string               <span class="c">// namespace currently leased; unset while expired</span>
+  slot?: string               <span class="c">// suffix currently leased; unset while expired</span>
   state: 'creating' | 'active' | 'expired' | 'failed'
   createdAt, lastUsedAt: number
   members: SandboxMember[]
@@ -151,13 +151,14 @@
     <li>The view adds <code>link</code> (the stable per-ticket URL, §10), <code>markdown</code> (a PR-body block: state, link, live URL, per-member <code>repo workload &lt;branch&gt; @ &lt;sha&gt; (+N uncommitted files) PR #n</code>), <code>healthy</code>, <code>ribbon</code>, <code>pool</code> and <code>evictionCandidate</code>.</li>
   </ul>
 
-  <h2 id="slots">4 · Namespace slots</h2>
+  <h2 id="slots">4 · Personal namespace slots</h2>
   <ul>
-    <li>The pool is <code>DEVDOCK_SANDBOX_NAMESPACES</code> (comma list), e.g. <code>saibhushan-sb1,saibhushan-sb2</code>. Infra creates them once with <code>dev-env env:create &lt;slot&gt; --owner_uid &lt;email&gt;</code>.</li>
-    <li>A sandbox leases one free slot on create or rebuild. The lease is a ConfigMap <code>devdock-sandbox</code> in the slot holding <code>{key, instanceId, members, shas}</code>. A slot whose ConfigMap names another key is busy. An operation claim in the same ConfigMap serializes lifecycle mutations across instances using resourceVersion compare-and-swap. It is separate from controller leadership.</li>
-    <li>Pool size caps concurrent sandboxes, ECR tags (<code>IMAGE_TAG</code> is <code>&lt;slot&gt;-&lt;workload&gt;</code>, overwritten per build) and cost.</li>
-    <li>The personal namespace may be listed as a slot for trials. A member whose release is held by a live dev session there is refused, never clobbered.</li>
-    <li>URLs are read from the slot's Ingress objects (authoritative), e.g. <code>dashboard-&lt;slot&gt;.vmock.dev</code>, <code>api-&lt;slot&gt;-&lt;team&gt;.vmock.dev/&lt;svc&gt;</code>. The UI shows ticket → URL, so slot names never matter to the reader.</li>
+    <li>Allocate the lowest free <code>sb1</code>, <code>sb2</code>, etc. on demand. <code>DEVDOCK_SANDBOX_MAX</code> defaults to 5. No namespace pool or admin setup is required.</li>
+    <li>Lease ConfigMaps are <code>devdock-sandbox-&lt;slot&gt;</code> in the personal namespace. Creation claims a slot atomically; resourceVersion compare-and-swap serializes operations across instances.</li>
+    <li>Namespace and <code>ENVIRONMENT_NAME</code> stay personal. <code>WORKLOAD_NAME=&lt;DEVSPACE_NAME&gt;-&lt;slot&gt;-&lt;workload&gt;</code>. Hosts insert the suffix after the namespace, for example <code>api-saibhushan-sb1-candidate.vmock.dev</code>. Image tags contain the content hash and slot.</li>
+    <li>Member hosts and fallback routes derive from personal ingresses. Non-member API paths retain their personal service backends. Generated routing ingresses use <code>devdock-&lt;slot&gt;-route-*</code>.</li>
+    <li>A TLS master ingress <code>devdock-&lt;slot&gt;-tls</code> covers served hosts, uses <code>letsencrypt-issuer</code> and stores its certificate in the same-named secret. Expiry retains both across reuse and rebuild to avoid duplicate-certificate rate limits on the shared company domain. Explicit delete removes TLS resources only while holding that slot; it cannot delete another sandbox's certificate.</li>
+    <li>Displayed URLs come from the sandbox's own ingresses. Legacy namespace-slot records become expired and can be rebuilt or restored.</li>
   </ul>
 
   <h2 id="build">5 · Building a member</h2>
@@ -165,17 +166,17 @@
     <li>Source: the member's <code>path</code> (an agent worktree of the repo) or, when absent, the repo's registered checkout. devdock never checks out, fetches or switches branches; it builds whatever the checkout holds.</li>
     <li>Copy: <code>git ls-files -co --exclude-standard</code> (tracked and untracked, ignored and deleted excluded) is copied into a devdock-owned temp build dir beside the parent checkout (same placement rule as replicas: outside any sync root, keyed by slot and a hash of repo + workload) and built from there, so generated configs never land in the source checkout. The dir is removed after the build. Submodules are refused.</li>
     <li>Record: <code>deployedSha</code> is the source's HEAD, <code>dirtyFiles</code> its changed and untracked paths, <code>branch</code> its branch (absent when detached). With a branch, <code>gh pr view</code> (15s timeout) fills <code>pr</code>; any gh failure just leaves it out and never fails or stalls the build.</li>
-    <li>Env: <code>devspace run-pipeline sync-env</code> in the build dir with <code>--var ENVIRONMENT_NAME=&lt;slot&gt;</code>, so <code>prepare_local_env</code> rewrites hosts for the slot.</li>
-    <li>Deploy: <code>devspace deploy -n &lt;slot&gt; -p persistent</code> with vars <code>ENVIRONMENT_NAME=&lt;slot&gt;</code>, <code>WORKLOAD_TYPE=&lt;workload&gt;</code>, <code>API_PERSISTENT_REPLICAS</code>/<code>WEB_PERSISTENT_REPLICAS</code> = current power (0 asleep, 1 awake), <code>CRON_/WORKER_PERSISTENT_REPLICAS=0</code> unless named.</li>
+    <li>Env: <code>devspace run-pipeline sync-env</code> in the build dir with the personal <code>ENVIRONMENT_NAME</code>. Then devdock rewrites exact member service URL authorities and served hosts in the temporary .env. Other dependencies stay personal.</li>
+    <li>Deploy: <code>devspace deploy -n &lt;personal&gt; -p persistent -p sandbox</code> with vars <code>ENVIRONMENT_NAME=&lt;personal&gt;</code>, <code>WORKLOAD_TYPE=&lt;workload&gt;</code>, <code>API_PERSISTENT_REPLICAS</code>/<code>WEB_PERSISTENT_REPLICAS</code> = current power (0 asleep, 1 awake), <code>CRON_/WORKER_PERSISTENT_REPLICAS=0</code> unless named.</li>
     <li>Placement: the <code>persistent</code> profile pins <code>nodeSelector: workload: products</code> (the UAT nodegroup). A generated, untracked config in the build dir adds a values file setting <code>workload: development</code> so sandboxes never consume UAT capacity.</li>
-    <li>Same tag every build, so an awake member gets a <code>rollout restart</code> after a successful deploy.</li>
+    <li>Content and slot determine the image tag. Helm rolls changed images; an awake member restarts only when reusing the same image.</li>
     <li>One build per (sandbox, member). Builds run only when asked (create, build, snapshot, rebuild); nothing watches the checkout.</li>
   </ol>
 
   <h2 id="power">6 · Wake and sleep</h2>
   <ul>
     <li><b>Wake</b>: patch <code>spec.replicas=1</code> on each member's api/ui deployment, showing what was last deployed; nothing is rebuilt. Typical 20 to 60s.</li>
-    <li><b>Restore</b>: wake on an expired sandbox with a retained snapshot leases a free slot and deploys the recorded images with <code>--skip-build</code>; nothing is rebuilt. A full pool fails naming the least-recently-used asleep sandbox; <code>evict: true</code> expires that one first. Awake, building or creating sandboxes are never evicted. Without a snapshot the call fails: rebuild first.</li>
+    <li><b>Restore</b>: wake on an expired sandbox with a retained snapshot leases the recorded slot and deploys the recorded images with <code>--skip-build</code>; nothing is rebuilt. Baked UI hosts require the original slot; rebuild if it is occupied. A full set of slots fails naming the least-recently-used asleep sandbox; <code>evict: true</code> expires that one first. Awake, building or creating sandboxes are never evicted. Without a snapshot the call fails: rebuild first.</li>
     <li><b>Sleep</b>: patch <code>spec.replicas=0</code>. Images and releases stay.</li>
     <li>Both are any-machine operations: only builds and dev sessions are tied to a machine.</li>
   </ul>
@@ -189,7 +190,8 @@
    any state ──(explicit delete by agent or you)──▶ gone</pre>
   <ul>
     <li><b>Used</b> = wake, build, or any mutating MCP/UI call. Request traffic is not tracked.</li>
-    <li><b>Expire</b>: reset every member release in the slot to its default (UAT proxy for api, purge for others; a generated reset pipeline runs <code>create_deployments default</code> for api and <code>purge_deployments</code> for other members; the shared UI purge pipeline restores a proxy, so it cannot implement the non-api rule directly), delete the slot ConfigMap, remove worktrees, free the slot. Keep key, members, last shas, activity.</li>
+    <li><b>Expire</b>: <code>helm uninstall &lt;suffixed-release&gt; -n &lt;personal&gt; --ignore-not-found</code> for each member, delete generated fallback ingresses and the lease ConfigMap, remove worktrees, free the suffix. Keep the snapshot, record and TLS resources. Never reset a personal release.</li>
+    <li>Helm wait is disabled because ReplicaSet listing is forbidden. Readiness comes from deployment ready/updated replicas and observed generation. Failed creates show failed and can be deleted or rebuilt.</li>
     <li><b>Rebuild</b>: lease a slot, build every member from its checkout's current files, leave asleep unless asked to wake.</li>
     <li><b>Delete</b>: explicit only. Expires first if active, then removes the record.</li>
   </ul>
@@ -246,7 +248,7 @@
   <ul>
     <li><b>Snapshot cards</b>: the Sandboxes entry at the top of the sidebar opens a card grid under a thin rail of pool slots and their holders. One card per sandbox (personal first, full width): state ribbon (awake, building, asleep, expired restorable, failed), key and title, one sentence, a <i>shows</i> box listing per member <code>repo workload  branch @ sha7  PR #n  +N files</code>, the stable link, and one primary action: Open, Wake, Restore (or Evict and restore), or Build logs. The key opens the sandbox page below. <code>/s/:key</code> renders the same card server-side.</li>
     <li>The personal sandbox is selected by default; its detail is today's repo detail (verbs, logs, terminal, machine picker) with repos as rows and <b>+ add repo</b> searching discovered repos.</li>
-    <li>The namespace picker leaves the top bar: choosing a sandbox chooses its namespace.</li>
+    <li>Choosing a sandbox selects its suffixed workloads within the personal namespace.</li>
     <li>Ticket detail: header actions, URL chips, members table (checkout, deployed branch @ sha with PR and dirty files, build state, owning machine), activity feed with actors, log pane for the selected member.</li>
     <li>New sandbox: type a key, add rows of repo, workload and an optional worktree path (empty builds the repo's checkout), Create starts one operation shown in the existing WorkflowPanel.</li>
   </ul>
@@ -256,7 +258,7 @@
 
   <h2 id="asks">14 · Infra asks</h2>
   <ol>
-    <li>Create 2 to 3 slots: <code>dev-env env:create saibhushan-sb&lt;n&gt; --owner_uid &lt;email&gt;</code>.</li>
+    <li>No namespace provisioning is needed. Set <code>DEVDOCK_SANDBOX_MAX</code> only to change the default limit of 5.</li>
     <li>A PriorityClass below the autoscaler's expendable cutoff (value &lt; -10) so sandbox pods only use spare capacity and never add a node.</li>
   </ol>
 
@@ -269,7 +271,7 @@
 
   <h2 id="open">16 · Unverified</h2>
   <ul>
-    <li>Whether <code>env:create</code> also runs UIs in a slot with slot env. If not, UI members are added from the base branch.</li>
+    <li>Live validation still needs DNS, TLS issuance, frontend baked hosts and non-member API fallback checks.</li>
     <li>Real image sizes, readiness timings, and whether the Dockerfiles cache composer/npm layers.</li>
     <li>Whether any UAT traffic still goes through the older ECS services (S3 env files still name <code>*.vmock.com</code> hosts).</li>
     <li>Pull policy of the service chart (decides whether <code>rollout restart</code> pulls the new image).</li>

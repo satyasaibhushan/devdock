@@ -28,6 +28,14 @@ import {
   sandboxImagePipeline,
   sandboxRestart,
 } from './sandboxImages.js'
+import {
+  type SandboxIngress,
+  guardSandboxName,
+  rewriteSandboxEnv,
+  sandboxRouting,
+  sandboxSlot,
+  sandboxWorkloadName,
+} from './sandboxRouting.js'
 import type { StateStore } from './stateStore.js'
 import type { Supervisor } from './supervisor.js'
 import type { Repo } from './types.js'
@@ -75,6 +83,7 @@ export interface SandboxSnapshotMember {
   pr?: SandboxPr
 }
 export interface SandboxSnapshot {
+  slot?: string
   at: number
   actor: string
   members: SandboxSnapshotMember[]
@@ -83,6 +92,7 @@ export interface Sandbox {
   key: string
   title?: string
   slot?: string
+  retainedSlot?: string
   state: 'creating' | 'active' | 'expired' | 'failed'
   createdAt: number
   lastUsedAt: number
@@ -107,7 +117,7 @@ export interface SandboxView extends Sandbox {
   markdown: string
   expiresAt: number
   personal?: boolean
-  /** Namespace pool with the key holding each slot. */
+  /** Personal namespace suffixes with the key holding each slot. */
   pool: { slot: string; key?: string }[]
   /** Least-recently-used asleep sandbox, offered only while the pool is full. */
   evictionCandidate?: string
@@ -221,20 +231,28 @@ export class Sandboxes {
   constructor(private readonly deps: SandboxDeps) {}
 
   private pool(): string[] {
-    const slots = [
-      ...new Set(
-        (process.env.DEVDOCK_SANDBOX_NAMESPACES ?? '')
-          .split(',')
-          .map((s) => s.trim())
-          .filter(Boolean),
-      ),
-    ]
-    if (slots.some((s) => !namespacePattern.test(s))) throw new Error('Invalid sandbox namespace')
-    return slots
+    const max = Number(process.env.DEVDOCK_SANDBOX_MAX ?? 5)
+    if (!Number.isSafeInteger(max) || max < 1) throw new Error('Invalid sandbox maximum')
+    return Array.from({ length: max }, (_, i) => `sb${i + 1}`)
   }
+  private async namespace(): Promise<string> {
+    const namespace = await this.deps.namespace()
+    if (!namespacePattern.test(namespace)) throw new Error('Sandbox requires a personal namespace')
+    return namespace
+  }
+  private name(s: Sandbox, member: SandboxMemberInput): string {
+    return sandboxWorkloadName(this.repo(member), member.workload, s.slot as string)
+  }
+
   private get(key: string): Sandbox {
     const record = this.deps.store.getSandbox(key)
     if (!record) throw new Error(`unknown sandbox: ${key}`)
+    if (record.slot && !sandboxSlot(record.slot)) {
+      record.slot = undefined
+      record.state = 'expired'
+      record.expiredAt ??= Date.now()
+      this.save(record)
+    }
     return record
   }
   private save(s: Sandbox): void {
@@ -288,9 +306,9 @@ export class Sandboxes {
     const raw = await this.checked('kubectl', [
       'get',
       'configmap',
-      'devdock-sandbox',
+      guardSandboxName(`devdock-sandbox-${slot}`, slot),
       '-n',
-      slot,
+      await this.namespace(),
       '--ignore-not-found',
       '-o',
       'json',
@@ -327,9 +345,9 @@ export class Sandboxes {
     await this.checked('kubectl', [
       'patch',
       'configmap',
-      'devdock-sandbox',
+      guardSandboxName(`devdock-sandbox-${s.slot}`, s.slot as string),
       '-n',
-      s.slot as string,
+      await this.namespace(),
       '--type=json',
       '-p',
       JSON.stringify([
@@ -341,23 +359,31 @@ export class Sandboxes {
     ])
   }
   private async available(s: Sandbox, slot: string): Promise<void> {
-    for (const member of s.members) await this.deps.assertAvailable(this.repo(member), slot)
+    for (const member of s.members)
+      await this.deps.assertAvailable(
+        {
+          ...this.repo(member),
+          name: this.name({ ...s, slot }, member),
+          session: `devdock-${slot}-${member.repo}-${member.workload}`,
+        },
+        await this.namespace(),
+      )
   }
-  private async lease(s: Sandbox): Promise<void> {
+  private async lease(s: Sandbox, preferred?: string): Promise<void> {
     const observed = await Promise.all(
       this.pool().map(async (slot) => ({ slot, lease: await this.readLease(slot) })),
     )
     if (observed.some(({ lease }) => lease?.data.key === s.key))
       throw new Error('Sandbox already leased on another instance; recover it first')
     for (const { slot, lease } of observed) {
-      if (lease) continue
+      if (lease || (preferred && slot !== preferred)) continue
       await this.available(s, slot)
       const result = await this.deps.kubectl('kubectl', [
         'create',
         'configmap',
-        'devdock-sandbox',
+        guardSandboxName(`devdock-sandbox-${slot}`, slot),
         '-n',
-        slot,
+        await this.namespace(),
         `--from-literal=key=${s.key}`,
         `--from-literal=instanceId=${this.deps.instanceId}`,
         `--from-literal=operation=${this.active.get(s.key) ?? ''}`,
@@ -372,7 +398,11 @@ export class Sandboxes {
       this.save(s)
       return
     }
-    throw new Error('Sandbox namespace pool full')
+    if (preferred)
+      throw new Error(
+        `Snapshot needs slot ${preferred}; it is in use or outside the slot limit. Rebuild to use another slot`,
+      )
+    throw new Error(`All ${this.pool().length} sandbox slots are in use`)
   }
   private operation(
     s: Sandbox,
@@ -412,9 +442,9 @@ export class Sandboxes {
           await this.checked('kubectl', [
             'patch',
             'configmap',
-            'devdock-sandbox',
+            guardSandboxName(`devdock-sandbox-${s.slot}`, s.slot),
             '-n',
-            s.slot,
+            await this.namespace(),
             '--type=json',
             '-p',
             JSON.stringify([
@@ -443,7 +473,7 @@ export class Sandboxes {
             await this.unlock(s.slot, lease, lock).catch(() => undefined)
         }
         s.error = error instanceof Error ? error.message : String(error)
-        if (s.slot) s.state = 'failed'
+        if (s.slot || s.state === 'creating') s.state = 'failed'
         this.save(s)
         this.deps.operations.update(
           op.id,
@@ -462,9 +492,9 @@ export class Sandboxes {
     await this.checked('kubectl', [
       'patch',
       'configmap',
-      'devdock-sandbox',
+      guardSandboxName(`devdock-sandbox-${slot}`, slot),
       '-n',
-      slot,
+      await this.namespace(),
       '--type=json',
       '-p',
       JSON.stringify([
@@ -480,6 +510,11 @@ export class Sandboxes {
       .filter((o) => o.repo.startsWith('sandbox:') && o.state === 'active'))
       this.deps.operations.update(op.id, { state: 'interrupted' }, 'Daemon restarted; not replayed')
     for (const s of this.deps.store.listSandboxes()) {
+      if (s.slot && !sandboxSlot(s.slot)) {
+        s.slot = undefined
+        s.state = 'expired'
+        s.expiredAt ??= Date.now()
+      }
       for (const m of s.members) {
         m.path ??= legacyPath(m)
         if (m.build.state === 'building' || m.build.state === 'queued')
@@ -487,6 +522,7 @@ export class Sandboxes {
       }
       this.save(s)
     }
+    if (!(await this.deps.namespace())) return
     const observed = new Map<string, Lease>()
     for (const slot of this.pool()) {
       const lease = await this.readLease(slot)
@@ -510,7 +546,7 @@ export class Sandboxes {
         title: saved?.title,
         snapshot: saved?.snapshot,
         slot,
-        state: 'active',
+        state: saved?.state === 'failed' || saved?.state === 'creating' ? 'failed' : 'active',
         members: members.map((m) => ({
           ...m,
           path: m.path ?? legacyPath(m),
@@ -534,7 +570,9 @@ export class Sandboxes {
   }
   async list(): Promise<SandboxView[]> {
     const pool = await this.poolState()
-    const views = await Promise.all(this.deps.store.listSandboxes().map((s) => this.view(s, pool)))
+    const views = await Promise.all(
+      this.deps.store.listSandboxes().map((s) => this.view(this.get(s.key), pool)),
+    )
     const ns = await this.deps.namespace()
     if (!ns) return views
     const now = Date.now()
@@ -557,7 +595,7 @@ export class Sandboxes {
           })),
         ),
     }
-    return [{ ...(await this.view(personal, pool)), personal: true, expiresAt: 0 }, ...views]
+    return [{ ...(await this.view(personal, pool, true)), personal: true, expiresAt: 0 }, ...views]
   }
   async status(key: string): Promise<SandboxView> {
     if (!this.deps.store.getSandbox(key) && key === (await this.deps.namespace())) {
@@ -574,20 +612,32 @@ export class Sandboxes {
     const full = pool.length > 0 && pool.every((entry) => entry.key)
     return { pool, evictionCandidate: full ? (await this.evictionCandidate())?.key : undefined }
   }
-  private async cluster(s: Sandbox): Promise<Pick<SandboxView, 'power' | 'healthy' | 'urls'>> {
+  private async cluster(
+    s: Sandbox,
+    personal = false,
+  ): Promise<Pick<SandboxView, 'power' | 'healthy' | 'urls'>> {
     if (!s.slot) return { power: 'asleep', healthy: false, urls: [] }
     try {
       const deployments = JSON.parse(
-        await this.checked('kubectl', ['get', 'deployments', '-n', s.slot, '-o', 'json']),
+        await this.checked('kubectl', [
+          'get',
+          'deployments',
+          '-n',
+          await this.namespace(),
+          '-o',
+          'json',
+        ]),
       ) as {
         items: {
-          metadata: { name: string }
+          metadata: { name: string; generation?: number }
           spec?: { replicas?: number }
-          status?: { readyReplicas?: number; updatedReplicas?: number }
+          status?: { readyReplicas?: number; updatedReplicas?: number; observedGeneration?: number }
         }[]
       }
       const named = s.members.map((m) =>
-        deployments.items.find((d) => d.metadata.name === this.repo(m).name),
+        deployments.items.find(
+          (d) => d.metadata.name === (personal ? this.repo(m).name : this.name(s, m)),
+        ),
       )
       const awake = named.filter((d) => (d?.spec?.replicas ?? 0) > 0).length
       const power =
@@ -597,25 +647,44 @@ export class Sandboxes {
         named.every((d) => {
           const want = d?.spec?.replicas ?? 1
           return (
-            (d?.status?.readyReplicas ?? 0) >= want && (d?.status?.updatedReplicas ?? 0) >= want
+            (d?.status?.readyReplicas ?? 0) >= want &&
+            (d?.status?.updatedReplicas ?? 0) >= want &&
+            (d?.status?.observedGeneration ?? 0) >= (d?.metadata.generation ?? 0)
           )
         })
       const ingresses = JSON.parse(
-        await this.checked('kubectl', ['get', 'ingresses', '-n', s.slot, '-o', 'json']),
+        await this.checked('kubectl', [
+          'get',
+          'ingresses',
+          '-n',
+          await this.namespace(),
+          '-o',
+          'json',
+        ]),
       ) as {
         items: {
+          metadata?: { name?: string }
           spec?: { rules?: { host?: string; http?: { paths?: { path?: string }[] } }[] }
         }[]
       }
       const urls = [
         ...new Set(
-          ingresses.items.flatMap((i) =>
-            (i.spec?.rules ?? []).flatMap((r) =>
-              r.host
-                ? (r.http?.paths ?? [{ path: '/' }]).map((p) => `https://${r.host}${p.path ?? '/'}`)
-                : [],
+          ingresses.items
+            .filter((i) =>
+              personal
+                ? !i.metadata?.name?.split('-').some(sandboxSlot)
+                : i.metadata?.name?.split('-').includes(s.slot as string) &&
+                  !i.metadata.name.startsWith('devdock-'),
+            )
+            .flatMap((i) =>
+              (i.spec?.rules ?? []).flatMap((r) =>
+                r.host
+                  ? (r.http?.paths ?? [{ path: '/' }]).map(
+                      (p) => `https://${r.host}${p.path ?? '/'}`,
+                    )
+                  : [],
+              ),
             ),
-          ),
         ),
       ]
       return { power, healthy, urls }
@@ -626,13 +695,14 @@ export class Sandboxes {
   private async view(
     s: Sandbox,
     pool?: Pick<SandboxView, 'pool' | 'evictionCandidate'>,
+    personal = false,
   ): Promise<SandboxView> {
     const now = Date.now()
     if (s.snapshot && !snapshotRetained(s, now)) {
       s.snapshot = undefined
       this.save(s)
     }
-    const { power, healthy, urls } = await this.cluster(s)
+    const { power, healthy, urls } = await this.cluster(s, personal)
     const link = `http://127.0.0.1:${process.env.DEVDOCK_PORT ?? 7717}/s/${encodeURIComponent(s.key)}`
     const ribbon = sandboxRibbon(s, power, now)
     return {
@@ -697,12 +767,13 @@ export class Sandboxes {
     return this.build(key, input, 'snapshot')
   }
   /** Least-recently-used sandbox that is active, idle, unlocked and fully scaled to zero. */
-  private async evictionCandidate(): Promise<Sandbox | undefined> {
+  private async evictionCandidate(slot?: string): Promise<Sandbox | undefined> {
     const candidates = this.deps.store
       .listSandboxes()
       .filter(
         (s) =>
           s.slot &&
+          (!slot || s.slot === slot) &&
           s.state === 'active' &&
           !this.tasks.has(s.key) &&
           !s.members.some((m) => m.build.state !== 'idle'),
@@ -713,9 +784,19 @@ export class Sandboxes {
       const lease = await this.readLease(slot)
       if (lease?.data.key !== candidate.key || lease.data.operation) continue
       const raw = JSON.parse(
-        await this.checked('kubectl', ['get', 'deployments', '-n', slot, '-o', 'json']),
-      ) as { items: { spec?: { replicas?: number } }[] }
-      if (raw.items.length && raw.items.every((d) => d.spec?.replicas === 0)) return candidate
+        await this.checked('kubectl', [
+          'get',
+          'deployments',
+          '-n',
+          await this.namespace(),
+          '-o',
+          'json',
+        ]),
+      ) as { items: { metadata: { name: string }; spec?: { replicas?: number } }[] }
+      const members = candidate.members.map((m) =>
+        raw.items.find((d) => d.metadata.name === this.name(candidate, m)),
+      )
+      if (members.length && members.every((d) => d?.spec?.replicas === 0)) return candidate
     }
     return undefined
   }
@@ -730,18 +811,21 @@ export class Sandboxes {
       if (!s.slot) {
         const leases = await Promise.all(this.pool().map((slot) => this.readLease(slot)))
         if (leases.length && leases.every(Boolean)) {
-          const candidate = await this.evictionCandidate()
-          if (!candidate) throw new Error('Sandbox namespace pool full; no asleep sandbox to evict')
+          const candidate = await this.evictionCandidate(s.snapshot?.slot)
+          if (!candidate)
+            throw new Error(
+              `All ${this.pool().length} sandbox slots are in use; no asleep sandbox to evict`,
+            )
           if (!options.evict)
             throw new Error(
-              `Sandbox namespace pool full; evict asleep sandbox ${candidate.key} to restore`,
+              `All ${this.pool().length} sandbox slots are in use; evict asleep sandbox ${candidate.key} to restore`,
             )
           const receipt = this.expire(candidate.key, actor)
           await this.tasks.get(candidate.key)
           if (this.deps.operations.get(receipt.operationId).state !== 'succeeded')
             throw new Error(`Cannot evict ${candidate.key}`)
         }
-        await this.lease(s)
+        await this.lease(s, s.snapshot?.slot)
         try {
           await this.restoreImages(s)
         } catch (err) {
@@ -780,9 +864,10 @@ export class Sandboxes {
           await this.checked('git', ['worktree', 'remove', '--force', path], root)
         await this.checked('git', ['worktree', 'add', '--detach', path], root)
       })
-      const repo = this.config(s, m, path)
+      const repo = await this.config(s, m, path)
       const sync = await this.deps.supervisor.sandbox(repo, 'sync')
       if (sync.code !== 0) throw new Error(sync.stderr || 'Sandbox env sync failed')
+      await this.rewriteEnv(s, repo)
       // ECR lifecycle rules can prune a tag inside the snapshot TTL; deploying it would only
       // leave pods in ImagePullBackOff.
       const at = saved.image.lastIndexOf(':')
@@ -803,6 +888,7 @@ export class Sandboxes {
       m.build = { state: 'idle' }
     }
     s.expiredAt = undefined
+    await this.applyRouting(s)
     await this.mirror(s)
   }
   private recordedImage(repo: Repo, member: SandboxMember, image: string): void {
@@ -832,7 +918,14 @@ export class Sandboxes {
   delete(key: string, actor: string): { operationId: string } {
     const s = this.get(key)
     return this.operation(s, 'delete', actor, async () => {
-      await this.expireRecord(s)
+      if (
+        !s.slot &&
+        s.retainedSlot &&
+        sandboxSlot(s.retainedSlot) &&
+        !(await this.readLease(s.retainedSlot))
+      )
+        await this.lease(s, s.retainedSlot)
+      await this.expireRecord(s, true)
       this.deps.store.removeSandbox(key)
       this.deps.emit({ key, deleted: true })
     })
@@ -863,6 +956,7 @@ export class Sandboxes {
       this.save(s)
       if (s.slot) {
         await this.available(s, s.slot)
+        await this.applyRouting(s)
         await this.mirror(s)
       }
     })
@@ -874,9 +968,9 @@ export class Sandboxes {
       await this.checked('kubectl', [
         'patch',
         'deployment',
-        this.repo(member).name,
+        this.name(s, member),
         '-n',
-        s.slot as string,
+        await this.namespace(),
         '-p',
         JSON.stringify({ spec: { replicas } }),
       ])
@@ -890,13 +984,19 @@ export class Sandboxes {
     const path = replicaCheckoutPath(root, `sb-${s.slot}-${suffix}`)
     return { root, path, repo }
   }
-  private config(s: Sandbox, m: SandboxMember, path: string): Repo {
+  private async config(s: Sandbox, m: SandboxMember, path: string): Promise<Repo> {
     const original = this.repo(m)
     const root = original.root ?? original.path
     const servicePath = resolve(path, relative(root, original.path))
     const sourcePath = resolve(path, relative(root, original.configPath))
     const doc = parseDocument(readFileSync(sourcePath, 'utf8'))
     const chart = m.workload === 'ui' ? 'web' : m.workload
+    const namespace = await this.namespace()
+    const routing = await this.routing(s)
+    const personalHosts = this.memberHosts(await this.ingresses(), original.name)
+    const host = personalHosts[0] ? routing.hosts.get(personalHosts[0]) : undefined
+    if ((m.workload === 'api' || m.workload === 'ui') && !host)
+      throw new Error(`No personal ingress for ${original.name}`)
     doc.setIn(['pipelines', 'sandbox-image', 'run'], sandboxImagePipeline)
     doc.setIn(
       ['pipelines', 'sandbox-architecture', 'run'],
@@ -905,10 +1005,7 @@ echo "SANDBOX_ARCH=$architecture"`,
     )
     for (const variable of ['SANDBOX_REGISTRY', 'SANDBOX_REPOSITORY', 'SANDBOX_TAG'])
       doc.setIn(['vars', variable], '')
-    doc.setIn(
-      ['pipelines', 'sandbox-reset', 'run'],
-      m.workload === 'api' ? 'create_deployments default' : `purge_deployments ${chart}`,
-    )
+    doc.setIn(['pipelines', 'sandbox-reset', 'run'], `purge_deployments ${chart}`)
     const valuesPath = join(dirname(sourcePath), `.devdock-sandbox-${m.workload}-values.yaml`)
     writeFileSync(valuesPath, 'nodeSelector:\n  workload: development\n')
     const profiles = (doc.toJS() as { profiles?: unknown[] }).profiles
@@ -916,22 +1013,36 @@ echo "SANDBOX_ARCH=$architecture"`,
       ...(profiles ?? []),
       {
         name: 'sandbox',
-        patches: [{ op: 'add', path: `deployments.${chart}.helm.valuesFiles`, value: valuesPath }],
+        patches: [
+          { op: 'add', path: `deployments.${chart}.helm.valuesFiles`, value: valuesPath },
+          { op: 'replace', path: `deployments.${chart}.helm.releaseName`, value: this.name(s, m) },
+          { op: 'replace', path: `deployments.${chart}.helm.values.name`, value: this.name(s, m) },
+          { op: 'add', path: `deployments.${chart}.helm.wait`, value: false },
+          { op: 'replace', path: 'pullSecrets', value: {} },
+          {
+            op: 'replace',
+            path: 'pipelines.deploy.run',
+            value: `docker_login_to_ecr\nbuild_images --all\ncreate_deployments ${chart}`,
+          },
+        ],
       },
     ])
     const configPath = join(dirname(sourcePath), `.devdock-sandbox-${m.workload}.yaml`)
     writeFileSync(configPath, doc.toString())
     return {
       ...original,
+      name: this.name(s, m),
       path: servicePath,
       root: path,
       configPath,
-      namespace: s.slot,
+      namespace,
       // Supervisor uses DEVSPACE_CONFIG for this generated config, preserving question defaults.
       devspaceTemplateName: original.devspaceTemplateName ?? original.name,
       varDefaults: {
         ...original.varDefaults,
-        ENVIRONMENT_NAME: s.slot as string,
+        ENVIRONMENT_NAME: namespace,
+        WORKLOAD_NAME: this.name(s, m),
+        ...(host ? { INGRESS_HOSTNAME: host } : {}),
         WORKLOAD_TYPE: m.workload,
       },
     }
@@ -991,7 +1102,14 @@ echo "SANDBOX_ARCH=$architecture"`,
     await this.available(s, s.slot as string)
     const { power } = await this.cluster(s)
     const cluster = JSON.parse(
-      await this.checked('kubectl', ['get', 'deployments', '-n', s.slot as string, '-o', 'json']),
+      await this.checked('kubectl', [
+        'get',
+        'deployments',
+        '-n',
+        await this.namespace(),
+        '-o',
+        'json',
+      ]),
     ) as {
       items: {
         metadata: { name: string }
@@ -1004,7 +1122,7 @@ echo "SANDBOX_ARCH=$architecture"`,
       async (m) => {
         try {
           await this.deps.authorize(m.repo)
-          const deployment = cluster.items.find((d) => d.metadata.name === this.repo(m).name)
+          const deployment = cluster.items.find((d) => d.metadata.name === this.name(s, m))
           const awake = (deployment?.spec?.replicas ?? 0) > 0
           const previous = deployment?.spec?.template?.spec?.containers?.[0]?.image
           const { root, path } = this.checkout(s, m)
@@ -1031,9 +1149,10 @@ echo "SANDBOX_ARCH=$architecture"`,
             const dirtyFiles = await this.copyWorktree(source, buildPath)
             const branch = await this.branch(source)
             const pr = branch ? await this.pr(source) : undefined
-            const repo = this.config(s, m, buildPath)
+            const repo = await this.config(s, m, buildPath)
             const sync = await this.deps.supervisor.sandbox(repo, 'sync')
             if (sync.code !== 0) throw new Error(sync.stderr || 'Sandbox env sync failed')
+            await this.rewriteEnv(s, repo)
             const image = await this.prepareImage(repo, m)
             await this.imageBuilds.deploy(
               image,
@@ -1059,9 +1178,9 @@ echo "SANDBOX_ARCH=$architecture"`,
               await this.checked('kubectl', [
                 'rollout',
                 'restart',
-                `deployment/${this.repo(m).name}`,
+                `deployment/${this.name(s, m)}`,
                 '-n',
-                s.slot as string,
+                await this.namespace(),
               ])
             this.touch(s, input.actor, 'built', `${identity(m)} ${sha}`)
             await this.mirror(s)
@@ -1079,6 +1198,7 @@ echo "SANDBOX_ARCH=$architecture"`,
         }
       },
     )
+    await this.applyRouting(s)
     s.state = 'active'
     // Every member deployed from a known image: that is the snapshot a stable link restores.
     const complete =
@@ -1086,6 +1206,7 @@ echo "SANDBOX_ARCH=$architecture"`,
       s.members.every((m) => m.image && m.deployedSha && m.build.state === 'idle')
     if (complete) {
       s.snapshot = {
+        slot: s.slot,
         at: Date.now(),
         actor: input.actor,
         members: s.members.map((m) => ({
@@ -1196,7 +1317,9 @@ echo "SANDBOX_ARCH=$architecture"`,
         this.queryImage(repo, base, tag),
       ),
     )
-    const tag = await sandboxImageKey(image, repo.path, architecture)
+    const slot = repo.varDefaults?.WORKLOAD_NAME?.split('-').find(sandboxSlot)
+    if (!slot) throw new Error('Missing sandbox image slot')
+    const tag = `${await sandboxImageKey(image, repo.path, architecture)}-${slot}`
     image.tags = [`${tag}-persistent`]
     repo.varDefaults = { ...repo.varDefaults, IMAGE_TAG: tag }
     const doc = parseDocument(readFileSync(repo.configPath, 'utf8'))
@@ -1216,19 +1339,97 @@ echo "SANDBOX_ARCH=$architecture"`,
     writeFileSync(repo.configPath, doc.toString())
     return `${image.image}:${tag}-persistent`
   }
+  private async ingresses(): Promise<SandboxIngress[]> {
+    return (
+      JSON.parse(
+        await this.checked('kubectl', [
+          'get',
+          'ingresses',
+          '-n',
+          await this.namespace(),
+          '-o',
+          'json',
+        ]),
+      ) as { items: SandboxIngress[] }
+    ).items
+  }
+  private memberHosts(ingresses: SandboxIngress[], name: string): string[] {
+    return ingresses
+      .filter((i) => !i.metadata?.name?.split('-').some(sandboxSlot))
+      .flatMap((i) =>
+        (i.spec?.rules ?? []).flatMap((r) =>
+          r.host && r.http?.paths.some((p) => p.backend.service?.name === name) ? [r.host] : [],
+        ),
+      )
+  }
+  private async routing(s: Sandbox) {
+    const services = new Map(s.members.map((m) => [this.repo(m).name, this.name(s, m)]))
+    return {
+      ...sandboxRouting(
+        (await this.ingresses()).filter((i) => !i.metadata?.name?.split('-').some(sandboxSlot)),
+        await this.namespace(),
+        s.slot as string,
+        services,
+      ),
+      services,
+    }
+  }
+  private async rewriteEnv(s: Sandbox, repo: Repo): Promise<void> {
+    const { services, hosts } = await this.routing(s)
+    const path = join(repo.path, '.env')
+    if (!existsSync(path) || !lstatSync(path).isFile())
+      throw new Error('Sandbox sync-env must produce a regular .env file')
+    writeFileSync(
+      path,
+      rewriteSandboxEnv(readFileSync(path, 'utf8'), await this.namespace(), services, hosts),
+    )
+  }
+  private async deleteRouting(slot: string): Promise<void> {
+    for (const ingress of await this.ingresses()) {
+      const name = ingress.metadata?.name
+      if (name?.startsWith(`devdock-${slot}-route-`))
+        await this.checked('kubectl', [
+          'delete',
+          'ingress',
+          guardSandboxName(name, slot),
+          '-n',
+          await this.namespace(),
+          '--ignore-not-found',
+        ])
+    }
+  }
+  private async applyRouting(s: Sandbox): Promise<void> {
+    const slot = s.slot as string
+    const routing = await this.routing(s)
+    await this.deleteRouting(slot)
+    if (!routing.hosts.size) return
+    const dir = mkdtempSync(
+      join(dirname(this.repo(s.members[0] as SandboxMember).path), '.devdock-routing-'),
+    )
+    try {
+      for (const ingress of [routing.tls, ...routing.fallback]) {
+        guardSandboxName(ingress.metadata.name, slot)
+        const path = join(dir, `${ingress.metadata.name}.json`)
+        writeFileSync(path, JSON.stringify(ingress))
+        await this.checked('kubectl', ['apply', '-n', await this.namespace(), '-f', path])
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }
   private async reset(s: Sandbox, m: SandboxMember): Promise<void> {
     await this.owned(s)
-    await this.deps.assertAvailable(this.repo(m), s.slot as string)
     await this.deps.authorize(m.repo, false)
-    const { root, path } = this.checkout(s, m)
-    // Generated configs must never land in the main checkout; a worktree built elsewhere is
-    // recreated at HEAD here, and callers remove it after the reset.
-    if (!existsSync(path)) await this.checked('git', ['worktree', 'add', '--detach', path], root)
-    const repo = this.config(s, m, path)
-    const result = await this.deps.supervisor.sandbox(repo, 'reset')
-    if (result.code !== 0) throw new Error(result.stderr || 'Sandbox release reset failed')
+    await this.checked('helm', [
+      'uninstall',
+      this.name(s, m),
+      '-n',
+      await this.namespace(),
+      '--ignore-not-found',
+    ])
   }
-  private async expireRecord(s: Sandbox): Promise<void> {
+
+  private async expireRecord(s: Sandbox, deleteTls = false): Promise<void> {
     if (!s.slot) {
       s.state = 'expired'
       this.save(s)
@@ -1240,7 +1441,25 @@ echo "SANDBOX_ARCH=$architecture"`,
       if (existsSync(path)) await this.checked('git', ['worktree', 'remove', '--force', path], root)
     }
     await this.owned(s)
-    await this.checked('kubectl', ['delete', 'configmap', 'devdock-sandbox', '-n', s.slot])
+    await this.deleteRouting(s.slot)
+    if (deleteTls)
+      for (const kind of ['ingress', 'secret'])
+        await this.checked('kubectl', [
+          'delete',
+          kind,
+          guardSandboxName(`devdock-${s.slot}-tls`, s.slot),
+          '-n',
+          await this.namespace(),
+          '--ignore-not-found',
+        ])
+    await this.checked('kubectl', [
+      'delete',
+      'configmap',
+      guardSandboxName(`devdock-sandbox-${s.slot}`, s.slot),
+      '-n',
+      await this.namespace(),
+    ])
+    s.retainedSlot = s.slot
     s.slot = undefined
     s.state = 'expired'
     s.expiredAt = Date.now()

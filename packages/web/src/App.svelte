@@ -410,7 +410,7 @@
       <button
         class="hostbtn top"
         class:selected={selectedId === GRID_ID}
-        title="Every sandbox as a snapshot card, with the namespace pool"
+        title="Every sandbox as a snapshot card, with personal namespace slots"
         onclick={() => (selectedId = GRID_ID)}
       >
         <Icon name="box" size={13} />

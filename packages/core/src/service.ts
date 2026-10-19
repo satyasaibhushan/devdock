@@ -26,6 +26,7 @@ import {
   replicaIsolationProblems,
 } from './replicas.js'
 import { SandboxController, type SandboxControllerStatus } from './sandboxController.js'
+import { sandboxWorkloadName } from './sandboxRouting.js'
 import {
   type SandboxBuild,
   type SandboxCreate,
@@ -387,7 +388,11 @@ export class Service {
       parent.workloads?.length || parent.members?.length
         ? scopeRepo(parent, member.workload)
         : parent
-    return { ...repo, namespace: sandbox.slot }
+    return {
+      ...repo,
+      name: sandboxWorkloadName(repo, member.workload, sandbox.slot),
+      namespace: await this.contextNamespace(),
+    }
   }
 
   listSandboxes() {

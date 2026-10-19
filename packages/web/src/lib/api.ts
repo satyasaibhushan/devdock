@@ -601,7 +601,7 @@ export function sendResize(ws: WebSocket, cols: number, rows: number): void {
 }
 
 // ---- sandboxes ----
-// Ticket sandboxes: a namespace slot leased from a pool, a set of members (one
+// Ticket sandboxes: a suffix leased inside the personal namespace, a set of members (one
 // repo workload each, built from an agent worktree or the repo's registered
 // checkout, uncommitted files included), woken and slept as a unit. The personal sandbox is the kube context's own namespace,
 // listed first. A successful build records a snapshot: the images each member
@@ -644,6 +644,7 @@ export interface SandboxSnapshotMember {
   pr?: SandboxPr
 }
 export interface SandboxSnapshot {
+  slot?: string
   at: number
   actor: string
   members: SandboxSnapshotMember[]
@@ -657,6 +658,7 @@ export interface SandboxActivity {
 export type SandboxState = 'creating' | 'active' | 'expired' | 'failed'
 export type SandboxPower = 'awake' | 'asleep' | 'partial' | 'unknown'
 export interface Sandbox {
+  retainedSlot?: string
   key: string
   title?: string
   slot?: string

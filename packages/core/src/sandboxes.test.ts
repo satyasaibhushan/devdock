@@ -24,7 +24,7 @@ const pr7 = { number: 7, url: 'https://github.com/team/app/pull/7' }
 let root: string
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'sandboxes-'))
-  vi.stubEnv('DEVDOCK_SANDBOX_NAMESPACES', 'slot1,slot2')
+  vi.stubEnv('DEVDOCK_SANDBOX_MAX', '2')
   vi.stubEnv('DEVDOCK_SANDBOX_TTL_HOURS', '24')
 })
 afterEach(() => {
@@ -44,14 +44,23 @@ function fixture(instanceId = 'machine1') {
     { metadata: { resourceVersion: string }; data: Record<string, string> }
   >()
   const deployments = new Map<string, number>()
+  const applied: { metadata: { name: string }; spec: unknown }[] = []
   let head = sha1
   let branch = 'ticket'
   let gh: () => { code: number; stdout: string } = () => ({ code: 0, stdout: JSON.stringify(pr7) })
   let version = 1
   const runner = vi.fn(async (cmd: string, args: string[], options?: { cwd?: string }) => {
     let stdout = ''
-    const slot = args[args.indexOf('-n') + 1] ?? ''
+    const slot = args[2]?.replace('devdock-sandbox-', '') ?? ''
     if (cmd === 'kubectl') {
+      if (args[0] === 'config') stdout = 'personal'
+      if (args[0] === 'apply')
+        applied.push(
+          JSON.parse(readFileSync(args[args.indexOf('-f') + 1] as string, 'utf8')) as {
+            metadata: { name: string }
+            spec: unknown
+          },
+        )
       if (args[0] === 'get' && args[1] === 'configmap')
         stdout = leases.has(slot) ? JSON.stringify(leases.get(slot)) : ''
       if (args[0] === 'create') {
@@ -77,7 +86,7 @@ function fixture(instanceId = 'machine1') {
           lease.data[p.path.slice('/data/'.length)] = p.value
         lease.metadata.resourceVersion = String(version++)
       }
-      if (args[0] === 'delete') leases.delete(slot)
+      if (args[0] === 'delete' && args[1] === 'configmap') leases.delete(slot)
       if (args[1] === 'deployments')
         stdout = JSON.stringify({
           items: [...deployments].map(([name, replicas]) => ({
@@ -86,8 +95,64 @@ function fixture(instanceId = 'machine1') {
           })),
         })
       if (args[1] === 'ingresses')
-        stdout =
-          '{"items":[{"spec":{"rules":[{"host":"slot.example","http":{"paths":[{"path":"/app"}]}}]}}]}'
+        stdout = JSON.stringify({
+          items: [
+            {
+              metadata: { name: 'app-ui' },
+              spec: {
+                rules: [
+                  {
+                    host: 'dashboard-personal.vmock.dev',
+                    http: {
+                      paths: [
+                        {
+                          path: '/',
+                          backend: { service: { name: 'app-ui', port: { number: 80 } } },
+                        },
+                      ],
+                    },
+                  },
+                ],
+              },
+            },
+            {
+              metadata: { name: 'app-api' },
+              spec: {
+                rules: [
+                  {
+                    host: 'api-personal-candidate.vmock.dev',
+                    http: {
+                      paths: [
+                        {
+                          path: '/app',
+                          backend: { service: { name: 'app-api', port: { number: 80 } } },
+                        },
+                      ],
+                    },
+                  },
+                ],
+              },
+            },
+            {
+              metadata: { name: 'app-sb1-api' },
+              spec: {
+                rules: [
+                  {
+                    host: 'api-personal-sb1-candidate.vmock.dev',
+                    http: {
+                      paths: [
+                        {
+                          path: '/app',
+                          backend: { service: { name: 'app-sb1-api', port: { number: 80 } } },
+                        },
+                      ],
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+        })
       if (args[0] === 'patch' && args[1] === 'deployment')
         deployments.set(
           args[2] ?? '',
@@ -113,11 +178,17 @@ function fixture(instanceId = 'machine1') {
   })
   const supervisor = new Supervisor(runner)
   // Build dirs are removed after each build, so keep what each deploy saw.
-  const configs: { config: string; values: string }[] = []
-  const sandboxResult = async (repo: { configPath: string }, action: string) => {
+  const configs: { config: string; values: string; env: string }[] = []
+  const sandboxResult = async (repo: { configPath: string; path: string }, action: string) => {
+    if (action === 'sync')
+      writeFileSync(
+        join(repo.path, '.env'),
+        'MEMBER=http://app-api/app\nPERSONAL=http://other-api/other\nAPI=https://api-personal-candidate.vmock.dev/app\nUI=https://dashboard-personal.vmock.dev/\n',
+      )
     if (action === 'deploy')
       configs.push({
         config: readFileSync(repo.configPath, 'utf8'),
+        env: readFileSync(join(repo.path, '.env'), 'utf8'),
         values: readFileSync(repo.configPath.replace('.yaml', '-values.yaml'), 'utf8'),
       })
     return {
@@ -151,7 +222,7 @@ function fixture(instanceId = 'machine1') {
         configPath: join(repoPath, 'devspace.yaml'),
         ports: [],
         session: 'devdock-app',
-        workloads: ['api', 'worker', 'cron'],
+        workloads: ['api', 'worker', 'cron', 'ui'],
         defaultWorkload: 'api',
       },
     ],
@@ -171,6 +242,7 @@ function fixture(instanceId = 'machine1') {
     operations,
     leases,
     deployments,
+    applied,
     runner,
     sandbox,
     sandboxResult,
@@ -204,17 +276,19 @@ describe('sandbox lifecycle', () => {
       (await f.done(await f.core.create({ key: 'SULF-1', actor: 'you', members: [input] }))).state,
     ).toBe('succeeded')
     expect(f.store.getSandbox('SULF-1')?.members[0]?.deployedSha).toBe(sha1)
-    expect(f.leases.get('slot1')?.data.members).toContain(sha1)
-    expect((await f.core.status('SULF-1')).urls).toEqual(['https://slot.example/app'])
+    expect(f.leases.get('sb1')?.data.members).toContain(sha1)
+    expect((await f.core.status('SULF-1')).urls).toEqual([
+      'https://api-personal-sb1-candidate.vmock.dev/app',
+    ])
     expect((await f.core.list())[0]?.personal).toBe(true)
     await f.done(f.core.wake('SULF-1', 'you'))
-    expect(f.deployments.get('app-api')).toBe(1)
-    expect(f.deployments.has('app-worker')).toBe(false)
+    expect(f.deployments.get('app-sb1-api')).toBe(1)
+    expect(f.deployments.has('app-sb1-worker')).toBe(false)
     expect((await f.core.status('SULF-1')).power).toBe('awake')
     await f.done(f.core.sleep('SULF-1', 'sleeper'))
-    expect(f.deployments.get('app-api')).toBe(0)
+    expect(f.deployments.get('app-sb1-api')).toBe(0)
     expect(f.sandbox).toHaveBeenCalledWith(
-      expect.objectContaining({ namespace: 'slot1' }),
+      expect.objectContaining({ namespace: 'personal' }),
       'deploy',
       false,
       false,
@@ -234,13 +308,13 @@ describe('sandbox lifecycle', () => {
   it('fails when all slots are occupied without deploying', async () => {
     const f = fixture()
     const busy = { metadata: { resourceVersion: '1' }, data: { key: 'other', members: '[]' } }
-    f.leases.set('slot1', busy)
-    f.leases.set('slot2', busy)
+    f.leases.set('sb1', busy)
+    f.leases.set('sb2', busy)
     const result = await f.done(
       await f.core.create({ key: 'SULF-1', members: [input], actor: 'you' }),
     )
     expect(result.state).toBe('failed')
-    expect(result.logs.at(-1)?.message).toContain('pool full')
+    expect(result.logs.at(-1)?.message).toContain('All 2 sandbox slots are in use')
     expect(f.sandbox).not.toHaveBeenCalled()
   })
   it('keeps the record and SHAs on expiry, rebuilds all members asleep, deletes only explicitly', async () => {
@@ -276,23 +350,23 @@ describe('sandbox lifecycle', () => {
       build: { state: 'building', instanceId: 'machine1' },
       deployedSha: sha1,
     }
-    f.leases.set('slot1', {
+    f.leases.set('sb1', {
       metadata: { resourceVersion: '1' },
       data: { key: 'SULF-1', instanceId: 'machine1', members: JSON.stringify([m]) },
     })
-    f.leases.set('slot2', {
+    f.leases.set('sb2', {
       metadata: { resourceVersion: '1' },
       data: { key: 'OTHER', instanceId: 'machine2', members: JSON.stringify([m]) },
     })
-    const op = f.operations.create('sandbox:SULF-1', '', 'slot1', 'build')
+    const op = f.operations.create('sandbox:SULF-1', '', 'sb1', 'build')
     await f.core.recover()
     expect(f.store.getSandbox('SULF-1')).toMatchObject({
-      slot: 'slot1',
+      slot: 'sb1',
       members: [{ deployedSha: sha1, build: { state: 'failed' } }],
     })
     expect(f.store.getSandbox('OTHER')).toBeUndefined()
     expect(f.operations.get(op.id).state).toBe('interrupted')
-    f.leases.set('slot2', {
+    f.leases.set('sb2', {
       metadata: { resourceVersion: '1' },
       data: { key: 'FREE', members: JSON.stringify([m]) },
     })
@@ -301,7 +375,6 @@ describe('sandbox lifecycle', () => {
   })
   it('refuses a live personal release before acquiring or deploying', async () => {
     const f = fixture()
-    vi.stubEnv('DEVDOCK_SANDBOX_NAMESPACES', 'personal')
     f.available.mockRejectedValue(new Error('Live dev session holds app-api in personal namespace'))
     const result = await f.done(
       await f.core.create({ key: 'SULF-1', members: [input], actor: 'you' }),
@@ -327,7 +400,7 @@ describe('sandbox lifecycle', () => {
     )
     const roots = f.sandbox.mock.calls.filter((c) => c[1] === 'deploy').map((c) => c[0].root)
     expect(new Set(roots).size).toBe(2)
-    expect(roots.every((r) => r?.startsWith(join(root, '.devdock-sb-slot1-')))).toBe(true)
+    expect(roots.every((r) => r?.startsWith(join(root, '.devdock-sb-sb1-')))).toBe(true)
   })
   it('retains failed builds for explicit retry, refuses concurrent operations and changed ownership', async () => {
     const f = fixture()
@@ -336,17 +409,16 @@ describe('sandbox lifecycle', () => {
     expect(() => f.core.expire('SULF-1', 'you')).toThrow('already active')
     expect((await f.done(op)).state).toBe('failed')
     expect(f.store.getSandbox('SULF-1')?.members[0]?.build).toMatchObject({ state: 'failed' })
-    const lease = f.leases.get('slot1')
+    const lease = f.leases.get('sb1')
     if (lease) lease.data.key = 'another'
     expect((await f.done(f.core.expire('SULF-1', 'you'))).state).toBe('failed')
-    expect(f.store.getSandbox('SULF-1')?.slot).toBe('slot1')
+    expect(f.store.getSandbox('SULF-1')?.slot).toBe('sb1')
   })
 })
 
 it('refuses real personal namespace dev sessions through the service', async () => {
   mkdirSync(join(root, 'app'))
   writeFileSync(join(root, 'app', 'devspace.yaml'), 'name: app\n')
-  vi.stubEnv('DEVDOCK_SANDBOX_NAMESPACES', 'personal')
   const runner = vi.fn(async (cmd: string, args: string[]) => {
     const stdout =
       cmd === 'kubectl' && args[0] === 'config'
@@ -375,7 +447,7 @@ it('refuses real personal namespace dev sessions through the service', async () 
 it('refuses a slot operation held by another machine', async () => {
   const f = fixture()
   await f.done(await f.core.create({ key: 'SULF-1', members: [input], actor: 'you' }))
-  const lease = f.leases.get('slot1')
+  const lease = f.leases.get('sb1')
   if (!lease) throw new Error('missing fixture lease')
   lease.data.operation = JSON.stringify({ instanceId: 'other', operationId: 'busy' })
   f.runner.mockClear()
@@ -385,7 +457,7 @@ it('refuses a slot operation held by another machine', async () => {
   expect(f.runner.mock.calls.some(([cmd, args]) => cmd === 'kubectl' && args[0] === 'delete')).toBe(
     false,
   )
-  expect(f.leases.get('slot1')?.data.operation).toContain('busy')
+  expect(f.leases.get('sb1')?.data.operation).toContain('busy')
 })
 
 it('resets a removed release, drops its worktree and retains the other members', async () => {
@@ -402,7 +474,11 @@ it('resets a removed release, drops its worktree and retains the other members',
     f.core.update('SULF-1', { actor: 'you', remove: [{ repo: 'app', workload: 'worker' }] }),
   )
   expect(op.state).toBe('succeeded')
-  expect(f.sandbox).toHaveBeenCalledWith(expect.objectContaining({ name: 'app-worker' }), 'reset')
+  expect(f.runner).toHaveBeenCalledWith(
+    'helm',
+    ['uninstall', 'app-sb1-worker', '-n', 'personal', '--ignore-not-found'],
+    expect.anything(),
+  )
   expect(f.store.getSandbox('SULF-1')?.members.map((m) => m.workload)).toEqual(['api'])
 })
 
@@ -415,19 +491,19 @@ it('rebuilds from the moved checkout and lets Helm roll changed images', async (
       actor: 'you',
     }),
   )
-  f.deployments.set('app-api', 1)
-  f.deployments.set('app-worker', 0)
+  f.deployments.set('app-sb1-api', 1)
+  f.deployments.set('app-sb1-worker', 0)
   f.setHead(sha2)
   f.sandbox.mockClear()
   await f.done(f.core.build('SULF-1', { actor: 'you' }))
   expect(f.sandbox).toHaveBeenCalledWith(
-    expect.objectContaining({ name: 'app-api' }),
+    expect.objectContaining({ name: 'app-sb1-api' }),
     'deploy',
     true,
     false,
   )
   expect(f.sandbox).toHaveBeenCalledWith(
-    expect.objectContaining({ name: 'app-worker' }),
+    expect.objectContaining({ name: 'app-sb1-worker' }),
     'deploy',
     false,
     false,
@@ -452,7 +528,7 @@ it('builds the registered checkout when no path is given and appends development
   )
   const yaml = f.configs[0]?.config
   expect(yaml).toContain('deployments.api.helm.valuesFiles')
-  expect(yaml).toContain('create_deployments default')
+  expect(yaml).toContain('purge_deployments api')
   expect(f.configs[0]?.values).toContain('workload: development')
   expect(readFileSync(join(root, 'app', 'devspace.yaml'), 'utf8')).toBe(
     'version: v2beta1\nname: app\n',
@@ -470,7 +546,7 @@ it('targets sandbox deployments for logs and exec and requires an exec actor', a
   await svc.queryLogs('app', { sandbox: 'SULF-1', workload: 'api', tail: 7 })
   expect(f.runner).toHaveBeenCalledWith(
     'kubectl',
-    ['logs', 'deployment/app', '-n', 'slot1', '--tail', '7'],
+    ['logs', 'deployment/app-sb1-api', '-n', 'personal', '--tail', '7'],
     expect.anything(),
   )
   await expect(svc.runInWorkload('app', 'pwd', { sandbox: 'SULF-1' })).rejects.toThrow(
@@ -479,7 +555,7 @@ it('targets sandbox deployments for logs and exec and requires an exec actor', a
   await svc.runInWorkload('app', 'pwd', { sandbox: 'SULF-1', actor: 'you' })
   expect(f.runner).toHaveBeenCalledWith(
     'kubectl',
-    ['exec', 'deployment/app', '-n', 'slot1', '--', 'sh', '-c', 'pwd'],
+    ['exec', 'deployment/app-sb1-api', '-n', 'personal', '--', 'sh', '-c', 'pwd'],
     expect.anything(),
   )
   expect(
@@ -501,7 +577,7 @@ it('finishes other members and mirrors every failure without configmap conflicts
       return result
     }
     started.push(repo.name)
-    if (repo.name === 'app-api') {
+    if (repo.name === 'app-sb1-api') {
       await gate
       return { code: 1, stdout: '', stderr: 'api build failed' }
     }
@@ -515,14 +591,14 @@ it('finishes other members and mirrors every failure without configmap conflicts
       members: [input, { ...input, workload: 'worker' }],
     }),
   )
-  expect(started.sort()).toEqual(['app-api', 'app-worker'])
+  expect(started.sort()).toEqual(['app-sb1-api', 'app-sb1-worker'])
   expect(result.state).toBe('failed')
   expect(result.logs.at(-1)?.message).toContain('api build failed')
   expect(f.store.getSandbox('parallel')?.members.map((m) => m.build.state)).toEqual([
     'failed',
     'idle',
   ])
-  const mirrored = JSON.parse(f.leases.get('slot1')?.data.members ?? '[]') as {
+  const mirrored = JSON.parse(f.leases.get('sb1')?.data.members ?? '[]') as {
     build: { state: string }
   }[]
   expect(mirrored.map((m) => m.build.state)).toEqual(['failed', 'idle'])
@@ -546,7 +622,7 @@ it('deploys an existing ECR image with skip-build and freezes effective build se
   expect(text).toContain(`- ${repo.varDefaults?.IMAGE_TAG}-persistent`)
   expect(text).not.toContain('buildKit:')
   expect(text).not.toContain('sb-cache-')
-  expect(text).not.toContain('slot1-persistent-cache')
+  expect(text).not.toContain('sb1-persistent-cache')
 })
 
 it.each(['linux/arm64', 'linux/amd64', '', 'not an architecture'])(
@@ -608,7 +684,7 @@ it('names the image and tag when an ECR lookup fails', async () => {
   )
   expect(result.state).toBe('failed')
   expect(result.logs.at(-1)?.message).toMatch(
-    /lookup failed for .*\/devspace:sb-[a-f0-9]+-persistent/,
+    /lookup failed for .*\/devspace:sb-[a-f0-9]+-sb1-persistent/,
   )
   expect(f.sandbox.mock.calls.some((c) => c[1] === 'deploy')).toBe(false)
 })
@@ -664,7 +740,7 @@ describe('snapshots', () => {
     )
     expect(result.state).toBe('succeeded')
     expect(seen).toEqual({
-      root: expect.stringContaining('.devdock-sb-slot1-'),
+      root: expect.stringContaining('.devdock-sb-sb1-'),
       a: 'new\n',
       b: true,
       log: false,
@@ -755,12 +831,12 @@ describe('snapshots', () => {
     )
     let view = await f.core.status('SULF-1')
     expect(view.ribbon).toBe('asleep')
-    expect(view.pool).toEqual([{ slot: 'slot1', key: 'SULF-1' }, { slot: 'slot2' }])
+    expect(view.pool).toEqual([{ slot: 'sb1', key: 'SULF-1' }, { slot: 'sb2' }])
     expect(view.markdown).toBe(
       [
         'Sandbox SULF-1: asleep',
         'Stable link: http://127.0.0.1:7717/s/SULF-1',
-        'Live URL: https://slot.example/app',
+        'Live URL: https://api-personal-sb1-candidate.vmock.dev/app',
         '',
         '```',
         `app api ticket @ ${sha1} PR #7`,
@@ -855,7 +931,7 @@ describe('snapshots', () => {
     const wt = join(root, 'wt')
     const member = { ...record.members[0], source: { kind: 'worktree', path: wt } }
     f.store.setSandbox({ ...record, members: [member] } as unknown as typeof record)
-    const lease = f.leases.get('slot1')
+    const lease = f.leases.get('sb1')
     if (!lease) throw new Error('missing lease')
     lease.data.members = JSON.stringify([member])
     await f.core.recover()
@@ -874,7 +950,7 @@ describe('snapshots', () => {
     expect(result.logs.at(-1)?.message).toBe(`Snapshot image ${image} is gone; rebuild the sandbox`)
     expect(f.sandbox.mock.calls.some((c) => c[1] === 'deploy')).toBe(false)
     expect(f.store.getSandbox('SULF-1')).toMatchObject({ state: 'expired', slot: undefined })
-    expect(f.leases.has('slot1')).toBe(false)
+    expect(f.leases.has('sb1')).toBe(false)
     expect((await f.core.status('SULF-1')).ribbon).toBe('expired restorable')
     f.imagePresent()
     f.sandbox.mockClear()
@@ -883,8 +959,8 @@ describe('snapshots', () => {
     const deploy = f.sandbox.mock.calls.find((c) => c[1] === 'deploy')
     expect(deploy?.slice(1)).toEqual(['deploy', true, true])
     expect(readFileSync(deploy?.[0].configPath as string, 'utf8')).toContain(`value: ${image}`)
-    expect(f.store.getSandbox('SULF-1')).toMatchObject({ state: 'active', slot: 'slot1' })
-    expect(f.deployments.get('app-api')).toBe(1)
+    expect(f.store.getSandbox('SULF-1')).toMatchObject({ state: 'active', slot: 'sb1' })
+    expect(f.deployments.get('app-sb1-api')).toBe(1)
     expect(f.store.getSandbox('SULF-1')?.activity).toContainEqual(
       expect.objectContaining({ action: 'restore', actor: 'link' }),
     )
@@ -916,24 +992,159 @@ describe('snapshots', () => {
     let result = await f.done(f.core.wake('SULF-1', 'link'))
     expect(result.state).toBe('failed')
     expect(result.logs.at(-1)?.message).toContain('no asleep sandbox to evict')
-    f.deployments.set('app-api', 0)
+    f.deployments.set('app-sb1-api', 0)
     expect((await f.core.status('SULF-1')).evictionCandidate).toBe('SULF-2')
     result = await f.done(f.core.wake('SULF-1', 'link'))
     expect(result.state).toBe('failed')
     expect(result.logs.at(-1)?.message).toBe(
-      'Sandbox namespace pool full; evict asleep sandbox SULF-2 to restore',
+      'All 2 sandbox slots are in use; evict asleep sandbox SULF-2 to restore',
     )
     expect(f.store.getSandbox('SULF-1')?.state).toBe('expired')
     expect(f.store.getSandbox('SULF-2')?.state).toBe('active')
     // An awake sandbox is never a candidate.
-    f.deployments.set('app-api', 1)
+    f.deployments.set('app-sb1-api', 1)
     result = await f.done(f.core.wake('SULF-1', 'link', { evict: true }))
     expect(result.logs.at(-1)?.message).toContain('no asleep sandbox to evict')
-    f.deployments.set('app-api', 0)
+    f.deployments.set('app-sb1-api', 0)
     result = await f.done(f.core.wake('SULF-1', 'link', { evict: true }))
     expect(result.state).toBe('succeeded')
     expect(f.store.getSandbox('SULF-2')).toMatchObject({ state: 'expired', slot: undefined })
-    expect(f.store.getSandbox('SULF-1')).toMatchObject({ state: 'active', slot: 'slot1' })
-    expect(f.store.getSandbox('SULF-3')?.slot).toBe('slot2')
+    expect(f.store.getSandbox('SULF-1')).toMatchObject({ state: 'active', slot: 'sb1' })
+    expect(f.store.getSandbox('SULF-3')?.slot).toBe('sb2')
+  })
+})
+
+it('defaults to five dynamic slots and ignores the old namespace pool', async () => {
+  vi.stubEnv('DEVDOCK_SANDBOX_MAX', undefined)
+  vi.stubEnv('DEVDOCK_SANDBOX_NAMESPACES', 'old-namespace')
+  const f = fixture()
+  const views = await f.core.list()
+  expect(views[0]?.pool.map((entry) => entry.slot)).toEqual(['sb1', 'sb2', 'sb3', 'sb4', 'sb5'])
+  expect(f.runner.mock.calls.every(([, args]) => !args.includes('old-namespace'))).toBe(true)
+})
+
+it('failed creates show failed and can be deleted or rebuilt after capacity becomes free', async () => {
+  const f = fixture()
+  const busy = { metadata: { resourceVersion: '1' }, data: { key: 'other', members: '[]' } }
+  f.leases.set('sb1', busy)
+  f.leases.set('sb2', busy)
+  await f.done(await f.core.create({ key: 'failed', members: [input], actor: 'you' }))
+  expect(await f.core.status('failed')).toMatchObject({
+    state: 'failed',
+    ribbon: 'failed',
+  })
+  expect((await f.done(f.core.delete('failed', 'you'))).state).toBe('succeeded')
+  await f.done(await f.core.create({ key: 'retry', members: [input], actor: 'you' }))
+  f.leases.delete('sb1')
+  expect((await f.done(f.core.build('retry', { actor: 'you' }))).state).toBe('succeeded')
+  expect(f.store.getSandbox('retry')?.slot).toBe('sb1')
+})
+
+it('expires legacy namespace records without accessing their old namespace', async () => {
+  const f = fixture()
+  f.store.setSandbox({
+    key: 'legacy',
+    slot: 'old-namespace',
+    state: 'active',
+    createdAt: 1,
+    lastUsedAt: 1,
+    members: [],
+    activity: [],
+  })
+  await f.core.recover()
+  expect(await f.core.status('legacy')).toMatchObject({ state: 'expired', slot: undefined })
+  expect(f.runner.mock.calls.every(([, args]) => !args.includes('old-namespace'))).toBe(true)
+})
+
+it('isolates deployment commands, keeps TLS on expiry and removes it only on explicit delete', async () => {
+  const f = fixture()
+  await f.done(await f.core.create({ key: 'safe', members: [input], actor: 'you' }))
+  const repo = f.sandbox.mock.calls.find((call) => call[1] === 'deploy')?.[0]
+  expect(repo).toMatchObject({
+    namespace: 'personal',
+    varDefaults: {
+      ENVIRONMENT_NAME: 'personal',
+      WORKLOAD_NAME: 'app-sb1-api',
+      INGRESS_HOSTNAME: 'api-personal-sb1-candidate.vmock.dev',
+    },
+  })
+  expect(repo?.varDefaults?.IMAGE_TAG).toMatch(/-sb1$/)
+  expect(f.configs[0]?.config).toContain('deployments.api.helm.wait\n        value: false')
+  expect(f.applied.map((ingress) => ingress.metadata.name)).toContain('devdock-sb1-tls')
+  await f.done(f.core.wake('safe', 'you'))
+  await f.done(f.core.sleep('safe', 'you'))
+  await f.done(f.core.expire('safe', 'you'))
+  expect(
+    f.runner.mock.calls.some(([, args]) => args[0] === 'delete' && args[2] === 'devdock-sb1-tls'),
+  ).toBe(false)
+  await f.done(f.core.delete('safe', 'you'))
+  for (const kind of ['ingress', 'secret'])
+    expect(f.runner).toHaveBeenCalledWith(
+      'kubectl',
+      ['delete', kind, 'devdock-sb1-tls', '-n', 'personal', '--ignore-not-found'],
+      expect.anything(),
+    )
+  for (const [cmd, args] of f.runner.mock.calls) {
+    if (cmd === 'helm') expect(args[1]).toBe('app-sb1-api')
+    if (cmd === 'kubectl' && ['patch', 'create', 'delete'].includes(args[0] ?? '')) {
+      expect(args[2]?.split('-')).toContain('sb1')
+      expect(args[args.indexOf('-n') + 1]).toBe('personal')
+    }
+  }
+})
+
+it('does not delete TLS after its expired slot has been reused', async () => {
+  const f = fixture()
+  await f.done(await f.core.create({ key: 'old', members: [input], actor: 'you' }))
+  await f.done(f.core.expire('old', 'you'))
+  await f.done(await f.core.create({ key: 'new', members: [input], actor: 'you' }))
+  f.runner.mockClear()
+  await f.done(f.core.delete('old', 'you'))
+  expect(f.runner.mock.calls.some(([cmd, args]) => cmd === 'helm' || args[0] === 'delete')).toBe(
+    false,
+  )
+  expect(f.leases.get('sb1')?.data.key).toBe('new')
+})
+
+it('refuses to restore baked hosts into a different slot', async () => {
+  const f = fixture()
+  await f.done(await f.core.create({ key: 'old', members: [input], actor: 'you' }))
+  await f.done(f.core.expire('old', 'you'))
+  await f.done(await f.core.create({ key: 'new', members: [input], actor: 'you' }))
+  f.sandbox.mockClear()
+  const op = await f.done(f.core.wake('old', 'you'))
+  expect(op.state).toBe('failed')
+  expect(op.logs.at(-1)?.message).toContain('Snapshot needs slot sb1')
+  expect(f.leases.has('sb2')).toBe(false)
+  expect(f.sandbox).not.toHaveBeenCalled()
+})
+
+it('rewrites API and UI env before baking and configures each suffixed chart', async () => {
+  const f = fixture()
+  const op = await f.done(
+    await f.core.create({
+      key: 'full',
+      members: [input, { ...input, workload: 'ui' }],
+      actor: 'you',
+    }),
+  )
+  expect(op.state).toBe('succeeded')
+  for (const config of f.configs) {
+    expect(config.env).toBe(
+      'MEMBER=http://app-sb1-api/app\nPERSONAL=http://other-api/other\nAPI=https://api-personal-sb1-candidate.vmock.dev/app\nUI=https://dashboard-personal-sb1.vmock.dev/\n',
+    )
+    expect(config.config).toContain('path: pullSecrets\n        value: {}')
+  }
+  expect(
+    f.sandbox.mock.calls.find(
+      ([repo, action]) => repo.name === 'app-sb1-ui' && action === 'deploy',
+    )?.[0].varDefaults,
+  ).toMatchObject({
+    WORKLOAD_NAME: 'app-sb1-ui',
+    ENVIRONMENT_NAME: 'personal',
+    INGRESS_HOSTNAME: 'dashboard-personal-sb1.vmock.dev',
+  })
+  expect(f.applied.find((i) => i.metadata.name === 'devdock-sb1-tls')?.spec).toMatchObject({
+    tls: [{ hosts: ['dashboard-personal-sb1.vmock.dev', 'api-personal-sb1-candidate.vmock.dev'] }],
   })
 })

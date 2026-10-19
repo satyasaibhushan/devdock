@@ -165,7 +165,7 @@
     >{expired ? 'Rebuild' : 'Build'}</button>
     <button
       class="btn"
-      title="Reset releases and free the slot; the sandbox can be rebuilt later"
+      title="Uninstall sandbox releases and free the slot; the sandbox can be rebuilt later"
       disabled={locked || expired}
       onclick={() => (confirm = 'expire')}
     >Expire</button>
@@ -174,7 +174,7 @@
 </div>
 
 <div class="meta">
-  {#if sandbox.slot}<span class="fact mono" title="namespace slot"><Icon name="layers" size={12} />{sandbox.slot}</span>{/if}
+  {#if sandbox.slot}<span class="fact mono" title="personal namespace suffix"><Icon name="layers" size={12} />{sandbox.slot}</span>{/if}
   {#if sandbox.power !== 'unknown'}<span class="fact">{sandbox.power}</span>{/if}
   <span class="fact" class:due={!!sandbox.slot && sandbox.expiresAt <= now}>{expiryLabel(sandbox, now)}</span>
   {#if operation && (operationActive || (operation.state !== 'succeeded' && dismissedOperation !== operation.id))}
@@ -319,8 +319,8 @@
   <ConfirmModal
     title="{confirm === 'delete' ? 'Delete' : 'Expire'} {sandbox.key}?"
     message={confirm === 'delete'
-      ? `Resets every member's release, frees ${sandbox.slot ?? 'its slot'} and removes the sandbox record and its activity.`
-      : `Resets every member's release and frees ${sandbox.slot ?? 'its slot'}. The record stays, so the sandbox can be rebuilt into a free slot later.`}
+      ? `Uninstalls every member's release, frees ${sandbox.slot ?? 'its slot'} and removes the sandbox record and its activity.`
+      : `Uninstalls every member's release and frees ${sandbox.slot ?? 'its slot'}. The record stays, so the sandbox can be rebuilt into a free slot later.`}
     confirmLabel={confirm === 'delete' ? 'Delete sandbox' : 'Expire sandbox'}
     danger
     {busy}

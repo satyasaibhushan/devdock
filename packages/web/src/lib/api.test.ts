@@ -108,11 +108,11 @@ describe('sandbox client', () => {
       vi.fn(async () => ({
         ok: false,
         status: 409,
-        json: async () => ({ error: 'Sandbox namespace pool full' }),
+        json: async () => ({ error: 'All 5 sandbox slots are in use' }),
       })),
     )
     await expect(sandboxAction('SULF-1', 'sleep', '')).rejects.toThrow(
-      'Sandbox namespace pool full',
+      'All 5 sandbox slots are in use',
     )
   })
   it('reads log tails first and cursors afterwards', async () => {
