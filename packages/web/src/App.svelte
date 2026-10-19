@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { globalRepos, workloadTarget, instanceEndpoint, instanceSymbol, retainOwners } from './lib/globalRepos'
+  import { globalRepos, workloadTarget, instanceEndpoint, instanceSymbol, retainOwners, observationLogIssue } from './lib/globalRepos'
   import AuthBanner from './lib/AuthBanner.svelte'
   import InstancePanel from './lib/InstancePanel.svelte'
   import ConfirmModal from './lib/ConfirmModal.svelte'
@@ -126,7 +126,7 @@
   let moveTarget = $state<InstanceView | null>(null)
   let moveBusy = $state(false)
   // Machines with this checkout; new work and moves can only target those.
-  const machines = $derived(instances.filter((i) => i.repos.some((r) => r.repo.id === sid)))
+  const machines = $derived(instances.filter((i) => i.id === view?.ownerInstanceId || i.repos.some((r) => r.repo.id === sid)))
   function pickMachine(select: HTMLSelectElement) {
     const id = select.value
     const from = view?.ownerInstanceId
@@ -255,6 +255,9 @@
   const view = $derived(active ?? null)
   const owner = $derived(instances.find((i) => i.id === view?.instanceId))
   const ownerEndpoint = $derived(owner ? instanceEndpoint(owner) : '')
+  const observer = $derived(instances.find((i) => i.id === view?.observationInstanceId))
+  const logIssue = $derived(view?.unavailable ? observationLogIssue(view, observer) : '')
+  const logsEndpoint = $derived(view?.unavailable && observer ? instanceEndpoint(observer) : ownerEndpoint)
   const controlInstance = $derived(selectedId === HOST_ID ? preferredInstance : owner ?? preferredInstance)
   const controlEndpoint = $derived(controlInstance ? instanceEndpoint(controlInstance) : '')
   $effect(() => { void controlEndpoint; auth = null; void refresh() })
@@ -471,11 +474,11 @@
           <span class="ctls">
             <select
               class="sel mono"
-              title={view?.ownerInstanceId ? `Deployed from ${owner?.name ?? 'an unlinked instance'}. Pick another machine to move it.` : 'Machine for new work'}
+              title={view?.unavailable ? `${owner?.name ?? 'Owner'} unavailable${owner?.error ? `: ${owner.error}` : ''}` : view?.ownerInstanceId ? `Deployed from ${owner?.name ?? 'an unlinked instance'}. Pick another machine to move it.` : 'Machine for new work'}
               value={view?.ownerInstanceId ?? owner?.id ?? preferred}
               onchange={(e) => pickMachine(e.currentTarget)}
               aria-label="Machine"
-              disabled={busy !== null || moveBusy || activeOperation !== null}
+              disabled={view?.unavailable || busy !== null || moveBusy || activeOperation !== null}
             >
               {#each machines as item (item.id)}<option value={item.id} disabled={!item.online}>{instanceSymbol(item, instances)} {item.name}{item.online ? '' : ' (offline)'}</option>{/each}
               {#if view?.ownerInstanceId && !owner}<option value={view.ownerInstanceId} disabled>? unlinked owner</option>{/if}
@@ -528,7 +531,7 @@
             <button
               class="btn"
               class:danger={v === 'destroy'}
-              disabled={busy !== null || adoptBusy || stoppingSession || activeOperation !== null}
+              disabled={view?.unavailable || busy !== null || adoptBusy || stoppingSession || activeOperation !== null}
               onclick={() => act(v, sid, wl)}
             >{VERB_LABEL[v]}</button>
           {/each}
@@ -549,26 +552,42 @@
       </div>
 
       {#if view?.unavailable}
-        <div class="placeholder warn">
-          <Icon name="alert" size={18} />
-          <p>{owner ? `${owner.name} is unavailable or ownership could not be verified.` : 'Connect the instance that owns this deployment.'} Existing ownership is preserved.</p>
+        <div class="owner-warning" role="status">
+          <Icon name="alert" size={14} />
+          <span>{owner ? `${owner.name} is unavailable or ownership could not be verified.${owner.error ? ` ${owner.error}.` : ''}` : 'Connect the instance that owns this deployment.'}
+            Existing ownership is preserved. Controls and terminals are disabled.
+            {#if observer}Showing pod facts{logIssue ? '' : ' and logs'} observed by {observer.name}.{/if}
+            {logIssue}
+          </span>
         </div>
-      {:else}
+        <div class="pod-facts" aria-label="Pod facts">
+          {#each view.pods as pod (pod.name)}
+            <div class="pod-fact">
+              <span class="mono">{pod.name}</span>
+              <span>{pod.phase} · {pod.ready ? 'ready' : 'not ready'} · {pod.restartCount} restart{pod.restartCount === 1 ? '' : 's'}</span>
+            </div>
+          {:else}<span class="fact">No pods observed for this workload.</span>{/each}
+          {#each view.deployments as deployment (deployment.name)}
+            <div class="pod-fact"><span class="mono">{deployment.name}</span><span>{deployment.readyReplicas}/{deployment.replicas} replicas ready</span></div>
+          {/each}
+        </div>
+      {/if}
+      {#if !view?.unavailable || !logIssue}
       <!-- The terminal is the dev session; without one there is nothing to attach to. -->
-      <div class="streams" class:solo={!view?.hasSession}>
+      <div class="streams" class:solo={!view?.hasSession || view?.unavailable}>
         <div class="pane">
           <div class="pane-head">
             <span class="pane-title">Logs</span>
             {#if wl}<span class="pane-sub">{wl}</span>{/if}
           </div>
           <div class="pane-body">
-            {#key ownerEndpoint + sid + swl + sstatus}
-              <LogViewer id={sid} workload={wl} instance={ownerEndpoint} />
+            {#key logsEndpoint + sid + swl + sstatus}
+              <LogViewer id={sid} workload={wl} instance={logsEndpoint} />
             {/key}
           </div>
         </div>
 
-        {#if view?.hasSession}
+        {#if view?.hasSession && !view.unavailable}
           <div class="pane tpane">
             {#key ownerEndpoint + sid + swl}
               <TerminalPanel repo={sid} workload={wl} attach={sterm} instance={ownerEndpoint} machine={owner?.name ?? 'machine'} />
@@ -885,6 +904,42 @@
   .fact.mono {
     font-family: var(--mono);
     font-size: 12.5px;
+  }
+
+  .owner-warning {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    flex: none;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--line);
+    background: color-mix(in srgb, var(--warn) 7%, var(--bg-1));
+    color: var(--warn);
+    font-size: 12.5px;
+    line-height: 1.5;
+  }
+  .owner-warning :global(svg) {
+    flex: none;
+    margin-top: 2px;
+  }
+  .pod-facts {
+    flex: 0 1 auto;
+    max-height: 30%;
+    overflow-y: auto;
+    padding: 8px 16px;
+    border-bottom: 1px solid var(--line);
+    color: var(--ink-2);
+    font-size: 12.5px;
+  }
+  .pod-fact {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 16px;
+    padding: 4px 0;
+  }
+  .pod-fact .mono {
+    font-family: var(--mono);
+    overflow-wrap: anywhere;
   }
 
   .streams {

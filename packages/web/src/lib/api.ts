@@ -51,6 +51,8 @@ export interface WorkloadState {
   ownershipKnown?: boolean
   instanceId?: string
   unavailable?: boolean
+  /** Fresh local cluster observations when control through the owner is unavailable. */
+  observationInstanceId?: string
   type: string
   status: RepoStatus
   pods: PodInfo[]

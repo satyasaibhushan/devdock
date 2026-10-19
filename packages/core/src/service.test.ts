@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import {
   appendFileSync,
   mkdirSync,
@@ -850,6 +851,52 @@ describe('Service', () => {
         .filter((t) => t.alive)
         .map((t) => t.id),
     ).toEqual([second.id])
+  })
+
+  it('streams locally observed pod logs for a foreign owner while refusing mutations and terminals', async () => {
+    const peer = 'bbbbbbbb-2222-4222-8222-222222222222'
+    const claim = `devdock-owner-${createHash('sha256').update('svc-a').digest('hex').slice(0, 32)}`
+    const base = cannedRunner(READY_PODS, false)
+    const runner = vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
+      if (cmd === 'kubectl' && args.includes('configmaps'))
+        return { code: 0, stdout: `${claim}\tsvc-a\t${peer}\n`, stderr: '' }
+      if (cmd === 'kubectl' && args.includes('configmap'))
+        return {
+          code: 0,
+          stdout: JSON.stringify({ data: { instance: peer, deployment: 'svc-a' } }),
+          stderr: '',
+        }
+      return base(cmd, args)
+    })
+    const { spawner, spawns } = fakeStreamSpawner()
+    const svc = new Service(
+      { roots: [root], stateFile, instanceId: 'local' },
+      { runner, streamSpawner: spawner },
+    )
+    svc.rescan()
+    try {
+      await svc.reconcileAll()
+      expect((await svc.listWithOwnership())[0]?.workloads[0]?.ownerInstanceId).toBe(peer)
+      const off = svc.subscribeLogs('svc-a', () => undefined)
+      expect(spawns).toContainEqual({
+        cmd: 'kubectl',
+        args: ['logs', '-f', 'svc-a-app-devspace-1', '-n', 'ns'],
+      })
+      expect(() => svc.logs('svc-a')).not.toThrow()
+      off()
+      await expect(svc.start('svc-a')).rejects.toThrow(`owned by instance ${peer}`)
+      await expect(svc.openRegisteredTerminal({ repo: 'svc-a' })).rejects.toThrow(
+        `owned by instance ${peer}`,
+      )
+      expect(
+        runner.mock.calls.some(
+          ([cmd, args]) =>
+            cmd === 'kubectl' && ['create', 'delete', 'apply'].includes(args[0] ?? ''),
+        ),
+      ).toBe(false)
+    } finally {
+      await svc.stopLoop()
+    }
   })
 
   it('narrates verb activity into the repo logs, even with no pods', async () => {
