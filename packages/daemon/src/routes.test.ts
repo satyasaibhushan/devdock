@@ -716,7 +716,7 @@ it('serves sandbox reads on the development socket and validates actors on every
       { method: 'POST' as const, url: '/sandboxes' },
       { method: 'PATCH' as const, url: '/sandboxes/SULF-1' },
       { method: 'DELETE' as const, url: '/sandboxes/SULF-1' },
-      ...['build', 'snapshot', 'wake', 'sleep', 'expire', 'head'].map((a) => ({
+      ...['build', 'snapshot', 'wake', 'sleep', 'expire'].map((a) => ({
         method: 'POST' as const,
         url: `/sandboxes/SULF-1/${a}`,
       })),
@@ -733,14 +733,13 @@ it('serves sandbox reads on the development socket and validates actors on every
   }
 })
 
-it('routes sandbox mutations and head updates to the core and forwards log/exec targets', async () => {
+it('routes sandbox mutations to the core and forwards log/exec targets', async () => {
   const { svc } = makeService()
   const app = buildApp(svc)
   const receipt = { operationId: 'op1' }
   const create = vi.spyOn(svc, 'createSandbox').mockResolvedValue(receipt)
   const update = vi.spyOn(svc, 'updateSandbox').mockReturnValue(receipt)
   const build = vi.spyOn(svc, 'buildSandbox').mockReturnValue(receipt)
-  const head = vi.spyOn(svc, 'recordHead').mockResolvedValue()
   const query = vi
     .spyOn(svc, 'queryLogs')
     .mockResolvedValue({ source: 'container', lines: [], cursor: '' })
@@ -767,9 +766,9 @@ it('routes sandbox mutations and head updates to the core and forwards log/exec 
     await app.inject({
       method: 'POST',
       url: '/sandboxes/SULF-1/build',
-      payload: { actor: 'you', force: true },
+      payload: { actor: 'you', repo: 'svc-a' },
     })
-    expect(build).toHaveBeenCalledWith('SULF-1', { actor: 'you', force: true })
+    expect(build).toHaveBeenCalledWith('SULF-1', { actor: 'you', repo: 'svc-a' })
     for (const action of ['wake', 'sleep', 'expire', 'delete'] as const) {
       const method = vi.spyOn(svc, `${action}Sandbox`).mockReturnValue(receipt)
       const response = await app.inject({
@@ -796,18 +795,11 @@ it('routes sandbox mutations and head updates to the core and forwards log/exec 
       payload: { actor: 'you', evict: true },
     })
     expect(wake).toHaveBeenCalledWith('SULF-1', 'you', { evict: true })
-    await app.inject({
-      method: 'POST',
-      url: '/sandboxes/SULF-1/head',
-      payload: { repo: 'svc-a', workload: 'api', sha: 'a'.repeat(40), actor: 'poller' },
-    })
-    expect(head).toHaveBeenCalledWith(
-      'SULF-1',
-      expect.objectContaining({ repo: 'svc-a' }),
-      'a'.repeat(40),
-      'poller',
-      undefined,
-    )
+    for (const gone of ['discover', 'head'])
+      expect(
+        (await app.inject({ method: 'POST', url: `/sandboxes/SULF-1/${gone}`, payload: {} }))
+          .statusCode,
+      ).toBe(404)
     await app.inject('/repos/svc-a/logs/query?sandbox=SULF-1&workload=api')
     expect(query).toHaveBeenCalledWith(
       'svc-a',
@@ -854,9 +846,7 @@ describe('stable sandbox link', () => {
       {
         repo: 'svc-a',
         workload: 'api',
-        source: { kind: 'branch', ref: 'SULF-1' },
         mode: 'built',
-        headSha: sha,
         deployedSha: sha,
         build: { state: 'idle' },
       },
@@ -864,7 +854,17 @@ describe('stable sandbox link', () => {
     snapshot: {
       at: Date.now(),
       actor: 'you',
-      members: [{ repo: 'svc-a', workload: 'api', sha, dirtyFiles: ['src/a.ts'], image: 'img' }],
+      members: [
+        {
+          repo: 'svc-a',
+          workload: 'api',
+          sha,
+          dirtyFiles: ['src/a.ts'],
+          image: 'img',
+          branch: 'SULF-1-fix',
+          pr: { number: 7, url: 'https://github.com/team/svc-a/pull/7' },
+        },
+      ],
     },
     power: 'awake',
     healthy: true,
@@ -873,7 +873,6 @@ describe('stable sandbox link', () => {
     link: 'http://127.0.0.1:7717/s/SULF-1',
     markdown: '',
     expiresAt: 0,
-    allMerged: false,
     pool: [{ slot: 'slot1', key: 'SULF-1' }],
     ...over,
   })
@@ -895,6 +894,8 @@ describe('stable sandbox link', () => {
       expect(wake).not.toHaveBeenCalled()
       expect(asleep.body).toContain('Waking the sandbox')
       expect(asleep.body).toContain('+1 files')
+      expect(asleep.body).toContain(`SULF-1-fix @ ${sha.slice(0, 7)}`)
+      expect(asleep.body).toContain('href="https://github.com/team/svc-a/pull/7">PR #7<')
       expect(asleep.body).toContain('"poll":true')
       expect(asleep.body).toContain('"wake":true')
       status.mockResolvedValue(view({ power: 'asleep', healthy: false, ribbon: 'building' }))

@@ -34,30 +34,30 @@ const STYLE = `
 .one{padding:0 12px 10px;font-size:12.5px;color:var(--ink-2)}.one.err{color:var(--danger)}
 .shows{margin:0 12px;background:var(--bg-0);border:1px solid var(--line);border-radius:6px;font:12px var(--mono);padding:8px 10px}
 .sh{display:flex;font-size:11px;text-transform:uppercase;color:var(--muted);margin-bottom:6px}.sh .ago{margin-left:auto}
-.ln{display:grid;grid-template-columns:minmax(0,1.5fr) 58px minmax(0,1fr);gap:8px;padding:2px 0}.ln .repo{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.ln .h{color:var(--ink-2)}.ln .cmp{text-align:right}.cmp.ok{color:var(--ok)}.cmp.warn{color:var(--warn)}.cmp.vi{color:var(--deployed)}.cmp.ac{color:var(--accent)}
+.ln{display:flex;gap:10px;padding:2px 0;white-space:nowrap}.ln .repo{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis}
+.ln .h{min-width:0;overflow:hidden;text-overflow:ellipsis;color:var(--ink-2)}.ln .pr{color:var(--accent);text-decoration:none}.ln .dirty{color:var(--deployed)}
 .ft{display:flex;align-items:center;gap:10px;padding:12px;margin-top:auto}
 .lk{font:12px var(--mono);color:var(--accent);text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .btn{margin-left:auto;border:1px solid var(--line-strong);background:var(--bg-2);color:var(--ink);border-radius:6px;padding:6px 12px;font:600 12.5px var(--sans);cursor:pointer;white-space:nowrap}
 .btn.primary{background:var(--accent);border-color:var(--accent);color:#06101c}.btn:disabled{opacity:.6;cursor:default}
 `
 
+// One line per member: what was built (branch @ sha), its PR and uncommitted files. Display only;
+// nothing here is compared against a remote head.
 function shows(view: SandboxView): string {
   const snap = view.snapshot
   if (!snap) return ''
   const rows = snap.members
     .map((m) => {
-      const member = view.members.find((c) => c.repo === m.repo && c.workload === m.workload)
-      let cmp = ''
-      let cls = 'ac'
-      if (m.dirtyFiles.length) {
-        cmp = `+${m.dirtyFiles.length} files`
-        cls = 'vi'
-      } else if (member?.headSha && member.source.kind !== 'worktree') {
-        cmp = m.sha === member.headSha ? '= head' : 'behind head'
-        cls = m.sha === member.headSha ? 'ok' : 'warn'
-      }
-      return `<div class="ln"><span class="repo">${esc(m.repo)} ${esc(m.workload)}</span><span class="h">${esc(m.sha.slice(0, 7))}</span><span class="cmp ${cls}">${esc(cmp)}</span></div>`
+      const branch = m.branch ? `${esc(m.branch)} @ ` : ''
+      const pr =
+        m.pr && /^https?:\/\//.test(m.pr.url)
+          ? `<a class="pr" href="${esc(m.pr.url)}">PR #${m.pr.number}</a>`
+          : ''
+      const dirty = m.dirtyFiles.length
+        ? `<span class="dirty" title="${esc(m.dirtyFiles.join('\n'))}">+${m.dirtyFiles.length} files</span>`
+        : ''
+      return `<div class="ln"><span class="repo">${esc(m.repo)} ${esc(m.workload)}</span><span class="h" title="${esc(m.sha)}">${branch}${esc(m.sha.slice(0, 7))}</span>${pr}${dirty}</div>`
     })
     .join('')
   return `<div class="shows"><div class="sh"><span>shows</span><span class="ago">${esc(ago(snap.at))} by ${esc(snap.actor)}</span></div>${rows}</div>`
