@@ -49,6 +49,7 @@ describe('instance directory', () => {
       expect(peerPathAllowed(path, true)).toBe(false)
     }
     expect(peerPathAllowed('/repos/accounts/run', false)).toBe(true)
+    expect(peerPathAllowed('/auth/aws/login', false)).toBe(true)
     expect(peerPathAllowed('/repos/accounts/stop-session?workload=api', false)).toBe(true)
     expect(peerPathAllowed('/repos/accounts/logs?workload=api', false)).toBe(true)
     expect(peerPathAllowed('/terminals/id/attach', false)).toBe(false)

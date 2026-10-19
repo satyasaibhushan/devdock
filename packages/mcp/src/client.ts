@@ -123,6 +123,7 @@ export interface DaemonClient {
   setNamespace(ns: string): Promise<NamespaceInfo>
   auth(): Promise<AuthState>
   authLogin(): Promise<AuthState>
+  awsLogin(): Promise<AuthState>
   authClear(): Promise<AuthState>
   branches(id: string): Promise<BranchInfo[]>
   replicaCreate(id: string, branch: string, ownImage?: boolean): Promise<ReplicaRecord>
@@ -314,6 +315,7 @@ export function daemonClient(send: DaemonTransport, prefix = ''): DaemonClient {
       }),
     auth: () => request<AuthState>('/auth'),
     authLogin: () => post<AuthState>('/auth/login'),
+    awsLogin: () => post<AuthState>('/auth/aws/login'),
     authClear: () => post<AuthState>('/auth/clear'),
     branches: (i) => request<BranchInfo[]>(`/repos/${id(i)}/branches`),
     replicaCreate: (i, branch, ownImage) =>

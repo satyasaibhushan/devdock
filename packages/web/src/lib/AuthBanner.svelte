@@ -2,9 +2,9 @@
   // Kubernetes auth indicator (header) — visible only when something needs the
   // user: login required (one explicit shared sign-in for all workloads),
   // sign-in in progress, or an auth error. Silent when ok or when the cluster
-  // doesn't use oidc-login at all. A pending AWS sign-in shows its own pill
+  // doesn't use oidc-login at all. Required or pending AWS sign-in has its own pill
   // (the daemon never opens a browser, so this link is the only way in).
-  import { type AuthState, clearAuthCache, startAuthLogin } from './api.js'
+  import { type AuthState, clearAuthCache, startAuthLogin, startAwsLogin } from './api.js'
   import Icon from './Icon.svelte'
 
   let {
@@ -19,6 +19,7 @@
   } = $props()
 
   let busy = $state(false)
+  let awsBusy = $state(false)
 
   const visible = $derived(auth.oidc && auth.phase !== 'ok' && auth.phase !== 'unknown')
 
@@ -43,13 +44,30 @@
       busy = false
     }
   }
+
+  async function awsLogin() {
+    awsBusy = true
+    try {
+      onchanged(await startAwsLogin(instance))
+    } catch {
+      // next poll shows the real state
+    } finally {
+      awsBusy = false
+    }
+  }
 </script>
 
-{#if auth.awsLoginUrl}
-  <div class="auth login_required" title="AWS refresh token expired" role="status">
+{#if auth.aws?.state === 'required'}
+  <div class="auth login_required" title={auth.aws.message} role="status">
     <Icon name="alert" size={13} />
     <span class="msg">AWS sign-in required</span>
-    <a class="btn sm" href={auth.awsLoginUrl} target="_blank" rel="noreferrer">Open sign-in<Icon name="external" size={11} /></a>
+    <button class="btn sm primary" onclick={awsLogin} disabled={awsBusy}>Sign in</button>
+  </div>
+{:else if auth.aws?.state === 'pending' || auth.awsLoginUrl}
+  <div class="auth login_required" title={auth.aws?.message ?? 'AWS sign-in pending'} role="status">
+    <Icon name="alert" size={13} />
+    <span class="msg">AWS sign-in required</span>
+    <a class="btn sm" href={auth.aws?.loginUrl ?? auth.awsLoginUrl} target="_blank" rel="noreferrer">Open sign-in<Icon name="external" size={11} /></a>
   </div>
 {/if}
 {#if visible}

@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { AwsCreds } from './awsCreds.js'
 import type { RunResult } from './exec.js'
+import { TokenEndpointError, tokenGrant } from './oidc.js'
 
 // The shape `aws-cli-oidc setup` writes. Port 0 → the callback server picks an
 // ephemeral port, so interactive-flow tests never collide with a real 8010.
@@ -87,7 +88,10 @@ beforeEach(() => {
   tokenFile = join(dir, 'aws-oidc.json')
   writeFileSync(configPath, OIDC_CONFIG)
 })
-afterEach(() => rmSync(dir, { recursive: true, force: true }))
+afterEach(() => {
+  vi.restoreAllMocks()
+  rmSync(dir, { recursive: true, force: true })
+})
 
 const make = (fetchFn: typeof fetch, extra: Record<string, unknown> = {}) =>
   new AwsCreds({
@@ -99,6 +103,108 @@ const make = (fetchFn: typeof fetch, extra: Record<string, unknown> = {}) =>
   })
 
 describe('AwsCreds', () => {
+  it('requires sign-in without a usable saved token, without making network calls', () => {
+    const { fetchFn } = fakeFetch({})
+    const creds = make(fetchFn)
+    const required = { state: 'required', message: 'no AWS sign-in saved' }
+    expect(creds.status()).toEqual(required)
+    for (const contents of ['not json', '{}', '{"refreshToken":""}', '{"refreshToken":" "}']) {
+      writeFileSync(tokenFile, contents)
+      expect(creds.status()).toEqual(required)
+    }
+    writeFileSync(tokenFile, JSON.stringify({ refreshToken: 'rt-1' }))
+    expect(creds.status()).toEqual({ state: 'ok' })
+    expect(fetchFn).not.toHaveBeenCalled()
+  })
+
+  it('reports pending sign-in with its URL, then ok after the callback', async () => {
+    const { fetchFn } = fakeFetch({
+      token: () => json({ id_token: 'id-1', refresh_token: 'rt-new' }),
+    })
+    const creds = make(fetchFn, { loginTimeoutMs: 2000 })
+    const warming = creds.warm()
+    await vi.waitFor(() => expect(creds.status().state).toBe('pending'))
+    expect(creds.status().loginUrl).toBe(creds.loginUrl())
+    expect(creds.status().loginUrl).toMatch(/^https:\/\/idp\.example\/oauth2\/authorize\?/)
+    const browser = watchSignIn(creds)
+    try {
+      expect(await warming).toEqual({ ok: true })
+      expect(creds.status()).toEqual({ state: 'ok' })
+      rmSync(tokenFile)
+      expect(creds.status()).toEqual({ state: 'ok' }) // the credential is still fresh
+    } finally {
+      browser.stop()
+    }
+  })
+
+  it('keeps and logs the rejection reason until a successful mint', async () => {
+    writeFileSync(
+      tokenFile,
+      JSON.stringify({ refreshToken: 'rt-dead', savedAt: Date.now() - 3 * 3600_000 }),
+    )
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {})
+    let denyRole = true
+    const { fetchFn } = fakeFetch({
+      token: (form) =>
+        form.get('refresh_token') === 'rt-dead'
+          ? json({ error: 'invalid_grant', error_description: 'Refresh Token has expired' }, 400)
+          : json({ id_token: 'id-1', refresh_token: 'rt-live' }),
+      sts: () =>
+        denyRole
+          ? new Response('<Error><Message>role denied</Message></Error>', { status: 403 })
+          : new Response(stsXml(3600_000)),
+    })
+    const creds = make(fetchFn, { loginTimeoutMs: 150 })
+    expect((await creds.warm()).ok).toBe(false)
+    expect(() => readFileSync(tokenFile)).toThrow()
+    const required = {
+      state: 'required',
+      message:
+        'AWS refresh token rejected after 3h: OIDC token grant failed: HTTP 400 invalid_grant: Refresh Token has expired',
+    }
+    expect(creds.status()).toEqual(required)
+    expect(creds.status()).toEqual(required)
+    expect(log).toHaveBeenCalledTimes(1)
+    expect(log).toHaveBeenCalledWith(required.message)
+    const browser = watchSignIn(creds)
+    try {
+      expect(await creds.login()).toEqual({ ok: false, message: 'role denied' })
+      expect(creds.status()).toEqual(required)
+      expect(JSON.parse(readFileSync(tokenFile, 'utf8')).refreshToken).toBe('rt-live')
+      denyRole = false
+      expect(await creds.login()).toEqual({ ok: true })
+      expect(creds.status()).toEqual({ state: 'ok' })
+      expect(log).toHaveBeenCalledTimes(1)
+    } finally {
+      browser.stop()
+    }
+  })
+
+  it('keeps sign-in required after timeout and lets login bypass the cooldown', async () => {
+    const { fetchFn, grants } = fakeFetch({
+      token: () => json({ id_token: 'id-1', refresh_token: 'rt-new' }),
+    })
+    const creds = make(fetchFn, { loginTimeoutMs: 150, failCooldownMs: 60_000 })
+    const failed = await creds.warm()
+    expect(failed.ok).toBe(false)
+    expect(creds.status()).toEqual({ state: 'required', message: failed.message })
+    expect(failed.message).toContain('AWS sign-in did not complete in time')
+    expect(creds.loginUrl()).toBeUndefined()
+    expect(await creds.warm()).toEqual(failed)
+    expect(grants).toHaveLength(0)
+    const browser = watchSignIn(creds)
+    try {
+      const login = creds.login()
+      expect(creds.login()).toBe(login)
+      expect(creds.warm()).toBe(login)
+      expect(await login).toEqual({ ok: true })
+      expect(creds.status()).toEqual({ state: 'ok' })
+      expect(grants).toHaveLength(1)
+    } finally {
+      browser.stop()
+    }
+  })
+
   it('mints silently via the refresh token grant — no browser', async () => {
     writeFileSync(tokenFile, JSON.stringify({ refreshToken: 'rt-1' }))
     const { fetchFn, grants } = fakeFetch({
@@ -295,6 +401,7 @@ describe('AwsCreds', () => {
       const fetchFn = vi.fn() as unknown as typeof fetch
       const creds = new AwsCreds({ oidcConfigPath: path, tokenFile, fetchFn })
       expect(creds.configured()).toBe(false)
+      expect(creds.status()).toEqual({ state: 'ok' })
       expect(await creds.warm()).toEqual({ ok: true })
       expect((await creds.credential()).ok).toBe(false)
       expect(fetchFn).not.toHaveBeenCalled()
@@ -320,4 +427,30 @@ describe('AwsCreds', () => {
     expect(creds.fresh()).toBe(false)
     expect(() => readFileSync(tokenFile, 'utf8')).toThrow()
   })
+})
+
+describe('tokenGrant', () => {
+  it.each([
+    [
+      { error: 'invalid_grant', error_description: 'Refresh Token has expired' },
+      ' invalid_grant: Refresh Token has expired',
+      true,
+    ],
+    [{ error: 'invalid_grant' }, ' invalid_grant', true],
+    [{ error_description: 'Try again' }, ' Try again', false],
+    [{ error: 12, error_description: {} }, '', false],
+  ])(
+    'reports provider error fields without response tokens: %j',
+    async (body, detail, invalidGrant) => {
+      const { fetchFn } = fakeFetch({
+        token: () => json({ ...body, id_token: 'secret-id', refresh_token: 'secret-refresh' }, 400),
+      })
+      await expect(
+        tokenGrant(fetchFn, TOKEN_URL, { refresh_token: 'secret-request' }),
+      ).rejects.toMatchObject({
+        message: `OIDC token grant failed: HTTP 400${detail}`,
+        invalidGrant,
+      })
+    },
+  )
 })

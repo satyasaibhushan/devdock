@@ -24,6 +24,7 @@
 import { readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import type { AwsSignInStatus } from './awsCreds.js'
 import { type RunOptions, type RunResult, run, runStream } from './exec.js'
 import { type OidcEndpoints, TokenEndpointError, discoverEndpoints, tokenGrant } from './oidc.js'
 
@@ -49,8 +50,9 @@ export interface AuthState {
   /** Cached id_token expiry (epoch ms), when present and parseable. */
   tokenExpiresAt?: number
   loginUrl?: string
-  /** Pending AWS sign-in URL (set by the service from AwsCreds, not by this
-   *  manager): the refresh token is dead and a verb is waiting on it. */
+  /** AWS sign-in state, filled by the service. */
+  aws?: AwsSignInStatus
+  /** Pending AWS sign-in URL, kept for older clients. */
   awsLoginUrl?: string
   checkedAt: number
 }

@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { type RunResult, Service } from '@devdock/core'
+import { AwsCreds, type RunResult, Service } from '@devdock/core'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { AccessGate } from './accessGate.js'
 import { buildAgentApp } from './agentAccess.js'
@@ -450,9 +450,32 @@ describe('daemon routes', () => {
     const login = await app.inject({ method: 'POST', url: '/auth/login' })
     expect(login.json().phase).toBe('logging_in') // immediate snapshot, flow continues behind
     expect(auth.login).toHaveBeenCalled()
+    auth.snapshot.mockReturnValue({ oidc: true, phase: 'login_required', checkedAt: 3 })
     const clear = await app.inject({ method: 'POST', url: '/auth/clear' })
     expect(clear.json().phase).toBe('login_required')
     expect(auth.clearCache).toHaveBeenCalled()
+    expect(clear.json().aws).toEqual({ state: 'ok' })
+  })
+
+  it('POST /auth/aws/login returns the auth snapshot while sign-in is still waiting', async () => {
+    const awsCreds = new AwsCreds({ oidcConfigPath: null, tokenFile: join(root, 'aws-oidc.json') })
+    const login = vi.spyOn(awsCreds, 'login').mockReturnValue(new Promise(() => {}))
+    const aws = { state: 'pending' as const, loginUrl: 'https://idp.example/authorize' }
+    vi.spyOn(awsCreds, 'status').mockReturnValue(aws)
+    const svc = new Service(
+      { roots: [root], stateFile: join(root, 'state.json') },
+      { runner: vi.fn(async () => ({ code: 0, stdout: '', stderr: '' })), awsCreds },
+    )
+    const app = buildApp(svc)
+    try {
+      const res = await app.inject({ method: 'POST', url: '/auth/aws/login' })
+      expect(res.statusCode).toBe(200)
+      expect(res.json()).toMatchObject({ aws, awsLoginUrl: aws.loginUrl })
+      expect(login).toHaveBeenCalledTimes(1)
+      expect((await app.inject('/auth')).json()).toEqual(res.json())
+    } finally {
+      await app.close()
+    }
   })
 
   it('GET /aws/credential serves the minted credential_process payload', async () => {

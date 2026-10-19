@@ -265,6 +265,7 @@ export function buildApp(
   // flow finishes in the background and later polls pick up the outcome.
   app.get('/auth', async () => service.authState())
   app.post('/auth/login', async () => service.authLogin())
+  app.post('/auth/aws/login', async () => service.awsLogin())
   app.post('/auth/clear', async () => service.authClearCache())
 
   // AWS credential, owned by the daemon: minted silently via the OIDC refresh

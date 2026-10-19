@@ -358,6 +358,7 @@ export interface AuthState {
   message?: string
   tokenExpiresAt?: number
   loginUrl?: string
+  aws?: { state: 'ok' | 'required' | 'pending'; message?: string; loginUrl?: string }
   /** Pending AWS sign-in; shown even when kubernetes auth is ok. */
   awsLoginUrl?: string
   checkedAt: number
@@ -373,6 +374,12 @@ export async function fetchAuth(instance = selectedInstance): Promise<AuthState>
 export async function startAuthLogin(instance = selectedInstance): Promise<AuthState> {
   const res = await fetch('/auth/login', { method: 'POST' }, instance)
   if (!res.ok) throw new Error(`POST /auth/login → ${res.status}`)
+  return res.json()
+}
+
+export async function startAwsLogin(instance = selectedInstance): Promise<AuthState> {
+  const res = await fetch('/auth/aws/login', { method: 'POST' }, instance)
+  if (!res.ok) throw new Error(`POST /auth/aws/login → ${res.status}`)
   return res.json()
 }
 

@@ -60,8 +60,13 @@ export async function tokenGrant(
     error_description?: string
   }
   if (!res.ok) {
+    // Provider's own reason (e.g. invalid_grant: Refresh Token has expired), so a dead
+    // grant says why it died.
+    const detail = [body.error, body.error_description]
+      .filter((v) => typeof v === 'string' && v !== '')
+      .join(': ')
     throw new TokenEndpointError(
-      `OIDC token grant failed: HTTP ${res.status}`,
+      `OIDC token grant failed: HTTP ${res.status}${detail ? ` ${detail}` : ''}`,
       res.status === 400 && body.error === 'invalid_grant',
     )
   }

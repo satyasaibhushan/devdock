@@ -44,6 +44,12 @@ export interface WarmResult {
   message?: string
 }
 
+export interface AwsSignInStatus {
+  state: 'ok' | 'required' | 'pending'
+  message?: string
+  loginUrl?: string
+}
+
 /** A credential_process payload — what `/aws/credential` serves. */
 export interface AwsCredential {
   Version: 1
@@ -107,6 +113,7 @@ export class AwsCreds {
   private lastFailMessage: string | undefined
   private inflight: Promise<WarmResult> | null = null
   private pendingLoginUrl: string | undefined
+  private signInRequiredMessage: string | undefined
 
   constructor(opts: AwsCredsOptions = {}) {
     this.oidcConfigPath =
@@ -128,6 +135,30 @@ export class AwsCreds {
   /** Whether the minted credential is known-fresh (a warm would be a no-op). */
   fresh(): boolean {
     return this.expiresAt - EXPIRY_MARGIN_MS > Date.now()
+  }
+
+  status(): AwsSignInStatus {
+    if (!this.configured()) return { state: 'ok' }
+    if (this.pendingLoginUrl) {
+      return {
+        state: 'pending',
+        message: this.signInRequiredMessage,
+        loginUrl: this.pendingLoginUrl,
+      }
+    }
+    if (this.signInRequiredMessage) {
+      return { state: 'required', message: this.signInRequiredMessage }
+    }
+    if (!this.fresh() && !this.loadRefreshToken()) {
+      return { state: 'required', message: 'no AWS sign-in saved' }
+    }
+    return { state: 'ok' }
+  }
+
+  /** Explicit retries share the current mint but bypass a previous failure's cooldown. */
+  login(): Promise<WarmResult> {
+    this.lastFailAt = 0
+    return this.warm()
   }
 
   /** Make the AWS credential good before devspace runs. Single-flight: every
@@ -185,6 +216,7 @@ export class AwsCreds {
       this.expiresAt = Number.isNaN(exp) ? Date.now() + FALLBACK_FRESH_MS : exp
       this.lastFailAt = 0
       this.lastFailMessage = undefined
+      this.signInRequiredMessage = undefined
       return { ok: true }
     } catch (err) {
       this.lastFailAt = Date.now()
@@ -202,7 +234,7 @@ export class AwsCreds {
         const t = await tokenGrant(this.fetchFn, ep.token, {
           grant_type: 'refresh_token',
           client_id: cfg.clientId,
-          refresh_token: refreshToken,
+          refresh_token: refreshToken.token,
         })
         if (t.refresh_token) this.saveRefreshToken(t.refresh_token) // rotation, if enabled
         if (typeof t.id_token !== 'string' || !t.id_token) {
@@ -211,6 +243,16 @@ export class AwsCreds {
         idToken = t.id_token
       } catch (err) {
         if (!(err instanceof TokenEndpointError) || !err.invalidGrant) throw err
+        const minutes =
+          refreshToken.savedAt === undefined
+            ? undefined
+            : Math.max(0, Math.floor((Date.now() - refreshToken.savedAt) / 60_000))
+        const age =
+          minutes === undefined
+            ? ''
+            : ` after ${minutes >= 60 ? `${Math.floor(minutes / 60)}h` : `${minutes}m`}`
+        this.signInRequiredMessage = `AWS refresh token rejected${age}: ${err.message}`
+        console.error(this.signInRequiredMessage)
         // The grant is dead (expired/revoked) — only then fall to the browser.
         rmSync(this.tokenFile, { force: true })
       }
@@ -246,7 +288,9 @@ export class AwsCreds {
       const redirect = `http://${cfg.listenHost}:${port}`
       const code = new Promise<string>((resolve, reject) => {
         const timer = setTimeout(() => {
-          reject(new Error(`AWS sign-in did not complete in time — ${OFF_NETWORK_HINT}`))
+          const message = `AWS sign-in did not complete in time: ${OFF_NETWORK_HINT}`
+          this.signInRequiredMessage ??= message
+          reject(new Error(message))
         }, this.loginTimeoutMs)
         server.on('request', (req, res) => {
           const u = new URL(req.url ?? '/', redirect)
@@ -330,12 +374,20 @@ export class AwsCreds {
     return this.endpointsCache
   }
 
-  private loadRefreshToken(): string | undefined {
+  private loadRefreshToken(): { token: string; savedAt?: number } | undefined {
     try {
-      const data = JSON.parse(readFileSync(this.tokenFile, 'utf8')) as { refreshToken?: unknown }
-      return typeof data.refreshToken === 'string' && data.refreshToken
-        ? data.refreshToken
-        : undefined
+      const data = JSON.parse(readFileSync(this.tokenFile, 'utf8')) as {
+        refreshToken?: unknown
+        savedAt?: unknown
+      }
+      if (typeof data.refreshToken !== 'string' || !data.refreshToken.trim()) return undefined
+      return {
+        token: data.refreshToken,
+        savedAt:
+          typeof data.savedAt === 'number' && Number.isFinite(data.savedAt)
+            ? data.savedAt
+            : undefined,
+      }
     } catch {
       return undefined
     }

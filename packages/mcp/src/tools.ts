@@ -285,7 +285,7 @@ export function allTools(client: DaemonClient): ToolDef[] {
     {
       name: 'devdock_auth_status',
       description:
-        'Kubernetes OIDC auth state (phase, token expiry, sign-in URL) plus awsLoginUrl when an AWS sign-in is pending. Neither sign-in opens a browser: hand the URL to the user. Poll this after devdock_auth_login.',
+        'Kubernetes OIDC auth state (phase, token expiry, sign-in URL) plus AWS sign-in status (ok, required, pending), reason and login URL. awsLoginUrl is also set while AWS sign-in is pending. Neither sign-in opens a browser: hand the URL to the user. Poll this after devdock_auth_login or devdock_aws_login.',
       scope: 'ro',
       inputSchema: {},
       handler: async () => JSON.stringify(await client.auth(), null, 2),
@@ -466,6 +466,14 @@ export function allTools(client: DaemonClient): ToolDef[] {
       scope: 'rw',
       inputSchema: {},
       handler: async () => JSON.stringify(await client.authLogin()),
+    },
+    {
+      name: 'devdock_aws_login',
+      description:
+        'Explicitly start one AWS sign-in without opening a browser, bypassing the retry cooldown. Poll devdock_auth_status for the sign-in URL and outcome.',
+      scope: 'rw',
+      inputSchema: {},
+      handler: async () => JSON.stringify(await client.awsLogin()),
     },
     {
       name: 'devdock_auth_clear',

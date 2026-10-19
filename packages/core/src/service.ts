@@ -2508,7 +2508,8 @@ export class Service {
 
   // ---- kubernetes auth (owned by AuthManager, surfaced over /auth) ----
   authState(): AuthState {
-    return { ...this.auth.snapshot(), awsLoginUrl: this.awsCreds.loginUrl() }
+    const aws = this.awsCreds.status()
+    return { ...this.auth.snapshot(), aws, awsLoginUrl: aws.loginUrl }
   }
 
   /** Kick off one explicit login without holding the HTTP request open. The
@@ -2519,10 +2520,16 @@ export class Service {
   }
 
   authClearCache(): AuthState {
-    return this.auth.clearCache()
+    this.auth.clearCache()
+    return this.authState()
   }
 
   // ---- AWS credential (owned by AwsCreds, surfaced over /aws/credential) ----
+  awsLogin(): AuthState {
+    void this.awsCreds.login().catch(() => undefined)
+    return this.authState()
+  }
+
   /** Mint/serve the credential_process payload. Blocks through one silent
    *  refresh — or one shared browser sign-in — because the caller is an
    *  `aws` process that cannot proceed without it. */

@@ -117,6 +117,7 @@ export {
   AwsCreds,
   type AwsCredential,
   type AwsCredsOptions,
+  type AwsSignInStatus,
   type WarmResult,
 } from './awsCreds.js'
 

@@ -126,6 +126,7 @@ function fakeClient(over: Partial<DaemonClient> = {}): DaemonClient {
     setNamespace: async (ns) => ({ current: ns, known: ['uat', ns] }),
     auth: async () => ({ oidc: true, phase: 'ok', checkedAt: 1 }),
     authLogin: async () => ({ oidc: true, phase: 'logging_in', checkedAt: 2 }),
+    awsLogin: async () => ({ oidc: true, phase: 'ok', aws: { state: 'pending' }, checkedAt: 2 }),
     authClear: async () => ({ oidc: true, phase: 'login_required', checkedAt: 3 }),
     termList: async () => [
       {
@@ -239,6 +240,7 @@ describe('toolsForScope', () => {
       'devdock_set_startup',
       'devdock_set_namespace',
       'devdock_auth_login',
+      'devdock_aws_login',
       'devdock_auth_clear',
       'devdock_term_open',
       'devdock_term_run',
@@ -284,6 +286,19 @@ describe('renderList', () => {
 })
 
 describe('tool handlers', () => {
+  it('starts AWS login and returns its auth snapshot', async () => {
+    const snapshot = {
+      oidc: true,
+      phase: 'ok' as const,
+      aws: { state: 'required' as const, message: 'no AWS sign-in saved' },
+      checkedAt: 2,
+    }
+    const awsLogin = vi.fn(async () => snapshot)
+    const login = allTools(fakeClient({ awsLogin })).find((t) => t.name === 'devdock_aws_login')
+    expect(await login?.handler({})).toBe(JSON.stringify(snapshot))
+    expect(awsLogin).toHaveBeenCalledTimes(1)
+  })
+
   it('logs queries by source/cursor and renders the header + lines', async () => {
     const queryLogs = vi.fn(async () => ({
       source: 'application' as const,

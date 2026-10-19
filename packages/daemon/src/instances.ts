@@ -74,6 +74,7 @@ export function peerPathAllowed(path: string, terminals: boolean): boolean {
       '/health',
       '/auth',
       '/auth/login',
+      '/auth/aws/login',
       '/auth/clear',
       '/namespace',
       '/repos',
