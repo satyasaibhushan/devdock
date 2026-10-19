@@ -36,14 +36,19 @@ import { scopeRepo, startupPodTypes } from './workloads.js'
 export interface SandboxMemberInput {
   repo: string
   workload: string
-  source:
-    | { kind: 'pr'; repoSlug: string; number: number; url: string }
-    | { kind: 'branch'; ref: string }
-    | { kind: 'worktree'; path: string }
+  /** Absolute path to an agent worktree of the repo; omitted builds the registered checkout. */
+  path?: string
+}
+/** The PR open for a build's branch when it ran. Display only: nothing compares or acts on it. */
+export interface SandboxPr {
+  number: number
+  url: string
 }
 export interface SandboxMember extends SandboxMemberInput {
   mode: 'built' | 'dev'
-  headSha?: string
+  /** Checkout branch at the last build; absent when HEAD was detached. */
+  branch?: string
+  pr?: SandboxPr
   deployedSha?: string
   dirtyFiles?: string[]
   image?: string
@@ -53,7 +58,6 @@ export interface SandboxMember extends SandboxMemberInput {
     startedAt?: number
     error?: string
   }
-  merged?: boolean
 }
 export interface ActivityEntry {
   at: number
@@ -61,10 +65,19 @@ export interface ActivityEntry {
   action: string
   detail?: string
 }
+export interface SandboxSnapshotMember {
+  repo: string
+  workload: string
+  sha: string
+  dirtyFiles: string[]
+  image: string
+  branch?: string
+  pr?: SandboxPr
+}
 export interface SandboxSnapshot {
   at: number
   actor: string
-  members: { repo: string; workload: string; sha: string; dirtyFiles: string[]; image: string }[]
+  members: SandboxSnapshotMember[]
 }
 export interface Sandbox {
   key: string
@@ -93,7 +106,6 @@ export interface SandboxView extends Sandbox {
   /** Short PR-body block: ribbon, link, live URL, and what each member shows. */
   markdown: string
   expiresAt: number
-  allMerged: boolean
   personal?: boolean
   /** Namespace pool with the key holding each slot. */
   pool: { slot: string; key?: string }[]
@@ -104,7 +116,6 @@ export interface SandboxCreate {
   key: string
   title?: string
   members?: SandboxMemberInput[]
-  discover?: boolean
   wake?: boolean
   actor: string
 }
@@ -115,7 +126,6 @@ export interface SandboxUpdate {
 }
 export interface SandboxBuild {
   repo?: string
-  force?: boolean
   actor: string
 }
 export const snapshotTtl = (): number => {
@@ -131,9 +141,6 @@ export const sandboxTtl = (): number => {
 export function isExpired(sandbox: Sandbox, now: number, ttl: number): boolean {
   return sandbox.slot !== undefined && now - sandbox.lastUsedAt >= ttl
 }
-export function staleMembers(sandbox: Sandbox): SandboxMember[] {
-  return sandbox.members.filter((m) => !m.merged && (!m.deployedSha || m.deployedSha !== m.headSha))
-}
 /** A snapshot outlives expiry for this long, so a stable link can restore it. */
 export function snapshotRetained(sandbox: Sandbox, now: number): boolean {
   if (!sandbox.snapshot) return false
@@ -147,7 +154,7 @@ export function sandboxRibbon(sandbox: Sandbox, power: SandboxPower, now: number
   if (sandbox.members.some((m) => m.build.state === 'building')) return 'building'
   return power
 }
-/** PR-body block listing what each member shows against its source head when known. */
+/** PR-body block: the stable link, the live URL and the branch and commit each member shows. */
 export function sandboxMarkdown(
   sandbox: Sandbox,
   ribbon: SandboxRibbon,
@@ -155,14 +162,10 @@ export function sandboxMarkdown(
   urls: string[],
 ): string {
   const lines = (sandbox.snapshot?.members ?? []).map((m) => {
-    const member = sandbox.members.find((candidate) => identity(candidate) === identity(m))
+    const branch = m.branch ? `${m.branch} @ ` : ''
     const dirty = m.dirtyFiles.length ? ` (+${m.dirtyFiles.length} uncommitted files)` : ''
-    const source = member?.source
-    if (!member?.headSha || !source || source.kind === 'worktree')
-      return `${m.repo} ${m.workload} ${m.sha}${dirty}`
-    const name = source.kind === 'pr' ? `PR #${source.number}` : source.ref
-    const head = m.sha === member.headSha ? `= ${name} head` : `vs ${name} head ${member.headSha}`
-    return `${m.repo} ${m.workload} ${m.sha}${dirty} ${head}`
+    const pr = m.pr ? ` PR #${m.pr.number}` : ''
+    return `${m.repo} ${m.workload} ${branch}${m.sha}${dirty}${pr}`
   })
   return [
     `Sandbox ${sandbox.key}: ${ribbon}`,
@@ -178,8 +181,18 @@ export function requireActor(actor: string): void {
   if (typeof actor !== 'string' || !actor.trim()) throw new Error('actor required')
 }
 const identity = (m: { repo: string; workload: string }) => `${m.repo}:${m.workload}`
+/** Members saved before checkout-only builds carried a `source`. A worktree one keeps its path;
+ *  a PR or branch one has none and builds from the registered checkout. */
+function legacyPath(m: SandboxMember): string | undefined {
+  const source = (m as { source?: { kind?: unknown; path?: unknown } }).source
+  return source?.kind === 'worktree' && typeof source.path === 'string' ? source.path : undefined
+}
 const namespacePattern = /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/
-type Runner = (cmd: string, args: string[], opts?: { cwd?: string }) => Promise<RunResult>
+type Runner = (
+  cmd: string,
+  args: string[],
+  opts?: { cwd?: string; timeoutMs?: number },
+) => Promise<RunResult>
 interface Lease {
   metadata: { resourceVersion: string }
   data: { key: string; instanceId?: string; members: string; sandbox?: string; operation?: string }
@@ -248,30 +261,20 @@ export class Sandboxes {
   private members(inputs: SandboxMemberInput[], local = true): SandboxMember[] {
     const seen = new Set<string>()
     return inputs.map((m) => {
-      if (!m || typeof m.repo !== 'string' || typeof m.workload !== 'string' || !m.source)
+      if (!m || typeof m.repo !== 'string' || typeof m.workload !== 'string')
         throw new Error('Invalid sandbox member')
+      if (m.path !== undefined && (typeof m.path !== 'string' || !isAbsolute(m.path)))
+        throw new Error('Worktree path must be absolute')
       if (local) this.repo(m)
       if (seen.has(identity(m))) throw new Error('Duplicate sandbox member')
       seen.add(identity(m))
-      if (m.source.kind === 'pr') {
-        if (
-          !/^[\w.-]+\/[\w.-]+$/.test(m.source.repoSlug) ||
-          !Number.isSafeInteger(m.source.number) ||
-          m.source.number <= 0 ||
-          typeof m.source.url !== 'string'
-        )
-          throw new Error('Invalid PR source')
-      } else if (m.source.kind === 'worktree') {
-        if (typeof m.source.path !== 'string' || !isAbsolute(m.source.path))
-          throw new Error('Worktree path must be absolute')
-      } else if (
-        m.source.kind !== 'branch' ||
-        typeof m.source.ref !== 'string' ||
-        !m.source.ref.trim() ||
-        m.source.ref.startsWith('-')
-      )
-        throw new Error('Invalid branch source')
-      return { ...structuredClone(m), mode: 'built', build: { state: 'idle' } }
+      return {
+        repo: m.repo,
+        workload: m.workload,
+        ...(m.path === undefined ? {} : { path: m.path }),
+        mode: 'built',
+        build: { state: 'idle' },
+      }
     })
   }
   private async checked(cmd: string, args: string[], cwd?: string): Promise<string> {
@@ -477,9 +480,11 @@ export class Sandboxes {
       .filter((o) => o.repo.startsWith('sandbox:') && o.state === 'active'))
       this.deps.operations.update(op.id, { state: 'interrupted' }, 'Daemon restarted; not replayed')
     for (const s of this.deps.store.listSandboxes()) {
-      for (const m of s.members)
+      for (const m of s.members) {
+        m.path ??= legacyPath(m)
         if (m.build.state === 'building' || m.build.state === 'queued')
           m.build = { state: 'failed', error: 'Build interrupted; retry explicitly' }
+      }
       this.save(s)
     }
     const observed = new Map<string, Lease>()
@@ -496,7 +501,7 @@ export class Sandboxes {
       const now = Date.now()
       const saved = lease.data.sandbox ? (JSON.parse(lease.data.sandbox) as Sandbox) : undefined
       const members = JSON.parse(lease.data.members) as SandboxMember[]
-      // Validate sources and local repo/workload identities before exposing a recovered record.
+      // Validate paths and local repo/workload identities before exposing a recovered record.
       this.members(members, false)
       this.save({
         key: lease.data.key,
@@ -508,6 +513,7 @@ export class Sandboxes {
         state: 'active',
         members: members.map((m) => ({
           ...m,
+          path: m.path ?? legacyPath(m),
           mode: 'built',
           build:
             m.build?.state === 'building' || m.build?.state === 'queued'
@@ -546,7 +552,6 @@ export class Sandboxes {
           startupPodTypes(r).map((workload) => ({
             repo: r.id,
             workload,
-            source: { kind: 'branch' as const, ref: 'HEAD' },
             mode: 'dev' as const,
             build: { state: 'idle' as const },
           })),
@@ -641,29 +646,7 @@ export class Sandboxes {
       link,
       markdown: sandboxMarkdown(s, ribbon, link, urls),
       expiresAt: s.lastUsedAt + sandboxTtl(),
-      allMerged: s.members.length > 0 && s.members.every((m) => m.merged === true),
     }
-  }
-  async discover(key: string): Promise<SandboxMemberInput[]> {
-    if (!key.trim()) throw new Error('key required')
-    const out: SandboxMemberInput[] = []
-    for (const repo of this.deps.repos().filter((r) => !r.parentId)) {
-      const raw = await this.checked(
-        'gh',
-        ['pr', 'list', '--state', 'open', '--limit', '1000', '--json', 'number,url,headRefName'],
-        repo.root ?? repo.path,
-      )
-      const prs = JSON.parse(raw) as { number: number; url: string; headRefName: string }[]
-      for (const pr of prs.filter((p) => p.headRefName.toLowerCase().includes(key.toLowerCase()))) {
-        const slug = new URL(pr.url).pathname.split('/').slice(1, 3).join('/')
-        out.push({
-          repo: repo.id,
-          workload: repo.defaultWorkload ?? startupPodTypes(repo)[0] ?? 'api',
-          source: { kind: 'pr', repoSlug: slug, number: pr.number, url: pr.url },
-        })
-      }
-    }
-    return out
   }
   async create(input: SandboxCreate): Promise<{ operationId: string }> {
     requireActor(input.actor)
@@ -671,10 +654,7 @@ export class Sandboxes {
       throw new Error('Invalid sandbox key')
     if (this.deps.store.getSandbox(input.key) || input.key === (await this.deps.namespace()))
       throw new Error('Sandbox already exists')
-    const members = this.members([
-      ...(input.members ?? []),
-      ...(input.discover ? await this.discover(input.key) : []),
-    ])
+    const members = this.members(input.members ?? [])
     if (!members.length) throw new Error('Sandbox members required')
     const now = Date.now()
     const s: Sandbox = {
@@ -688,7 +668,7 @@ export class Sandboxes {
     }
     return this.operation(s, 'create', input.actor, async () => {
       await this.lease(s)
-      await this.buildMembers(s, { actor: input.actor, force: true })
+      await this.buildMembers(s, { actor: input.actor })
       if (input.wake) await this.power(s, 1)
     })
   }
@@ -703,32 +683,8 @@ export class Sandboxes {
     return this.operation(s, s.slot ? action : 'rebuild', input.actor, async () => {
       const rebuild = !s.slot
       if (rebuild) await this.lease(s)
-      await this.buildMembers(s, {
-        ...input,
-        repo: rebuild ? undefined : input.repo,
-        force: rebuild || input.force,
-      })
+      await this.buildMembers(s, { ...input, repo: rebuild ? undefined : input.repo })
     })
-  }
-  async recordHead(
-    key: string,
-    member: { repo: string; workload: string },
-    sha: string,
-    actor: string,
-    merged?: boolean,
-    options: { touch?: boolean } = {},
-  ): Promise<void> {
-    requireActor(actor)
-    if (!/^[a-f0-9]{7,64}$/i.test(sha)) throw new Error('Invalid head SHA')
-    const s = this.get(key)
-    const m = s.members.find((m) => identity(m) === identity(member))
-    if (!m) throw new Error('unknown sandbox member')
-    m.headSha = sha
-    if (merged !== undefined) m.merged = merged
-    if (m.deployedSha !== sha && !m.merged && m.build.state !== 'building')
-      m.build = { state: 'queued' }
-    this.touch(s, actor, 'head', `${identity(m)} ${sha}`, options.touch ?? true)
-    if (s.slot) await this.mirror(s)
   }
   async recordExec(key: string, actor: string): Promise<void> {
     requireActor(actor)
@@ -736,9 +692,9 @@ export class Sandboxes {
     this.touch(s, actor, 'exec')
     if (s.slot) await this.mirror(s)
   }
-  /** Rebuild from the sources' current files (worktree members pick up new edits) and record. */
+  /** Rebuild from the checkouts' current files, uncommitted edits included, and record. */
   snapshot(key: string, input: SandboxBuild): { operationId: string } {
-    return this.build(key, { ...input, force: true }, 'snapshot')
+    return this.build(key, input, 'snapshot')
   }
   /** Least-recently-used sandbox that is active, idle, unlocked and fully scaled to zero. */
   private async evictionCandidate(): Promise<Sandbox | undefined> {
@@ -841,6 +797,8 @@ export class Sandboxes {
       if (deployed.code !== 0) throw new Error(deployed.stderr || 'Sandbox restore failed')
       m.deployedSha = saved.sha
       m.dirtyFiles = [...saved.dirtyFiles]
+      m.branch = saved.branch
+      m.pr = saved.pr
       m.image = saved.image
       m.build = { state: 'idle' }
     }
@@ -927,7 +885,7 @@ export class Sandboxes {
   private checkout(s: Sandbox, m: SandboxMemberInput): { root: string; path: string; repo: Repo } {
     const repo = this.repo(m)
     const root = repo.root ?? repo.path
-    // Separate worktrees isolate two workloads of the same repo at different source heads.
+    // Separate worktrees isolate two workloads of the same repo built from different checkouts.
     const suffix = createHash('sha256').update(`${m.repo}:${m.workload}`).digest('hex').slice(0, 12)
     const path = replicaCheckoutPath(root, `sb-${s.slot}-${suffix}`)
     return { root, path, repo }
@@ -978,23 +936,40 @@ echo "SANDBOX_ARCH=$architecture"`,
       },
     }
   }
-  private async head(m: SandboxMember, root: string): Promise<string> {
-    if (m.source.kind === 'worktree') {
-      const original = this.repo(m)
-      if (!existsSync(resolve(m.source.path, relative(root, original.configPath))))
-        throw new Error(`Worktree ${m.source.path} has no ${relative(root, original.configPath)}`)
-      const sha = (await this.checked('git', ['rev-parse', 'HEAD'], m.source.path)).trim()
-      if (!/^[a-f0-9]{40,64}$/i.test(sha)) throw new Error('Cannot resolve worktree HEAD')
-      return sha
+  /** The checkout a member builds from: its agent worktree, else the registered repo checkout. */
+  private source(m: SandboxMember, root: string): string {
+    if (m.path === undefined) return root
+    const config = relative(root, this.repo(m).configPath)
+    if (!existsSync(resolve(m.path, config))) throw new Error(`Worktree ${m.path} has no ${config}`)
+    return m.path
+  }
+  private async sha(cwd: string): Promise<string> {
+    const sha = (await this.checked('git', ['rev-parse', 'HEAD'], cwd)).trim()
+    if (!/^[a-f0-9]{40,64}$/i.test(sha)) throw new Error(`Cannot resolve HEAD in ${cwd}`)
+    return sha
+  }
+  /** Display only, so a detached HEAD or a git hiccup leaves the branch out instead of failing. */
+  private async branch(cwd: string): Promise<string | undefined> {
+    const result = await this.deps.runner('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd })
+    const branch = result.stdout.trim()
+    return result.code === 0 && branch && branch !== 'HEAD' ? branch : undefined
+  }
+  /** The PR for the checkout's branch, if gh finds one. gh may be missing, signed out, slow or
+   *  find nothing; all of that means no PR, never a failed or stalled build. */
+  private async pr(cwd: string): Promise<SandboxPr | undefined> {
+    try {
+      const result = await this.deps.runner('gh', ['pr', 'view', '--json', 'number,url'], {
+        cwd,
+        timeoutMs: 15_000,
+      })
+      if (result.code !== 0) return undefined
+      const pr = JSON.parse(result.stdout) as { number?: unknown; url?: unknown }
+      if (typeof pr.number !== 'number' || !Number.isSafeInteger(pr.number) || pr.number <= 0)
+        return undefined
+      return typeof pr.url === 'string' ? { number: pr.number, url: pr.url } : undefined
+    } catch {
+      return undefined
     }
-    const remote = m.source.kind === 'pr' ? `https://github.com/${m.source.repoSlug}.git` : 'origin'
-    const ref = m.source.kind === 'pr' ? `pull/${m.source.number}/head` : m.source.ref
-    return this.gitTask(root, async () => {
-      await this.checked('git', ['fetch', '--', remote, ref], root)
-      const sha = (await this.checked('git', ['rev-parse', 'FETCH_HEAD'], root)).trim()
-      if (!/^[a-f0-9]{40,64}$/i.test(sha)) throw new Error('Cannot resolve sandbox head')
-      return sha
-    })
   }
   private async gitTask<T>(root: string, work: () => Promise<T>): Promise<T> {
     const previous = this.gitTasks.get(root) ?? Promise.resolve()
@@ -1028,97 +1003,71 @@ echo "SANDBOX_ARCH=$architecture"`,
       s.members.filter((m) => !input.repo || m.repo === input.repo),
       async (m) => {
         try {
-          if (m.merged) return
           await this.deps.authorize(m.repo)
           const deployment = cluster.items.find((d) => d.metadata.name === this.repo(m).name)
           const awake = (deployment?.spec?.replicas ?? 0) > 0
-          let previous = deployment?.spec?.template?.spec?.containers?.[0]?.image
+          const previous = deployment?.spec?.template?.spec?.containers?.[0]?.image
           const { root, path } = this.checkout(s, m)
-          const observedHead = m.headSha
-          const fetched = await this.head(m, root)
-          if (m.headSha === observedHead) m.headSha = fetched
-          if (!input.force && m.headSha === m.deployedSha) return
-          do {
-            if (m.merged) break
-            const sha = m.headSha as string
-            const lease = await this.owned(s)
-            const remoteMembers = JSON.parse(lease.data.members) as SandboxMember[]
-            if (
-              remoteMembers.some(
-                (r) =>
-                  identity(r) === identity(m) &&
-                  r.build.state === 'building' &&
-                  r.build.instanceId !== this.deps.instanceId,
-              )
+          const source = this.source(m, root)
+          const lease = await this.owned(s)
+          const remoteMembers = JSON.parse(lease.data.members) as SandboxMember[]
+          if (
+            remoteMembers.some(
+              (r) =>
+                identity(r) === identity(m) &&
+                r.build.state === 'building' &&
+                r.build.instanceId !== this.deps.instanceId,
             )
-              throw new Error('Member is building on another instance')
-            m.build = { state: 'building', instanceId: this.deps.instanceId, startedAt: Date.now() }
-            this.save(s)
+          )
+            throw new Error('Member is building on another instance')
+          m.build = { state: 'building', instanceId: this.deps.instanceId, startedAt: Date.now() }
+          this.save(s)
+          await this.mirror(s)
+          // Every build bakes the checkout's current files, uncommitted edits included, from a
+          // devdock-owned copy: generated configs never land in the agent's or the user's tree.
+          const buildPath = mkdtempSync(`${path}-build-`)
+          try {
+            const sha = await this.sha(source)
+            const dirtyFiles = await this.copyWorktree(source, buildPath)
+            const branch = await this.branch(source)
+            const pr = branch ? await this.pr(source) : undefined
+            const repo = this.config(s, m, buildPath)
+            const sync = await this.deps.supervisor.sandbox(repo, 'sync')
+            if (sync.code !== 0) throw new Error(sync.stderr || 'Sandbox env sync failed')
+            const image = await this.prepareImage(repo, m)
+            await this.imageBuilds.deploy(
+              image,
+              async () =>
+                (await this.queryImage(
+                  repo,
+                  image.slice(0, image.lastIndexOf(':')),
+                  image.slice(image.lastIndexOf(':') + 1),
+                )) !== undefined,
+              async (skip) => {
+                await this.owned(s)
+                const deployed = await this.deps.supervisor.sandbox(repo, 'deploy', awake, skip)
+                if (deployed.code !== 0) throw new Error(deployed.stderr || 'Sandbox deploy failed')
+              },
+            )
+            m.image = image
+            m.dirtyFiles = dirtyFiles
+            m.deployedSha = sha
+            m.branch = branch
+            m.pr = pr
+            m.build = { state: 'idle' }
+            if (sandboxRestart(awake, previous, image))
+              await this.checked('kubectl', [
+                'rollout',
+                'restart',
+                `deployment/${this.repo(m).name}`,
+                '-n',
+                s.slot as string,
+              ])
+            this.touch(s, input.actor, 'built', `${identity(m)} ${sha}`)
             await this.mirror(s)
-            // A worktree member bakes the agent's current files, uncommitted edits included,
-            // from a devdock-owned copy: generated configs never land in the agent's checkout.
-            let buildPath = path
-            let dirtyFiles: string[] = []
-            if (m.source.kind === 'worktree') {
-              buildPath = mkdtempSync(`${path}-build-`)
-              try {
-                dirtyFiles = await this.copyWorktree(m.source.path, buildPath)
-              } catch (err) {
-                rmSync(buildPath, { recursive: true, force: true })
-                throw err
-              }
-            } else
-              await this.gitTask(root, async () => {
-                if (existsSync(path))
-                  await this.checked('git', ['worktree', 'remove', '--force', path], root)
-                await this.checked('git', ['worktree', 'add', '--detach', path, sha], root)
-              })
-            try {
-              const repo = this.config(s, m, buildPath)
-              const sync = await this.deps.supervisor.sandbox(repo, 'sync')
-              if (sync.code !== 0) throw new Error(sync.stderr || 'Sandbox env sync failed')
-              const image = await this.prepareImage(repo, m)
-              await this.imageBuilds.deploy(
-                image,
-                async () =>
-                  (await this.queryImage(
-                    repo,
-                    image.slice(0, image.lastIndexOf(':')),
-                    image.slice(image.lastIndexOf(':') + 1),
-                  )) !== undefined,
-                async (skip) => {
-                  await this.owned(s)
-                  const deployed = await this.deps.supervisor.sandbox(repo, 'deploy', awake, skip)
-                  if (deployed.code !== 0)
-                    throw new Error(deployed.stderr || 'Sandbox deploy failed')
-                },
-              )
-              m.image = image
-              m.dirtyFiles = dirtyFiles
-              m.deployedSha = sha
-              m.build = { state: 'idle' }
-              if (sandboxRestart(awake, previous, image))
-                await this.checked('kubectl', [
-                  'rollout',
-                  'restart',
-                  `deployment/${this.repo(m).name}`,
-                  '-n',
-                  s.slot as string,
-                ])
-              previous = image
-              const current = await this.owned(s)
-              const observed = (JSON.parse(current.data.members) as SandboxMember[]).find(
-                (r) => identity(r) === identity(m),
-              )
-              if (observed?.headSha && observed.headSha !== sha && m.headSha === sha)
-                m.headSha = observed.headSha
-              if (observed?.merged) m.merged = true
-              this.touch(s, input.actor, 'built', `${identity(m)} ${sha}`)
-              await this.mirror(s)
-            } finally {
-              if (buildPath !== path) rmSync(buildPath, { recursive: true, force: true })
-            }
-          } while (m.headSha !== m.deployedSha)
+          } finally {
+            rmSync(buildPath, { recursive: true, force: true })
+          }
         } catch (error) {
           m.build = {
             state: 'failed',
@@ -1145,6 +1094,8 @@ echo "SANDBOX_ARCH=$architecture"`,
           sha: m.deployedSha as string,
           dirtyFiles: m.dirtyFiles ?? [],
           image: m.image as string,
+          branch: m.branch,
+          pr: m.pr,
         })),
       }
       s.expiredAt = undefined
@@ -1169,7 +1120,7 @@ echo "SANDBOX_ARCH=$architecture"`,
       const stat = lstatSync(from)
       // ls-files lists a submodule as its directory; its files would be missing from the image.
       if (stat.isDirectory())
-        throw new Error(`Submodules are not supported in worktree members: ${file}`)
+        throw new Error(`Submodules are not supported in sandbox builds: ${file}`)
       if (!stat.isFile() && !stat.isSymbolicLink())
         throw new Error(`Unsupported worktree entry: ${file}`)
       mkdirSync(dirname(target), { recursive: true })

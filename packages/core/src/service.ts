@@ -363,11 +363,9 @@ export class Service {
     this.sandboxController = new SandboxController({
       sandboxes: this.sandboxes,
       operations: this.operations,
-      runner: this.runner,
       kubectl: this.kubectl,
       instanceId: opts.instanceId ?? randomUUID(),
       namespace: () => this.contextNamespace(),
-      repos: () => [...this.repos.values()],
     })
   }
 
@@ -398,9 +396,6 @@ export class Service {
   sandboxStatus(key: string) {
     return this.sandboxes.status(key)
   }
-  discoverSandbox(key: string) {
-    return this.sandboxes.discover(key)
-  }
   createSandbox(input: SandboxCreate) {
     return this.sandboxes.create(input)
   }
@@ -424,15 +419,6 @@ export class Service {
   }
   deleteSandbox(key: string, actor: string) {
     return this.sandboxes.delete(key, actor)
-  }
-  recordHead(
-    key: string,
-    member: { repo: string; workload: string },
-    sha: string,
-    actor: string,
-    merged?: boolean,
-  ) {
-    return this.sandboxes.recordHead(key, member, sha, actor, merged)
   }
 
   async checkout(id: string, workload?: string) {
