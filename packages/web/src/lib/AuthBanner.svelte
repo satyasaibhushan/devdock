@@ -1,9 +1,9 @@
 <script lang="ts">
-  // Kubernetes auth indicator (header) — visible only when something needs the
-  // user: login required (one explicit shared sign-in for all workloads),
-  // sign-in in progress, or an auth error. Silent when ok or when the cluster
-  // doesn't use oidc-login at all. Required or pending AWS sign-in has its own pill
-  // (the daemon never opens a browser, so this link is the only way in).
+  // Sign-in indicator (header): one chip and one Sign in button for everything
+  // the user must do, Kubernetes and AWS alike. Silent when both are fine. The
+  // daemon never opens a browser, so the chip's link is the only way in; when
+  // both flows are pending it offers one at a time, and the IdP session makes
+  // the second one instant.
   import { type AuthState, clearAuthCache, startAuthLogin, startAwsLogin } from './api.js'
   import Icon from './Icon.svelte'
 
@@ -19,14 +19,32 @@
   } = $props()
 
   let busy = $state(false)
-  let awsBusy = $state(false)
 
-  const visible = $derived(auth.oidc && auth.phase !== 'ok' && auth.phase !== 'unknown')
+  const kube = $derived(auth.oidc && auth.phase !== 'ok' && auth.phase !== 'unknown')
+  const awsLoginUrl = $derived(auth.aws?.loginUrl ?? auth.awsLoginUrl)
+  const aws = $derived(auth.aws?.state === 'required' || awsLoginUrl !== undefined)
+  const loginUrl = $derived(auth.loginUrl ?? awsLoginUrl)
+  const pending = $derived(auth.phase === 'logging_in' || awsLoginUrl !== undefined)
+  const message = $derived(
+    kube && aws
+      ? 'Kubernetes and AWS sign-in required'
+      : aws
+        ? 'AWS sign-in required'
+        : (auth.message ??
+          (auth.phase === 'error' ? 'kubernetes auth error' : 'kubernetes login required')),
+  )
+  const detail = $derived(
+    [kube ? auth.message : undefined, aws ? auth.aws?.message : undefined]
+      .filter((m) => m !== undefined)
+      .join('\n'),
+  )
 
-  async function login() {
+  async function signIn() {
     busy = true
     try {
-      onchanged(await startAuthLogin(instance))
+      // AWS first so the Kubernetes snapshot, the more detailed one, lands last.
+      if (aws) onchanged(await startAwsLogin(instance))
+      if (kube) onchanged(await startAuthLogin(instance))
     } catch {
       // next poll shows the real state
     } finally {
@@ -44,59 +62,34 @@
       busy = false
     }
   }
-
-  async function awsLogin() {
-    awsBusy = true
-    try {
-      onchanged(await startAwsLogin(instance))
-    } catch {
-      // next poll shows the real state
-    } finally {
-      awsBusy = false
-    }
-  }
 </script>
 
-{#if auth.aws?.state === 'required'}
-  <div class="auth login_required" title={auth.aws.message} role="status">
-    <Icon name="alert" size={13} />
-    <span class="msg">AWS sign-in required</span>
-    <button class="btn sm primary" onclick={awsLogin} disabled={awsBusy}>Sign in</button>
-  </div>
-{:else if auth.aws?.state === 'pending' || auth.awsLoginUrl}
-  <div class="auth login_required" title={auth.aws?.message ?? 'AWS sign-in pending'} role="status">
-    <Icon name="alert" size={13} />
-    <span class="msg">AWS sign-in required</span>
-    <a class="btn sm" href={auth.aws?.loginUrl ?? auth.awsLoginUrl} target="_blank" rel="noreferrer">Open sign-in<Icon name="external" size={11} /></a>
-  </div>
-{/if}
-{#if visible}
+{#if kube || aws}
   <div
-    class="auth {auth.phase}"
-    title={auth.message ?? 'kubernetes auth'}
+    class="auth {pending ? 'logging_in' : kube ? auth.phase : 'login_required'}"
+    title={detail || message}
     role="status"
   >
-    {#if auth.phase === 'logging_in'}
+    {#if pending}
       <span class="spin" aria-hidden="true"></span>
-      <span class="msg">{auth.message ?? 'preparing sign-in…'}</span>
-      {#if auth.loginUrl}
-        <a class="btn sm" href={auth.loginUrl} target="_blank" rel="noreferrer">Open sign-in<Icon name="external" size={11} /></a>
+      <span class="msg">{auth.phase === 'logging_in' ? (auth.message ?? 'preparing sign-in…') : message}</span>
+      {#if loginUrl}
+        <a class="btn sm" href={loginUrl} target="_blank" rel="noreferrer">Open sign-in<Icon name="external" size={11} /></a>
       {/if}
     {:else}
       <Icon name="alert" size={13} />
-      <span class="msg">
-        {auth.message ??
-          (auth.phase === 'error' ? 'kubernetes auth error' : 'kubernetes login required')}
-      </span>
-      <button class="btn sm primary" onclick={login} disabled={busy}>Log in</button>
-      <button
-        class="btn sm quiet"
-        onclick={clearCache}
-        disabled={busy}
-        title="rm -r ~/.kube/cache/oidc-login — force a clean login"
-      >
-        Clear cache
-      </button>
+      <span class="msg">{message}</span>
+      <button class="btn sm primary" onclick={signIn} disabled={busy}>Sign in</button>
+      {#if kube}
+        <button
+          class="btn sm quiet"
+          onclick={clearCache}
+          disabled={busy}
+          title="rm -r ~/.kube/cache/oidc-login — force a clean login"
+        >
+          Clear cache
+        </button>
+      {/if}
     {/if}
   </div>
 {/if}
