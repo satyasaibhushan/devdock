@@ -958,6 +958,8 @@ export class Sandboxes {
         await this.available(s, s.slot)
         await this.applyRouting(s)
         await this.mirror(s)
+        // A member added to a leased slot has no release yet; build it so the add is usable.
+        if (added.length > 0) await this.buildMembers(s, { actor: input.actor }, added)
       }
     })
   }
@@ -1096,7 +1098,11 @@ echo "SANDBOX_ARCH=$architecture"`,
     }
   }
 
-  private async buildMembers(s: Sandbox, input: SandboxBuild): Promise<void> {
+  private async buildMembers(
+    s: Sandbox,
+    input: SandboxBuild,
+    targets?: SandboxMember[],
+  ): Promise<void> {
     await this.owned(s)
     await this.available(s, s.slot as string)
     const { power } = await this.cluster(s)
@@ -1117,7 +1123,7 @@ echo "SANDBOX_ARCH=$architecture"`,
     }
     if (power === 'unknown') throw new Error('Cannot determine sandbox power')
     await parallelMembers(
-      s.members.filter((m) => !input.repo || m.repo === input.repo),
+      targets ?? s.members.filter((m) => !input.repo || m.repo === input.repo),
       async (m) => {
         try {
           await this.deps.authorize(m.repo)

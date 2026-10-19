@@ -482,6 +482,21 @@ it('resets a removed release, drops its worktree and retains the other members',
   expect(f.store.getSandbox('SULF-1')?.members.map((m) => m.workload)).toEqual(['api'])
 })
 
+it('builds only the member added to a leased sandbox', async () => {
+  const f = fixture()
+  await f.done(await f.core.create({ key: 'SULF-1', members: [input], actor: 'you' }))
+  f.sandbox.mockClear()
+  const op = await f.done(
+    f.core.update('SULF-1', { actor: 'you', add: [{ repo: 'app', workload: 'worker' }] }),
+  )
+  expect(op.state).toBe('succeeded')
+  const deployed = f.sandbox.mock.calls.filter((c) => c[1] === 'deploy')
+  expect(deployed).toHaveLength(1)
+  const worker = f.store.getSandbox('SULF-1')?.members.find((m) => m.workload === 'worker')
+  expect(worker?.image).toBeDefined()
+  expect(worker?.build.state).toBe('idle')
+})
+
 it('rebuilds from the moved checkout and lets Helm roll changed images', async () => {
   const f = fixture()
   await f.done(
