@@ -188,11 +188,12 @@ if [ "$(printf '%s\\n' "$profiles" | grep -c "\${AWS_DEVSPACE_PROFILE_NAME}")" -
   profileArg=" --profile \${AWS_DEVSPACE_PROFILE_NAME}"
 fi
 code=0
-result=$(aws ecr describe-images --region "\${AWS_REGION}" $profileArg --registry-id "\${SANDBOX_REGISTRY}" --repository-name "\${SANDBOX_REPOSITORY}" --image-ids "imageTag=\${SANDBOX_TAG}" --query 'imageDetails[0].imageDigest' --output text --no-cli-pager 2>&1) || code=$?
-if [ "$code" -eq 0 ]; then
-  echo "SANDBOX_IMAGE=$result"
-elif printf '%s' "$result" | grep -q '(ImageNotFoundException)'; then
+# The dev role can BatchGetImage but not DescribeImages; a missing tag is a per-image failure, not an error exit.
+result=$(aws ecr batch-get-image --region "\${AWS_REGION}" $profileArg --registry-id "\${SANDBOX_REGISTRY}" --repository-name "\${SANDBOX_REPOSITORY}" --image-ids "imageTag=\${SANDBOX_TAG}" --accepted-media-types application/vnd.docker.distribution.manifest.v2+json application/vnd.docker.distribution.manifest.list.v2+json application/vnd.oci.image.manifest.v1+json application/vnd.oci.image.index.v1+json --query 'images[0].imageId.imageDigest || failures[0].failureCode' --output text --no-cli-pager 2>&1) || code=$?
+if [ "$code" -eq 0 ] && [ "$result" = ImageNotFound ]; then
   echo SANDBOX_IMAGE=missing
+elif [ "$code" -eq 0 ]; then
+  echo "SANDBOX_IMAGE=$result"
 else
   echo "Sandbox ECR lookup failed for \${SANDBOX_REPOSITORY}:\${SANDBOX_TAG}" >&2
   exit "$code"
