@@ -7,6 +7,7 @@ import {
   readFileSync,
   readlinkSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -33,7 +34,17 @@ if [[ " $* " == *" deploy "* ]]; then
   printf 'export {}\\n' > "$target/dist/routes.js"
   printf 'export {}\\n' > "$target/dist/mcp.js"
   printf 'export {}\\n' > "$target/dist/server.js"
-  printf 'export {}\\n' > "$target/node_modules/@devdock/core/dist/index.js"
+  if [[ -n "${'$'}{DEVDOCK_TEST_ISOLATION:-}" ]]; then
+    mkdir -p "$DEVDOCK_REPO_ROOT/packages/core/dist"
+    printf 'export {}\\n' > "$DEVDOCK_REPO_ROOT/packages/core/dist/index.js"
+    ln "$DEVDOCK_REPO_ROOT/packages/core/dist/index.js" "$target/node_modules/@devdock/core/dist/index.js"
+    ln -s core "$target/node_modules/@devdock/internal"
+  else
+    printf 'export {}\\n' > "$target/node_modules/@devdock/core/dist/index.js"
+  fi
+  if [[ -n "${'$'}{DEVDOCK_TEST_LINK:-}" ]]; then
+    ln -s "$DEVDOCK_TEST_LINK" "$target/escape"
+  fi
   printf '{}\\n' > "$target/node_modules/@modelcontextprotocol/server/package.json"
 fi
 `
@@ -107,6 +118,8 @@ esac
         DEVDOCK_INSTALL_ROOT: installRoot,
         DEVDOCK_PLIST_DEST: plist,
         DEVDOCK_TEST_LOG: log,
+        DEVDOCK_NODE_BIN: process.execPath,
+        DEVDOCK_TEST_ISOLATION: '1',
       },
       stdio: 'pipe',
     })
@@ -130,6 +143,25 @@ esac
       ),
     ).toBe(true)
 
+    const sourceCore = join(repo, 'packages', 'core', 'dist', 'index.js')
+    const stagedCore = join(
+      release,
+      'packages',
+      'daemon',
+      'node_modules',
+      '@devdock',
+      'core',
+      'dist',
+      'index.js',
+    )
+    expect(statSync(stagedCore).ino).not.toBe(statSync(sourceCore).ino)
+    expect(statSync(stagedCore).nlink).toBe(1)
+    writeFileSync(sourceCore, 'export const changed = true\n')
+    expect(readFileSync(stagedCore, 'utf8')).toBe('export {}\n')
+    expect(
+      readlinkSync(join(release, 'packages', 'daemon', 'node_modules', '@devdock', 'internal')),
+    ).toBe('core')
+
     rmSync(join(repo, 'node_modules'), { recursive: true, force: true })
     rmSync(join(repo, 'packages', 'core', 'dist'), { recursive: true, force: true })
     rmSync(join(repo, 'packages', 'daemon', 'dist'), { recursive: true, force: true })
@@ -141,6 +173,41 @@ esac
     expect(calls).toContain('pnpm --filter @devdock/daemon deploy --prod --legacy')
     expect(calls).toContain('pnpm --filter @devdock/mcp deploy --prod --legacy')
     expect(calls).toContain('launchctl bootstrap')
+  })
+
+  it.each(['external', 'broken'])('rejects a %s symlink before touching launchd', (kind) => {
+    const root = mkdtempSync(join(tmpdir(), 'devdock-install-link-'))
+    dirs.push(root)
+    const repo = join(root, 'repo')
+    const log = join(root, 'commands.log')
+    const pnpm = join(root, 'pnpm')
+    const launchctl = join(root, 'launchctl')
+    mkdirSync(join(repo, 'packages', 'web'), { recursive: true })
+    executable(pnpm, FAKE_PNPM)
+    executable(
+      launchctl,
+      `#!/usr/bin/env bash\nprintf 'launchctl touched\\n' >> "$DEVDOCK_TEST_LOG"\nexit 1\n`,
+    )
+    expect(() =>
+      execFileSync('/bin/bash', [installScript], {
+        env: {
+          ...process.env,
+          HOME: join(root, 'home'),
+          DEVDOCK_REPO_ROOT: repo,
+          DEVDOCK_INSTALL_ROOT: join(root, 'install'),
+          DEVDOCK_PLIST_DEST: join(root, 'agent.plist'),
+          DEVDOCK_MCP_LINK: join(root, 'devdock-mcp'),
+          DEVDOCK_NODE_BIN: process.execPath,
+          DEVDOCK_PNPM_BIN: pnpm,
+          DEVDOCK_LAUNCHCTL_BIN: launchctl,
+          DEVDOCK_TEST_LOG: log,
+          DEVDOCK_TEST_LINK: kind === 'external' ? repo : join(root, 'missing'),
+        },
+        stdio: 'pipe',
+      }),
+    ).toThrow(/portable release symlink/)
+    expect(readFileSync(log, 'utf8')).not.toContain('launchctl touched')
+    expect(existsSync(join(root, 'agent.plist'))).toBe(false)
   })
 })
 
