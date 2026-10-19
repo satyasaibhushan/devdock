@@ -89,6 +89,7 @@ function fixture(instanceId = 'machine1') {
     if (cmd === 'git' && args[0] === 'worktree' && args[1] === 'add') {
       const path = args[3] as string
       mkdirSync(path, { recursive: true })
+      writeFileSync(join(path, 'Dockerfile'), 'FROM scratch\nCOPY . .\n')
       writeFileSync(join(path, 'devspace.yaml'), readFileSync(join(repoPath, 'devspace.yaml')))
     }
     if (cmd === 'git' && args[0] === 'worktree' && args[1] === 'remove')
@@ -100,9 +101,17 @@ function fixture(instanceId = 'machine1') {
     return { code: 0, stdout, stderr: '' }
   })
   const supervisor = new Supervisor(runner)
-  const sandbox = vi
-    .spyOn(supervisor, 'sandbox')
-    .mockResolvedValue({ code: 0, stdout: '', stderr: '' })
+  const sandboxResult = async (_repo: unknown, action: string) => ({
+    code: 0,
+    stdout:
+      action === 'print'
+        ? 'images:\n  app:\n    image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/devspace\n    context: .\n    dockerfile: Dockerfile\n'
+        : action === 'image'
+          ? 'SANDBOX_IMAGE=missing\n'
+          : '',
+    stderr: '',
+  })
+  const sandbox = vi.spyOn(supervisor, 'sandbox').mockImplementation(sandboxResult)
   const available = vi.fn(async () => {})
   const emit = vi.fn()
   const core = new Sandboxes({
@@ -142,6 +151,7 @@ function fixture(instanceId = 'machine1') {
     deployments,
     runner,
     sandbox,
+    sandboxResult,
     available,
     emit,
     done,
@@ -191,6 +201,7 @@ describe('sandbox lifecycle', () => {
       expect.objectContaining({ namespace: 'slot1' }),
       'deploy',
       false,
+      false,
     )
   })
   it('resets in a fresh worktree when the build worktree lives on another machine', async () => {
@@ -230,7 +241,7 @@ describe('sandbox lifecycle', () => {
     expect(f.leases.size).toBe(0)
     f.sandbox.mockClear()
     await f.done(f.core.build('SULF-1', { actor: 'you' }))
-    expect(f.sandbox).toHaveBeenCalledWith(expect.anything(), 'deploy', false)
+    expect(f.sandbox).toHaveBeenCalledWith(expect.anything(), 'deploy', false, false)
     await f.done(f.core.delete('SULF-1', 'you'))
     expect(f.store.getSandbox('SULF-1')).toBeUndefined()
   })
@@ -240,7 +251,7 @@ describe('sandbox lifecycle', () => {
     f.sandbox.mockImplementation(async (_repo, action) => {
       if (action === 'deploy' && changes++ === 0)
         await f.core.recordHead('SULF-1', input, sha2, 'poller')
-      return { code: 0, stdout: '', stderr: '' }
+      return f.sandboxResult(_repo, action)
     })
     await f.done(await f.core.create({ key: 'SULF-1', members: [input], actor: 'you' }))
     expect(f.sandbox.mock.calls.filter((c) => c[1] === 'deploy')).toHaveLength(2)
@@ -413,7 +424,7 @@ it('resets a removed release, drops its worktree and retains the other members',
   expect(f.store.getSandbox('SULF-1')?.members.map((m) => m.workload)).toEqual(['api'])
 })
 
-it('refreshes branch heads and restarts only members that were awake', async () => {
+it('refreshes branch heads and lets Helm roll changed images', async () => {
   const f = fixture()
   await f.done(
     await f.core.create({
@@ -431,16 +442,18 @@ it('refreshes branch heads and restarts only members that were awake', async () 
     expect.objectContaining({ name: 'app-api' }),
     'deploy',
     true,
+    false,
   )
   expect(f.sandbox).toHaveBeenCalledWith(
     expect.objectContaining({ name: 'app-worker' }),
     'deploy',
     false,
+    false,
   )
   const restarts = f.runner.mock.calls.filter(
     ([cmd, args]) => cmd === 'kubectl' && args[0] === 'rollout',
   )
-  expect(restarts.map((c) => c[1][2])).toEqual(['deployment/app-api'])
+  expect(restarts).toHaveLength(0)
   expect(f.store.getSandbox('SULF-1')?.members.every((m) => m.deployedSha === sha2)).toBe(true)
 })
 
@@ -507,4 +520,61 @@ it('targets sandbox deployments for logs and exec and requires an exec actor', a
   expect(
     new StateStore(join(root, 'state-machine1.json')).getSandbox('SULF-1')?.activity.at(-1),
   ).toMatchObject({ actor: 'you', action: 'exec' })
+})
+
+it('finishes other members and mirrors every failure without configmap conflicts', async () => {
+  const f = fixture()
+  const started: string[] = []
+  let release = () => {}
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  f.sandbox.mockImplementation(async (repo, action) => {
+    if (action !== 'deploy') return f.sandboxResult(repo, action)
+    started.push(repo.name)
+    if (repo.name === 'app-api') {
+      await gate
+      return { code: 1, stdout: '', stderr: 'api build failed' }
+    }
+    release()
+    return { code: 0, stdout: '', stderr: '' }
+  })
+  const result = await f.done(
+    await f.core.create({
+      key: 'parallel',
+      actor: 'you',
+      members: [input, { ...input, workload: 'worker' }],
+    }),
+  )
+  expect(started.sort()).toEqual(['app-api', 'app-worker'])
+  expect(result.state).toBe('failed')
+  expect(result.logs.at(-1)?.message).toContain('api build failed')
+  expect(f.store.getSandbox('parallel')?.members.map((m) => m.build.state)).toEqual([
+    'failed',
+    'idle',
+  ])
+  const mirrored = JSON.parse(f.leases.get('slot1')?.data.members ?? '[]') as {
+    build: { state: string }
+  }[]
+  expect(mirrored.map((m) => m.build.state)).toEqual(['failed', 'idle'])
+})
+
+it('deploys an existing ECR image with skip-build and freezes effective build settings', async () => {
+  const f = fixture()
+  f.sandbox.mockImplementation(async (repo, action) =>
+    action === 'image'
+      ? { code: 0, stdout: `SANDBOX_IMAGE=sha256:${'c'.repeat(64)}\n`, stderr: '' }
+      : f.sandboxResult(repo, action),
+  )
+  expect(
+    (await f.done(await f.core.create({ key: 'cached', actor: 'you', members: [input] }))).state,
+  ).toBe('succeeded')
+  const call = f.sandbox.mock.calls.find((c) => c[1] === 'deploy')
+  expect(call?.slice(1)).toEqual(['deploy', false, true])
+  const repo = call?.[0]
+  if (!repo) throw new Error('missing deployed repo')
+  const text = readFileSync(repo.configPath, 'utf8')
+  expect(text).toContain(`- ${repo.varDefaults?.IMAGE_TAG}-persistent`)
+  expect(text).toContain('sb-cache-')
+  expect(text).not.toContain('slot1-persistent-cache')
 })

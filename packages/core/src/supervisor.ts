@@ -172,7 +172,12 @@ export class Supervisor {
     return r.code === 0 && r.stdout.trim() === '1'
   }
 
-  sandbox(repo: Repo, action: 'sync' | 'deploy' | 'reset', awake = false): Promise<RunResult> {
+  sandbox(
+    repo: Repo,
+    action: 'sync' | 'deploy' | 'reset' | 'print' | 'image',
+    awake = false,
+    skipBuild = false,
+  ): Promise<RunResult> {
     prepareWorkloadConfig(repo)
     const replicas = awake ? '1' : '0'
     const type = repo.varDefaults?.WORKLOAD_TYPE
@@ -191,7 +196,11 @@ export class Supervisor {
         ? 'run-pipeline sync-env'
         : action === 'reset'
           ? 'run-pipeline sandbox-reset'
-          : 'deploy -p persistent -p sandbox'
+          : action === 'print'
+            ? 'print --skip-info -p persistent -p sandbox'
+            : action === 'image'
+              ? 'run-pipeline sandbox-image'
+              : `deploy -p persistent -p sandbox${skipBuild ? ' --skip-build' : ''}`
     return this.runner(loginShell, [loginShellArgs, devspaceCommand(target, verb)])
   }
 
