@@ -1069,7 +1069,8 @@ it('isolates deployment commands, keeps TLS on expiry and removes it only on exp
     },
   })
   expect(repo?.varDefaults?.IMAGE_TAG).toMatch(/-sb1$/)
-  expect(f.configs[0]?.config).toContain('deployments.api.helm.wait\n        value: false')
+  // DevSpace v6 HelmConfig has no wait field; its helm upgrade never waits on rollout.
+  expect(f.configs[0]?.config).not.toContain('helm.wait')
   expect(f.applied.map((ingress) => ingress.metadata.name)).toContain('devdock-sb1-tls')
   await f.done(f.core.wake('safe', 'you'))
   await f.done(f.core.sleep('safe', 'you'))
@@ -1077,6 +1078,11 @@ it('isolates deployment commands, keeps TLS on expiry and removes it only on exp
   expect(
     f.runner.mock.calls.some(([, args]) => args[0] === 'delete' && args[2] === 'devdock-sb1-tls'),
   ).toBe(false)
+  expect(f.runner).toHaveBeenCalledWith(
+    'kubectl',
+    ['delete', 'secret', 'devspace-cache-app-sb1-api', '-n', 'personal', '--ignore-not-found'],
+    expect.anything(),
+  )
   await f.done(f.core.delete('safe', 'you'))
   for (const kind of ['ingress', 'secret'])
     expect(f.runner).toHaveBeenCalledWith(

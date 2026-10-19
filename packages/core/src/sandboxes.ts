@@ -1017,7 +1017,6 @@ echo "SANDBOX_ARCH=$architecture"`,
           { op: 'add', path: `deployments.${chart}.helm.valuesFiles`, value: valuesPath },
           { op: 'replace', path: `deployments.${chart}.helm.releaseName`, value: this.name(s, m) },
           { op: 'replace', path: `deployments.${chart}.helm.values.name`, value: this.name(s, m) },
-          { op: 'add', path: `deployments.${chart}.helm.wait`, value: false },
           { op: 'replace', path: 'pullSecrets', value: {} },
           {
             op: 'replace',
@@ -1423,6 +1422,15 @@ echo "SANDBOX_ARCH=$architecture"`,
     await this.checked('helm', [
       'uninstall',
       this.name(s, m),
+      '-n',
+      await this.namespace(),
+      '--ignore-not-found',
+    ])
+    // DevSpace keeps a remote cache secret per config name; the slot name would otherwise outlive the sandbox.
+    await this.checked('kubectl', [
+      'delete',
+      'secret',
+      guardSandboxName(`devspace-cache-${this.name(s, m)}`, s.slot as string),
       '-n',
       await this.namespace(),
       '--ignore-not-found',
