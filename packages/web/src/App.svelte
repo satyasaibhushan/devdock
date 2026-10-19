@@ -504,7 +504,6 @@
         <SandboxDetail
           sandbox={ticketSandbox}
           picked={pickedMember}
-          onselect={selectMember}
           bind:addingMember
           repos={preferredInstance?.repos ?? []}
           instance={preferredEndpoint}

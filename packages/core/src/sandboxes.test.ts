@@ -87,6 +87,13 @@ function fixture(instanceId = 'machine1') {
         lease.metadata.resourceVersion = String(version++)
       }
       if (args[0] === 'delete' && args[1] === 'configmap') leases.delete(slot)
+      if (args[0] === 'get' && args[1] === 'deployment')
+        stdout = deployments.has(args[2] ?? '') ? `{"svc":"${args[2]}"}` : ''
+      if (args[0] === 'get' && args[1] === 'pods' && args.includes('-l'))
+        stdout =
+          (deployments.get(args[args.indexOf('-l') + 1]?.replace('svc=', '') ?? '') ?? 0) > 0
+            ? `${args[args.indexOf('-l') + 1]?.replace('svc=', '')}-abc12`
+            : ''
       if (args[1] === 'deployments')
         stdout = JSON.stringify({
           items: [...deployments].map(([name, replicas]) => ({
@@ -577,10 +584,16 @@ it('targets sandbox deployments for logs and exec and requires an exec actor', a
     { runner: f.runner },
   )
   svc.rescan()
+  // Asleep: no pod to read, and no watch fallback that personal RBAC denies.
+  f.deployments.set('app-sb1-api', 0)
+  await expect(
+    svc.queryLogs('app', { sandbox: 'SULF-1', workload: 'api', tail: 7 }),
+  ).rejects.toThrow('the sandbox is asleep')
+  f.deployments.set('app-sb1-api', 1)
   await svc.queryLogs('app', { sandbox: 'SULF-1', workload: 'api', tail: 7 })
   expect(f.runner).toHaveBeenCalledWith(
     'kubectl',
-    ['logs', 'deployment/app-sb1-api', '-n', 'personal', '--tail', '7'],
+    ['logs', 'app-sb1-api-abc12', '-n', 'personal', '--tail', '7'],
     expect.anything(),
   )
   await expect(svc.runInWorkload('app', 'pwd', { sandbox: 'SULF-1' })).rejects.toThrow(
@@ -589,7 +602,7 @@ it('targets sandbox deployments for logs and exec and requires an exec actor', a
   await svc.runInWorkload('app', 'pwd', { sandbox: 'SULF-1', actor: 'you' })
   expect(f.runner).toHaveBeenCalledWith(
     'kubectl',
-    ['exec', 'deployment/app-sb1-api', '-n', 'personal', '--', 'sh', '-c', 'pwd'],
+    ['exec', 'app-sb1-api-abc12', '-n', 'personal', '--', 'sh', '-c', 'pwd'],
     expect.anything(),
   )
   expect(

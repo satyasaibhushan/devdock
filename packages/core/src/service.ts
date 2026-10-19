@@ -395,6 +395,47 @@ export class Service {
     }
   }
 
+  /** `kubectl logs|exec deployment/x` waits for a pod with a watch when none
+   *  runs (an asleep sandbox), and personal namespaces do not grant watch on
+   *  pods. Resolve the running pod with plain gets instead. */
+  private async sandboxPod(repo: Repo): Promise<string> {
+    const ns = repo.namespace as string
+    const deployment = await this.kubectl(
+      'kubectl',
+      ['get', 'deployment', repo.name, '-n', ns, '-o', 'jsonpath={.spec.selector.matchLabels}'],
+      { timeoutMs: 15_000 },
+    )
+    if (deployment.code !== 0)
+      throw new Error(
+        `kubectl get deployment failed: ${deployment.stderr.trim() || deployment.code}`,
+      )
+    const labels = JSON.parse(deployment.stdout.trim() || '{}') as Record<string, string>
+    const selector = Object.entries(labels)
+      .map(([k, v]) => `${k}=${v}`)
+      .join(',')
+    if (!selector) throw new Error(`deployment ${repo.name} has no pod selector`)
+    const pods = await this.kubectl(
+      'kubectl',
+      [
+        'get',
+        'pods',
+        '-n',
+        ns,
+        '-l',
+        selector,
+        '--field-selector=status.phase=Running',
+        '-o',
+        'jsonpath={.items[*].metadata.name}',
+      ],
+      { timeoutMs: 15_000 },
+    )
+    if (pods.code !== 0)
+      throw new Error(`kubectl get pods failed: ${pods.stderr.trim() || pods.code}`)
+    const pod = pods.stdout.trim().split(/\s+/)[0]
+    if (!pod) throw new Error('No running pod: the sandbox is asleep, wake it first')
+    return pod
+  }
+
   listSandboxes() {
     return this.sandboxes.list()
   }
@@ -2113,7 +2154,7 @@ export class Service {
         'kubectl',
         [
           'exec',
-          `deployment/${repo.name}`,
+          await this.sandboxPod(repo),
           '-n',
           repo.namespace as string,
           '--',
@@ -2182,7 +2223,7 @@ export class Service {
       const repo = await this.sandboxTarget(opts.sandbox, id, opts.workload)
       const cursor = decodeCursor(opts.cursor)
       const now = new Date().toISOString()
-      const args = ['logs', `deployment/${repo.name}`, '-n', repo.namespace as string]
+      const args = ['logs', await this.sandboxPod(repo), '-n', repo.namespace as string]
       if (cursor?.kind === 'container') args.push(`--since-time=${cursor.sinceTime}`)
       else args.push('--tail', String(Math.min(Math.max(opts.tail ?? 200, 0), 2000)))
       const r = await this.kubectl('kubectl', args, { timeoutMs: 30_000 })
