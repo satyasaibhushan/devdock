@@ -175,6 +175,9 @@ export interface ScanOptions {
   roots?: string[]
   /** Max directory depth to recurse. */
   maxDepth?: number
+  /** Previously registered paths take precedence over new configs with the same id. */
+  preferredPaths?: ReadonlyMap<string, string>
+  onWarning?: (warning: string) => void
 }
 
 /** Scan the filesystem and build the repo registry. */
@@ -186,7 +189,7 @@ export function scanRepos(opts: ScanOptions = {}): Repo[] {
 
   const repos: Repo[] = []
   const seen = new Set<string>()
-  for (const configPath of configs) {
+  for (const configPath of configs.sort()) {
     // repo root is the dir holding devspace.yaml (or its parent if under .devspace/).
     let repoPath = dirname(configPath)
     if (basename(repoPath) === '.devspace') repoPath = dirname(repoPath)
@@ -220,15 +223,25 @@ export function scanRepos(opts: ScanOptions = {}): Repo[] {
     })
   }
   const grouped = groupByRoot(repos)
-  const identities = new Map<string, string>()
+  const identities = new Map<string, Repo>()
+  // Sort after grouping: a wrapper repo's identity is its root, not its members.
+  grouped.sort((a, b) => {
+    const preferred = (repo: Repo) => Number(opts.preferredPaths?.get(repo.id) === repo.path)
+    return preferred(b) - preferred(a) || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0)
+  })
   for (const repo of grouped) {
     const existing = identities.get(repo.id)
-    if (existing && existing !== repo.path) {
-      throw new Error(`duplicate repo id "${repo.id}": ${existing} and ${repo.path}`)
+    if (existing) {
+      if (existing.path !== repo.path) {
+        const warning = duplicateRepoWarning(repo.id, existing.path, repo.path)
+        if (opts.onWarning) opts.onWarning(warning)
+        else console.warn(warning)
+      }
+      continue
     }
-    identities.set(repo.id, repo.path)
+    identities.set(repo.id, repo)
   }
-  return grouped.sort((a, b) => a.id.localeCompare(b.id))
+  return [...identities.values()].sort((a, b) => a.id.localeCompare(b.id))
 }
 
 /** Repos whose workloads live in separate `.devspace/<name>-<type>/` configs
@@ -320,4 +333,8 @@ function safeRead(path: string): string {
   } catch {
     return ''
   }
+}
+
+export function duplicateRepoWarning(id: string, keptPath: string, skippedPath: string): string {
+  return `duplicate repo id "${id}": keeping ${keptPath}; ${skippedPath} is ignored`
 }
