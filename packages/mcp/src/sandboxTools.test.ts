@@ -11,9 +11,7 @@ const client = daemonClient(async () => new Response('{}'))
 it('keeps every public sandbox service method and MCP tool in parity', () => {
   // TypeScript private methods survive on the JS prototype; inspect declarations for visibility.
   const source = readFileSync(new URL('../../core/src/service.ts', import.meta.url), 'utf8')
-  const methods = [...source.matchAll(/^ {2}(?:async )?(\w*(?:[Ss]andbox\w*|recordHead))\(/gm)].map(
-    (m) => m[1],
-  )
+  const methods = [...source.matchAll(/^ {2}(?:async )?(\w*[Ss]andbox\w*)\(/gm)].map((m) => m[1])
   expect(methods.sort()).toEqual(Object.keys(sandboxMethods).sort())
   for (const method of Object.keys(sandboxMethods))
     expect(Object.hasOwn(Service.prototype, method)).toBe(true)
@@ -45,7 +43,6 @@ describe('sandbox MCP', () => {
     const ro = toolsForScope(client, 'ro').filter((t) => t.name.startsWith('devdock_sandbox_'))
     expect(ro.map((t) => t.name).sort()).toEqual([
       'devdock_sandbox_controller',
-      'devdock_sandbox_discover',
       'devdock_sandbox_list',
       'devdock_sandbox_status',
     ])
@@ -73,14 +70,12 @@ describe('sandbox MCP', () => {
       'sleep',
       'expire',
       'delete',
-      'head',
     ]) {
       const t = tools.find((t) => t.name === `devdock_sandbox_${suffix}`)
       await t?.handler({
         key: 'SULF/1',
         repo: 'app',
         workload: 'api',
-        sha: 'a'.repeat(40),
         actor: 'agent:test',
       })
       const [path, init] = send.mock.calls.at(-1) as unknown as [string, RequestInit]
@@ -90,6 +85,24 @@ describe('sandbox MCP', () => {
         suffix === 'update' ? 'PATCH' : suffix === 'delete' ? 'DELETE' : 'POST',
       )
     }
+  })
+  it('sends members as repo, workload and an optional worktree path', async () => {
+    const send = vi.fn(async () => new Response(JSON.stringify({ operationId: 'op1' })))
+    const create = allTools(daemonClient(send)).find((t) => t.name === 'devdock_sandbox_create')
+    expect(create?.description).toContain('worktree')
+    await create?.handler({
+      key: 'SULF-1',
+      actor: 'agent',
+      members: [
+        { repo: 'app', workload: 'api', path: '/wt/app' },
+        { repo: 'web', workload: 'ui' },
+      ],
+    })
+    const [, init] = send.mock.calls.at(-1) as unknown as [string, RequestInit]
+    expect(JSON.parse(init.body as string).members).toEqual([
+      { repo: 'app', workload: 'api', path: '/wt/app' },
+      { repo: 'web', workload: 'ui' },
+    ])
   })
   it('passes optional sandbox to logs and exec', async () => {
     const send = vi.fn(

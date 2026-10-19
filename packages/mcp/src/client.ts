@@ -17,7 +17,6 @@ import type {
   SandboxBuild,
   SandboxControllerStatus,
   SandboxCreate,
-  SandboxMemberInput,
   SandboxUpdate,
   SandboxView,
   TermInfo,
@@ -80,7 +79,6 @@ export interface DaemonClient {
   sandboxList?(): Promise<SandboxView[]>
   sandboxController?(): Promise<SandboxControllerStatus>
   sandboxStatus?(key: string): Promise<SandboxView>
-  sandboxDiscover?(key: string): Promise<SandboxMemberInput[]>
   sandboxCreate?(input: SandboxCreate): Promise<{ operationId: string }>
   sandboxUpdate?(key: string, input: SandboxUpdate): Promise<{ operationId: string }>
   sandboxSnapshot?(key: string, input: SandboxBuild): Promise<{ operationId: string }>
@@ -91,10 +89,6 @@ export interface DaemonClient {
     actor: string,
     options?: { evict?: boolean },
   ): Promise<{ operationId: string }>
-  sandboxHead?(
-    key: string,
-    input: { repo: string; workload: string; sha: string; actor: string; merged?: boolean },
-  ): Promise<void>
   beginOperation?(repo: string, action: WorkflowAction, workload?: string): Promise<Operation>
   operations?(repo?: string): Promise<Operation[]>
   operation?(id: string): Promise<Operation>
@@ -241,7 +235,6 @@ export function daemonClient(send: DaemonTransport, prefix = ''): DaemonClient {
     sandboxController: () => request('/sandboxes/controller'),
     sandboxList: () => request('/sandboxes'),
     sandboxStatus: (key) => request(`/sandboxes/${id(key)}`),
-    sandboxDiscover: (key) => request(`/sandboxes/${id(key)}/discover`),
     sandboxCreate: (input) => post('/sandboxes', input),
     sandboxUpdate: (key, input) =>
       request(`/sandboxes/${id(key)}`, {
@@ -259,7 +252,6 @@ export function daemonClient(send: DaemonTransport, prefix = ''): DaemonClient {
             body: JSON.stringify({ actor, ...options }),
           })
         : post(`/sandboxes/${id(key)}/${action}`, { actor, ...options }),
-    sandboxHead: (key, input) => post(`/sandboxes/${id(key)}/head`, input),
     beginOperation: (repo, action, workload) =>
       post(`/repos/${id(repo)}/operations`, { action, workload }),
     operations: (repo) => request(`/operations${repo ? `?repo=${id(repo)}` : ''}`),
