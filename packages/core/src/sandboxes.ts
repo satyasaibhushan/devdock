@@ -228,6 +228,8 @@ export class Sandboxes {
   private mirrors = new Map<string, Promise<void>>()
   private imageBuilds = new SandboxImageBuilds()
   private active = new Map<string, string>()
+  private leasesRecovered = false
+  private leaseRecovery: Promise<void> | undefined
   constructor(private readonly deps: SandboxDeps) {}
 
   private pool(): string[] {
@@ -433,7 +435,7 @@ export class Sandboxes {
     this.touch(s, actor, action)
     const lock = JSON.stringify({ instanceId: this.deps.instanceId, operationId: op.id })
     this.active.set(s.key, lock)
-    const task = Promise.resolve()
+    const task = this.recoverLeases()
       .then(async () => {
         if (s.slot) {
           const lease = await this.readLease(s.slot)
@@ -522,6 +524,30 @@ export class Sandboxes {
       }
       this.save(s)
     }
+    this.leasesRecovered = false
+    // Lease reads need kubectl, which is deferred while Kubernetes login is
+    // required. The daemon must still boot so that login can be offered.
+    await this.recoverLeases().catch((error: unknown) => {
+      console.error(
+        `devdock: sandbox recovery deferred: ${error instanceof Error ? error.message : String(error)}`,
+      )
+    })
+  }
+  /** Adopt this instance's slot leases once. Retried by reconcile and awaited
+   *  before every sandbox operation, so no operation takes a lock that a late
+   *  recovery would then release as stale. */
+  recoverLeases(): Promise<void> {
+    if (this.leasesRecovered) return Promise.resolve()
+    this.leaseRecovery ??= this.readLeases()
+      .then(() => {
+        this.leasesRecovered = true
+      })
+      .finally(() => {
+        this.leaseRecovery = undefined
+      })
+    return this.leaseRecovery
+  }
+  private async readLeases(): Promise<void> {
     if (!(await this.deps.namespace())) return
     const observed = new Map<string, Lease>()
     for (const slot of this.pool()) {

@@ -373,6 +373,25 @@ describe('sandbox lifecycle', () => {
     await f.core.recover()
     expect(f.store.getSandbox('FREE')).toBeDefined()
   })
+  it('boots without the cluster and adopts leases once kubectl is allowed', async () => {
+    const f = fixture()
+    f.leases.set('sb1', {
+      metadata: { resourceVersion: '1' },
+      data: { key: 'SULF-1', instanceId: 'machine1', members: JSON.stringify([input]) },
+    })
+    const runner = f.runner.getMockImplementation()
+    f.runner.mockImplementation(async (cmd, args, options) =>
+      cmd === 'kubectl' && args[0] === 'get'
+        ? { code: 1, stdout: '', stderr: 'devdock: kubectl deferred: kubernetes login required' }
+        : (runner as NonNullable<typeof runner>)(cmd, args, options),
+    )
+    vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    await expect(f.core.recover()).resolves.toBeUndefined()
+    expect(f.store.getSandbox('SULF-1')).toBeUndefined()
+    f.runner.mockImplementation(runner as NonNullable<typeof runner>)
+    await f.core.recoverLeases()
+    expect(f.store.getSandbox('SULF-1')).toMatchObject({ slot: 'sb1', state: 'active' })
+  })
   it('refuses a live personal release before acquiring or deploying', async () => {
     const f = fixture()
     f.available.mockRejectedValue(new Error('Live dev session holds app-api in personal namespace'))

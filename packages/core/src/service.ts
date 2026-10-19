@@ -2564,6 +2564,7 @@ export class Service {
     }
     this.timer = setInterval(() => {
       void this.reconcileAll().catch(() => undefined)
+      void this.sandboxes.recoverLeases().catch(() => undefined)
       this.terms.sweep() // reap idle/dead agent terminals alongside each pass
     }, this.opts.reconcileMs)
     this.authTimer = setInterval(() => {
