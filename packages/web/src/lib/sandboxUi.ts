@@ -1,59 +1,41 @@
-// Pure helpers behind the sandbox views: parsing member sources, deriving the
+// Pure helpers behind the sandbox views: parsing checkout paths, deriving the
 // small status words the sidebar and detail show, and folding WS events into
 // the polled list between refreshes.
 
-import type {
-  SandboxEvent,
-  SandboxMember,
-  SandboxMemberInput,
-  SandboxSnapshotMember,
-  SandboxView,
-} from './api'
+import type { SandboxEvent, SandboxMember, SandboxView } from './api'
 
 /** The daemon's key rule; mirrored so the form can disable Create early. */
 export const SANDBOX_KEY = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/
 
-/** A GitHub PR URL becomes a PR source; anything else is taken as a branch ref. */
-export function memberSource(value: string): SandboxMemberInput['source'] {
-  const ref = value.trim()
-  if (!ref || ref.startsWith('-')) throw new Error('Enter a PR URL or branch')
-  if (!/^https?:/i.test(ref)) return { kind: 'branch', ref }
-  let url: URL
-  try {
-    url = new URL(ref)
-  } catch {
-    throw new Error('Enter a GitHub PR URL')
-  }
-  const match = url.pathname.match(/^\/([\w.-]+\/[\w.-]+)\/pull\/([1-9]\d*)\/?$/)
-  if (url.protocol !== 'https:' || url.hostname !== 'github.com' || !match?.[1] || !match[2])
-    throw new Error('Enter a GitHub PR URL')
-  return {
-    kind: 'pr',
-    repoSlug: match[1],
-    number: Number(match[2]),
-    url: `https://github.com/${match[1]}/pull/${match[2]}`,
-  }
+/** A checkout path field: empty means the repo's registered checkout. */
+export function memberPath(value: string): string | undefined {
+  const path = value.trim()
+  if (!path) return undefined
+  if (!path.startsWith('/')) throw new Error('Enter an absolute worktree path')
+  return path
 }
 
 export const memberKey = (member: { repo: string; workload: string }) =>
   `${member.repo}:${member.workload}`
 
-export function sourceLabel(source: SandboxMemberInput['source']): string {
-  if (source.kind === 'pr') return `PR #${source.number}`
-  if (source.kind === 'branch') return source.ref
-  return `worktree ${source.path.split('/').filter(Boolean).pop() ?? source.path}`
+/** Where a member builds from: its worktree's folder name, else the repo checkout. */
+export function checkoutLabel(member: { path?: string }): string {
+  if (member.path === undefined) return 'repo checkout'
+  return member.path.split('/').filter(Boolean).pop() ?? member.path
 }
 
 export const shortSha = (sha: string | undefined) => (sha ? sha.slice(0, 7) : '')
 
-/** Deployed code is behind the source head (mirrors core's staleMembers). */
-export const memberStale = (member: SandboxMember) =>
-  !member.merged && (!member.deployedSha || member.deployedSha !== member.headSha)
+/** What a build baked, `branch @ sha7`; a detached build shows only the sha. */
+export function builtLabel(branch: string | undefined, sha: string | undefined): string {
+  if (!sha) return ''
+  return branch ? `${branch} @ ${shortSha(sha)}` : shortSha(sha)
+}
 
-/** Build progress wins over freshness while a build is pending or failed. */
+/** Build progress wins while a build is pending or failed. */
 export function memberBuildState(member: SandboxMember): string {
   if (member.build.state !== 'idle') return member.build.state
-  return memberStale(member) ? 'stale' : 'ready'
+  return member.deployedSha ? 'ready' : 'not built'
 }
 
 export function selectedMember(members: SandboxMember[], key: string | null): SandboxMember | null {
@@ -73,24 +55,6 @@ export function expiryLabel(sandbox: Pick<SandboxView, 'slot' | 'expiresAt'>, no
   if (!sandbox.slot) return 'slot released'
   if (sandbox.expiresAt <= now) return 'expiry due'
   return `expires in ${relativeTime(sandbox.expiresAt, now)}`
-}
-
-/** What a snapshot row says next to its sha: dirty files beat head comparison,
- *  and a worktree has no remote head to compare with. */
-export function showsCompare(
-  saved: SandboxSnapshotMember,
-  member: SandboxMember | undefined,
-): { text: string; tone: 'ok' | 'warn' | 'dirty' | 'none' } {
-  if (saved.dirtyFiles.length)
-    return {
-      text: `+${saved.dirtyFiles.length} file${saved.dirtyFiles.length === 1 ? '' : 's'}`,
-      tone: 'dirty',
-    }
-  if (!member?.headSha || member.source.kind === 'worktree') return { text: '', tone: 'none' }
-  const name = member.source.kind === 'pr' ? 'PR' : 'branch'
-  return saved.sha === member.headSha
-    ? { text: `= ${name} head`, tone: 'ok' }
-    : { text: `behind ${name} head`, tone: 'warn' }
 }
 
 /** The card's primary action; the one thing a visitor can do from the grid. */
@@ -154,7 +118,6 @@ function stableLink(list: SandboxView[], key: string): string {
 export function applySandboxEvent(list: SandboxView[], event: SandboxEvent): SandboxView[] {
   if ('deleted' in event) return list.filter((s) => s.key !== event.key)
   const previous = list.find((s) => s.key === event.key)
-  const allMerged = event.members.length > 0 && event.members.every((m) => m.merged === true)
   if (!previous) {
     const ribbon =
       event.state === 'expired' ? 'expired' : event.state === 'failed' ? 'failed' : 'unknown'
@@ -170,7 +133,6 @@ export function applySandboxEvent(list: SandboxView[], event: SandboxEvent): San
         markdown: '',
         pool: list[0]?.pool ?? [],
         expiresAt: 0,
-        allMerged,
       },
     ]
   }
@@ -178,7 +140,6 @@ export function applySandboxEvent(list: SandboxView[], event: SandboxEvent): San
   const next: SandboxView = {
     ...previous,
     ...event,
-    allMerged,
     expiresAt: previous.personal ? previous.expiresAt : event.lastUsedAt + ttl,
   }
   return list.map((s) => (s.key === event.key ? next : s))

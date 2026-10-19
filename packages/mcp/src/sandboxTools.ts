@@ -6,17 +6,16 @@ import type { ToolDef } from './tools.js'
 const member = z.object({
   repo: z.string().min(1),
   workload: z.string().min(1),
-  source: z.discriminatedUnion('kind', [
-    z.object({
-      kind: z.literal('pr'),
-      repoSlug: z.string().regex(/^[\w.-]+\/[\w.-]+$/),
-      number: z.number().int().positive(),
-      url: z.string().url(),
-    }),
-    z.object({ kind: z.literal('branch'), ref: z.string().min(1) }),
-    z.object({ kind: z.literal('worktree'), path: z.string().min(1) }),
-  ]),
+  path: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      "Absolute path of your agent worktree for this repo; omit to build the repo's registered checkout",
+    ),
 })
+const memberHelp =
+  "Each member is {repo, workload, path}: pass path as the absolute path of your agent worktree so the build bakes your current files, uncommitted edits included; without path it builds the repo's registered checkout."
 const key = { key: z.string().min(1) }
 const actor = { actor: z.string().trim().min(1) }
 
@@ -25,7 +24,6 @@ export const sandboxMethods = {
   listSandboxes: 'list',
   sandboxControllerStatus: 'controller',
   sandboxStatus: 'status',
-  discoverSandbox: 'discover',
   createSandbox: 'create',
   updateSandbox: 'update',
   buildSandbox: 'build',
@@ -34,13 +32,13 @@ export const sandboxMethods = {
   sleepSandbox: 'sleep',
   expireSandbox: 'expire',
   deleteSandbox: 'delete',
-  recordHead: 'head',
 } as const
 
 export function sandboxTools(client: DaemonClient): ToolDef[] {
   const definitions: {
     name: string
     scope: 'ro' | 'rw'
+    description?: string
     schema: z.ZodRawShape
     call: (a: Record<string, unknown>) => Promise<unknown> | undefined
   }[] = [
@@ -53,20 +51,14 @@ export function sandboxTools(client: DaemonClient): ToolDef[] {
       call: (a) => client.sandboxStatus?.(a.key as string),
     },
     {
-      name: 'discover',
-      scope: 'ro',
-      schema: key,
-      call: (a) => client.sandboxDiscover?.(a.key as string),
-    },
-    {
       name: 'create',
       scope: 'rw',
+      description: `Create a ticket sandbox and build its members. ${memberHelp} Records actor; returns operationId.`,
       schema: {
         ...key,
         ...actor,
         title: z.string().optional(),
         members: z.array(member).optional(),
-        discover: z.boolean().optional(),
         wake: z.boolean().optional(),
       },
       call: (a) => client.sandboxCreate?.(a as unknown as SandboxCreate),
@@ -74,6 +66,7 @@ export function sandboxTools(client: DaemonClient): ToolDef[] {
     {
       name: 'update',
       scope: 'rw',
+      description: `Add or remove ticket sandbox members. ${memberHelp} Records actor; returns operationId.`,
       schema: {
         ...key,
         ...actor,
@@ -85,7 +78,7 @@ export function sandboxTools(client: DaemonClient): ToolDef[] {
     {
       name: 'build',
       scope: 'rw',
-      schema: { ...key, ...actor, repo: z.string().optional(), force: z.boolean().optional() },
+      schema: { ...key, ...actor, repo: z.string().optional() },
       call: (a) => client.sandboxBuild?.(a.key as string, a as unknown as SandboxBuild),
     },
     {
@@ -106,33 +99,12 @@ export function sandboxTools(client: DaemonClient): ToolDef[] {
           action === 'wake' ? { evict: a.evict as boolean | undefined } : undefined,
         ),
     })),
-    {
-      name: 'head',
-      scope: 'rw',
-      schema: {
-        ...key,
-        ...actor,
-        repo: z.string(),
-        workload: z.string(),
-        sha: z.string(),
-        merged: z.boolean().optional(),
-      },
-      call: (a) =>
-        client.sandboxHead?.(
-          a.key as string,
-          a as unknown as {
-            repo: string
-            workload: string
-            sha: string
-            actor: string
-            merged?: boolean
-          },
-        ),
-    },
   ]
   return definitions.map((d) => ({
     name: `devdock_sandbox_${d.name}`,
-    description: `${d.name} a ticket sandbox. Mutations record their actor; long work returns operationId.`,
+    description:
+      d.description ??
+      `${d.name} a ticket sandbox. Mutations record their actor; long work returns operationId.`,
     scope: d.scope,
     inputSchema: d.schema,
     handler: async (args) => {

@@ -12,18 +12,15 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { Operations } from './operations.js'
-import { type SandboxMemberInput, Sandboxes, isExpired, staleMembers } from './sandboxes.js'
+import { type SandboxMemberInput, Sandboxes, isExpired } from './sandboxes.js'
 import { Service } from './service.js'
 import { StateStore } from './stateStore.js'
 import { Supervisor } from './supervisor.js'
 
 const sha1 = 'a'.repeat(40)
 const sha2 = 'b'.repeat(40)
-const input: SandboxMemberInput = {
-  repo: 'app',
-  workload: 'api',
-  source: { kind: 'branch', ref: 'ticket' },
-}
+const input: SandboxMemberInput = { repo: 'app', workload: 'api' }
+const pr7 = { number: 7, url: 'https://github.com/team/app/pull/7' }
 let root: string
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'sandboxes-'))
@@ -39,6 +36,7 @@ function fixture(instanceId = 'machine1') {
   const repoPath = join(root, 'app')
   mkdirSync(repoPath, { recursive: true })
   writeFileSync(join(repoPath, 'devspace.yaml'), 'version: v2beta1\nname: app\n')
+  writeFileSync(join(repoPath, 'Dockerfile'), 'FROM scratch\nCOPY . .\n')
   const store = new StateStore(join(root, `state-${instanceId}.json`))
   const operations = new Operations(join(root, `operations-${instanceId}.json`))
   const leases = new Map<
@@ -47,6 +45,8 @@ function fixture(instanceId = 'machine1') {
   >()
   const deployments = new Map<string, number>()
   let head = sha1
+  let branch = 'ticket'
+  let gh: () => { code: number; stdout: string } = () => ({ code: 0, stdout: JSON.stringify(pr7) })
   let version = 1
   const runner = vi.fn(async (cmd: string, args: string[], options?: { cwd?: string }) => {
     let stdout = ''
@@ -94,7 +94,11 @@ function fixture(instanceId = 'machine1') {
           JSON.parse(args[args.indexOf('-p') + 1] ?? '{}').spec.replicas as number,
         )
     }
-    if (cmd === 'git' && args[0] === 'rev-parse') stdout = head
+    if (cmd === 'git' && args[0] === 'rev-parse')
+      stdout = args[1] === '--abbrev-ref' ? branch : head
+    // The registered checkout: two clean tracked files.
+    if (cmd === 'git' && args[0] === 'ls-files' && args[1] === '-co')
+      stdout = 'Dockerfile\0devspace.yaml\0'
     if (cmd === 'git' && args[0] === 'worktree' && args[1] === 'add') {
       const path = args[3] as string
       mkdirSync(path, { recursive: true })
@@ -103,25 +107,32 @@ function fixture(instanceId = 'machine1') {
     }
     if (cmd === 'git' && args[0] === 'worktree' && args[1] === 'remove')
       rmSync(args[3] as string, { recursive: true, force: true })
-    if (cmd === 'gh')
-      stdout =
-        '[{"number":7,"url":"https://github.com/team/app/pull/7","headRefName":"SULF-1-fix"}]'
+    if (cmd === 'gh') return { ...gh(), stderr: '' }
     void options
     return { code: 0, stdout, stderr: '' }
   })
   const supervisor = new Supervisor(runner)
-  const sandboxResult = async (_repo: unknown, action: string) => ({
-    code: 0,
-    stdout:
-      action === 'print'
-        ? 'images:\n  app:\n    image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/devspace\n    context: .\n    dockerfile: Dockerfile\n'
-        : action === 'image'
-          ? 'SANDBOX_IMAGE=missing\n'
-          : action === 'architecture'
-            ? 'info SANDBOX_ARCH=linux/arm64\n'
-            : '',
-    stderr: '',
-  })
+  // Build dirs are removed after each build, so keep what each deploy saw.
+  const configs: { config: string; values: string }[] = []
+  const sandboxResult = async (repo: { configPath: string }, action: string) => {
+    if (action === 'deploy')
+      configs.push({
+        config: readFileSync(repo.configPath, 'utf8'),
+        values: readFileSync(repo.configPath.replace('.yaml', '-values.yaml'), 'utf8'),
+      })
+    return {
+      code: 0,
+      stdout:
+        action === 'print'
+          ? 'images:\n  app:\n    image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/devspace\n    context: .\n    dockerfile: Dockerfile\n'
+          : action === 'image'
+            ? 'SANDBOX_IMAGE=missing\n'
+            : action === 'architecture'
+              ? 'info SANDBOX_ARCH=linux/arm64\n'
+              : '',
+      stderr: '',
+    }
+  }
   const sandbox = vi.spyOn(supervisor, 'sandbox').mockImplementation(sandboxResult)
   const available = vi.fn(async () => {})
   const emit = vi.fn()
@@ -163,12 +174,19 @@ function fixture(instanceId = 'machine1') {
     runner,
     sandbox,
     sandboxResult,
+    configs,
     available,
     emit,
     done,
     repoPath,
     setHead: (sha: string) => {
       head = sha
+    },
+    setBranch: (name: string) => {
+      branch = name
+    },
+    setGh: (result: () => { code: number; stdout: string }) => {
+      gh = result
     },
     imagePresent: () =>
       sandbox.mockImplementation(async (repo, action) =>
@@ -180,26 +198,6 @@ function fixture(instanceId = 'machine1') {
 }
 
 describe('sandbox lifecycle', () => {
-  it('records controller heads without extending idle or expiry clocks', async () => {
-    const f = fixture()
-    await f.done(await f.core.create({ key: 'SULF-1', actor: 'you', members: [input] }))
-    const record = f.store.getSandbox('SULF-1')
-    if (!record) throw new Error('missing sandbox')
-    record.lastUsedAt = 123
-    f.store.setSandbox(record)
-    await f.core.recordHead('SULF-1', input, sha2, 'controller', false, { touch: false })
-    expect(f.store.getSandbox('SULF-1')?.lastUsedAt).toBe(123)
-    expect(f.store.getSandbox('SULF-1')?.activity.at(-1)).toMatchObject({
-      actor: 'controller',
-      action: 'head',
-    })
-    const mirrored = JSON.parse(f.leases.get('slot1')?.data.sandbox ?? '{}') as {
-      lastUsedAt: number
-    }
-    expect(mirrored.lastUsedAt).toBe(123)
-    await f.core.recordHead('SULF-1', input, sha1, 'you')
-    expect(f.store.getSandbox('SULF-1')?.lastUsedAt).toBeGreaterThan(123)
-  })
   it('leases before building, defaults asleep, derives URLs and wakes only explicit members', async () => {
     const f = fixture()
     expect(
@@ -263,34 +261,12 @@ describe('sandbox lifecycle', () => {
     await f.done(f.core.delete('SULF-1', 'you'))
     expect(f.store.getSandbox('SULF-1')).toBeUndefined()
   })
-  it('builds the latest head after an in-flight head change and caps activity', async () => {
+  it('caps activity', async () => {
     const f = fixture()
-    let changes = 0
-    f.sandbox.mockImplementation(async (_repo, action) => {
-      if (action === 'deploy' && changes++ === 0)
-        await f.core.recordHead('SULF-1', input, sha2, 'poller')
-      return f.sandboxResult(_repo, action)
-    })
     await f.done(await f.core.create({ key: 'SULF-1', members: [input], actor: 'you' }))
-    expect(f.sandbox.mock.calls.filter((c) => c[1] === 'deploy')).toHaveLength(2)
-    expect(f.store.getSandbox('SULF-1')?.members[0]?.deployedSha).toBe(sha2)
-    for (let i = 0; i < 210; i++) await f.core.recordHead('SULF-1', input, sha2, 'poller')
+    for (let i = 0; i < 210; i++) await f.core.recordExec('SULF-1', 'you')
     expect(f.store.getSandbox('SULF-1')?.activity).toHaveLength(200)
     expect((await f.core.status('SULF-1')).activity).toHaveLength(50)
-  })
-  it('marks merged PRs without building them', async () => {
-    const f = fixture()
-    await f.done(await f.core.create({ key: 'SULF-1', members: [input], actor: 'you' }))
-    await f.core.recordHead('SULF-1', input, sha2, 'poller', true)
-    expect(
-      staleMembers(
-        f.store.getSandbox('SULF-1') as NonNullable<ReturnType<StateStore['getSandbox']>>,
-      ),
-    ).toEqual([])
-    f.sandbox.mockClear()
-    await f.done(f.core.build('SULF-1', { actor: 'you', force: true }))
-    expect(f.sandbox).not.toHaveBeenCalled()
-    expect((await f.core.status('SULF-1')).allMerged).toBe(true)
   })
   it('recovers owned and unowned ConfigMaps, ignores another instance and interrupts operations', async () => {
     const f = fixture()
@@ -334,7 +310,7 @@ describe('sandbox lifecycle', () => {
     expect(f.leases.size).toBe(0)
     expect(f.sandbox).not.toHaveBeenCalled()
   })
-  it('requires actors, validates members, discovers PRs and isolates multi-workload worktrees', async () => {
+  it('requires actors, validates members and isolates multi-workload worktrees', async () => {
     const f = fixture()
     await expect(f.core.create({ key: 'SULF-1', members: [input], actor: '' })).rejects.toThrow(
       'actor required',
@@ -342,18 +318,6 @@ describe('sandbox lifecycle', () => {
     await expect(
       f.core.create({ key: 'SULF-1', members: [{ ...input, workload: 'nope' }], actor: 'you' }),
     ).rejects.toThrow('unknown workload')
-    expect(await f.core.discover('SULF-1')).toEqual([
-      {
-        repo: 'app',
-        workload: 'api',
-        source: {
-          kind: 'pr',
-          repoSlug: 'team/app',
-          number: 7,
-          url: 'https://github.com/team/app/pull/7',
-        },
-      },
-    ])
     await f.done(
       await f.core.create({
         key: 'SULF-1',
@@ -442,7 +406,7 @@ it('resets a removed release, drops its worktree and retains the other members',
   expect(f.store.getSandbox('SULF-1')?.members.map((m) => m.workload)).toEqual(['api'])
 })
 
-it('refreshes branch heads and lets Helm roll changed images', async () => {
+it('rebuilds from the moved checkout and lets Helm roll changed images', async () => {
   const f = fixture()
   await f.done(
     await f.core.create({
@@ -475,38 +439,21 @@ it('refreshes branch heads and lets Helm roll changed images', async () => {
   expect(f.store.getSandbox('SULF-1')?.members.every((m) => m.deployedSha === sha2)).toBe(true)
 })
 
-it('fetches PR heads from their target repository and appends development placement after persistent values', async () => {
+it('builds the registered checkout when no path is given and appends development placement after persistent values', async () => {
   const f = fixture()
-  await f.done(
-    await f.core.create({
-      key: 'SULF-1',
-      members: [
-        {
-          ...input,
-          source: {
-            kind: 'pr',
-            repoSlug: 'team/app',
-            number: 42,
-            url: 'https://github.com/team/app/pull/42',
-          },
-        },
-      ],
-      actor: 'you',
-    }),
-  )
+  await f.done(await f.core.create({ key: 'SULF-1', members: [input], actor: 'you' }))
   expect(f.runner).toHaveBeenCalledWith(
     'git',
-    ['fetch', '--', 'https://github.com/team/app.git', 'pull/42/head'],
-    expect.anything(),
+    ['ls-files', '-co', '--exclude-standard', '-z'],
+    expect.objectContaining({ cwd: f.repoPath }),
   )
-  const repo = f.sandbox.mock.calls.find((c) => c[1] === 'deploy')?.[0]
-  if (!repo) throw new Error('missing deployment')
-  const yaml = readFileSync(repo.configPath, 'utf8')
+  expect(f.runner.mock.calls.some(([cmd, args]) => cmd === 'git' && args[0] === 'worktree')).toBe(
+    false,
+  )
+  const yaml = f.configs[0]?.config
   expect(yaml).toContain('deployments.api.helm.valuesFiles')
   expect(yaml).toContain('create_deployments default')
-  expect(readFileSync(repo.configPath.replace('.yaml', '-values.yaml'), 'utf8')).toContain(
-    'workload: development',
-  )
+  expect(f.configs[0]?.values).toContain('workload: development')
   expect(readFileSync(join(root, 'app', 'devspace.yaml'), 'utf8')).toBe(
     'version: v2beta1\nname: app\n',
   )
@@ -595,7 +542,7 @@ it('deploys an existing ECR image with skip-build and freezes effective build se
   expect(call?.slice(1)).toEqual(['deploy', false, true])
   const repo = call?.[0]
   if (!repo) throw new Error('missing deployed repo')
-  const text = readFileSync(repo.configPath, 'utf8')
+  const text = f.configs[0]?.config
   expect(text).toContain(`- ${repo.varDefaults?.IMAGE_TAG}-persistent`)
   expect(text).not.toContain('buildKit:')
   expect(text).not.toContain('sb-cache-')
@@ -639,9 +586,7 @@ it('preserves the existing BuildKit builder and cache options while stabilizing 
   })
   const result = await f.done(await f.core.create({ key: 'kit', actor: 'you', members: [input] }))
   expect(result.state).toBe('succeeded')
-  const repo = f.sandbox.mock.calls.find((c) => c[1] === 'deploy')?.[0]
-  if (!repo) throw new Error('missing deployed repo')
-  const text = readFileSync(repo.configPath, 'utf8')
+  const text = f.configs[0]?.config
   expect(text).toContain('namespace: builders')
   expect(text).toContain('--platform=linux/amd64')
   expect(text).toContain(
@@ -681,7 +626,7 @@ describe('snapshots', () => {
       })
         .toString()
         .trim()
-    git('init', '-q')
+    git('init', '-q', '-b', 'SULF-1-fix')
     git('config', 'user.email', 'x@example.com')
     git('config', 'user.name', 'x')
     writeFileSync(join(wt, 'devspace.yaml'), 'version: v2beta1\nname: app\n')
@@ -713,7 +658,7 @@ describe('snapshots', () => {
       }
       return f.sandboxResult(repo, action)
     })
-    const member: SandboxMemberInput = { ...input, source: { kind: 'worktree', path: wt } }
+    const member: SandboxMemberInput = { ...input, path: wt }
     const result = await f.done(
       await f.core.create({ key: 'SULF-1', actor: 'agent', members: [member] }),
     )
@@ -741,12 +686,12 @@ describe('snapshots', () => {
     })
     const view = await f.core.status('SULF-1')
     expect(view.link).toBe('http://127.0.0.1:7717/s/SULF-1')
-    expect(view.markdown).toContain(`app api ${head} (+3 uncommitted files)`)
+    expect(view.markdown).toContain(`app api SULF-1-fix @ ${head} (+3 uncommitted files) PR #7\n`)
     await expect(
       f.core.create({
         key: 'SULF-2',
         actor: 'agent',
-        members: [{ ...input, source: { kind: 'worktree', path: 'relative' } }],
+        members: [{ ...input, path: 'relative' }],
       }),
     ).rejects.toThrow('absolute')
   })
@@ -759,31 +704,55 @@ describe('snapshots', () => {
       cmd === 'git' && options?.cwd === wt
         ? {
             code: 0,
-            stdout: args[0] === 'rev-parse' ? sha1 : 'Dockerfile\0vendor/lib\0',
+            stdout:
+              args[0] === 'rev-parse'
+                ? sha1
+                : args[0] === 'ls-files'
+                  ? 'Dockerfile\0vendor/lib\0'
+                  : '',
             stderr: '',
           }
         : (mocked as NonNullable<typeof mocked>)(cmd, args, options),
     )
     writeFileSync(join(wt, 'Dockerfile'), 'FROM scratch\n')
     writeFileSync(join(wt, 'devspace.yaml'), 'version: v2beta1\nname: app\n')
-    const member: SandboxMemberInput = { ...input, source: { kind: 'worktree', path: wt } }
+    const member: SandboxMemberInput = { ...input, path: wt }
     const result = await f.done(
       await f.core.create({ key: 'SULF-1', actor: 'agent', members: [member] }),
     )
     expect(result.state).toBe('failed')
     expect(result.logs.at(-1)?.message).toBe(
-      'app:api: Submodules are not supported in worktree members: vendor/lib',
+      'app:api: Submodules are not supported in sandbox builds: vendor/lib',
     )
     expect(readdirSync(dirname(f.repoPath)).filter((n) => n.includes('-build-'))).toEqual([])
   })
-  it('records a snapshot after every full build and renders PR markdown against the source head', async () => {
+  it('records branch, sha, dirty files and PR on the member and snapshot and renders markdown', async () => {
     const f = fixture()
     await f.done(await f.core.create({ key: 'SULF-1', actor: 'you', members: [input] }))
     const saved = f.store.getSandbox('SULF-1')?.snapshot
     expect(saved).toMatchObject({
       actor: 'you',
-      members: [{ sha: sha1, dirtyFiles: [], image: expect.stringContaining('-persistent') }],
+      members: [
+        {
+          sha: sha1,
+          dirtyFiles: [],
+          branch: 'ticket',
+          pr: pr7,
+          image: expect.stringContaining('-persistent'),
+        },
+      ],
     })
+    expect(f.store.getSandbox('SULF-1')?.members[0]).toMatchObject({
+      deployedSha: sha1,
+      dirtyFiles: [],
+      branch: 'ticket',
+      pr: pr7,
+    })
+    expect(f.runner).toHaveBeenCalledWith(
+      'gh',
+      ['pr', 'view', '--json', 'number,url'],
+      expect.objectContaining({ cwd: f.repoPath }),
+    )
     let view = await f.core.status('SULF-1')
     expect(view.ribbon).toBe('asleep')
     expect(view.pool).toEqual([{ slot: 'slot1', key: 'SULF-1' }, { slot: 'slot2' }])
@@ -794,20 +763,103 @@ describe('snapshots', () => {
         'Live URL: https://slot.example/app',
         '',
         '```',
-        `app api ${sha1} = ticket head`,
+        `app api ticket @ ${sha1} PR #7`,
         '```',
       ].join('\n'),
     )
-    await f.core.recordHead('SULF-1', input, sha2, 'poller')
-    view = await f.core.status('SULF-1')
-    expect(view.markdown).toContain(`app api ${sha1} vs ticket head ${sha2}`)
+    // A detached HEAD has no branch, so no PR lookup either.
     f.setHead(sha2)
+    f.setBranch('HEAD')
+    f.runner.mockClear()
     await f.done(f.core.snapshot('SULF-1', { actor: 'again' }))
     expect(f.store.getSandbox('SULF-1')?.snapshot).toMatchObject({
       actor: 'again',
-      members: [{ sha: sha2 }],
+      members: [{ sha: sha2, branch: undefined, pr: undefined }],
     })
+    expect(f.runner.mock.calls.some(([cmd]) => cmd === 'gh')).toBe(false)
+    view = await f.core.status('SULF-1')
+    expect(view.markdown).toContain(`app api ${sha2}\n`)
     expect(f.store.getSandbox('SULF-1')?.activity.map((a) => a.action)).toContain('snapshot')
+  })
+  it('builds without a PR when gh fails, times out or finds nothing', async () => {
+    const f = fixture()
+    f.setGh(() => ({ code: 1, stdout: '' }))
+    let result = await f.done(
+      await f.core.create({ key: 'SULF-1', actor: 'you', members: [input] }),
+    )
+    expect(result.state).toBe('succeeded')
+    expect(f.store.getSandbox('SULF-1')?.members[0]).toMatchObject({
+      branch: 'ticket',
+      pr: undefined,
+    })
+    f.setGh(() => {
+      throw new Error('gh missing')
+    })
+    result = await f.done(f.core.build('SULF-1', { actor: 'you' }))
+    expect(result.state).toBe('succeeded')
+    f.setGh(() => ({ code: 0, stdout: 'not json' }))
+    result = await f.done(f.core.build('SULF-1', { actor: 'you' }))
+    expect(result.state).toBe('succeeded')
+    expect(f.store.getSandbox('SULF-1')?.snapshot?.members[0]?.pr).toBeUndefined()
+    expect(f.runner).toHaveBeenCalledWith(
+      'gh',
+      expect.anything(),
+      expect.objectContaining({ timeoutMs: expect.any(Number) }),
+    )
+  })
+  it('loads, renders and rebuilds legacy PR and branch members from the repo checkout', async () => {
+    const f = fixture()
+    await f.done(await f.core.create({ key: 'SULF-1', actor: 'you', members: [input] }))
+    await f.done(f.core.expire('SULF-1', 'expiry'))
+    const record = f.store.getSandbox('SULF-1')
+    if (!record) throw new Error('missing sandbox')
+    const legacy = {
+      ...record,
+      allMerged: false,
+      members: [
+        {
+          ...record.members[0],
+          source: { kind: 'pr', repoSlug: 'team/app', number: 7, url: pr7.url },
+          headSha: sha2,
+          merged: true,
+        },
+        {
+          ...record.members[0],
+          workload: 'worker',
+          source: { kind: 'branch', ref: 'ticket' },
+          headSha: sha2,
+        },
+      ],
+    }
+    f.store.setSandbox(legacy as unknown as typeof record)
+    await f.core.recover()
+    const view = await f.core.status('SULF-1')
+    expect(view.members.map((m) => m.path)).toEqual([undefined, undefined])
+    expect(view.markdown).toContain('Sandbox SULF-1')
+    f.setHead(sha2)
+    f.runner.mockClear()
+    const result = await f.done(f.core.build('SULF-1', { actor: 'you' }))
+    expect(result.state).toBe('succeeded')
+    expect(
+      f.runner.mock.calls
+        .filter(([cmd, args]) => cmd === 'git' && args[0] === 'ls-files' && args[1] === '-co')
+        .map(([, , options]) => options?.cwd),
+    ).toEqual([f.repoPath, f.repoPath])
+    expect(f.store.getSandbox('SULF-1')?.members.map((m) => m.deployedSha)).toEqual([sha2, sha2])
+  })
+  it('keeps the path of a legacy worktree member recovered from its lease', async () => {
+    const f = fixture()
+    await f.done(await f.core.create({ key: 'SULF-1', actor: 'you', members: [input] }))
+    const record = f.store.getSandbox('SULF-1')
+    if (!record) throw new Error('missing sandbox')
+    const wt = join(root, 'wt')
+    const member = { ...record.members[0], source: { kind: 'worktree', path: wt } }
+    f.store.setSandbox({ ...record, members: [member] } as unknown as typeof record)
+    const lease = f.leases.get('slot1')
+    if (!lease) throw new Error('missing lease')
+    lease.data.members = JSON.stringify([member])
+    await f.core.recover()
+    expect(f.store.getSandbox('SULF-1')?.members[0]?.path).toBe(wt)
   })
   it('restores an expired snapshot into a free slot from recorded images without rebuilding', async () => {
     const f = fixture()

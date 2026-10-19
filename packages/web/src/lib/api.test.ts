@@ -4,7 +4,6 @@ import {
   buildSandbox,
   createSandbox,
   createTerminal,
-  discoverSandbox,
   fetchSandboxController,
   fetchSandboxLogs,
   fetchSandboxes,
@@ -73,24 +72,16 @@ describe('sandbox client', () => {
     vi.stubGlobal('fetch', fetch)
     await fetchSandboxes('box')
     await fetchSandboxController('box')
-    await discoverSandbox('SULF-1', '')
     expect(fetch.mock.calls.map((call) => call[0])).toEqual([
       '/instances/box/api/sandboxes',
       '/instances/box/api/sandboxes/controller',
-      '/sandboxes/SULF-1/discover',
     ])
   })
   it('signs every mutation as the ui actor with the right method and path', async () => {
     const fetch = okFetch({ operationId: 'op1' })
     vi.stubGlobal('fetch', fetch)
-    const pr = {
-      kind: 'pr' as const,
-      repoSlug: 'v/r',
-      number: 1,
-      url: 'https://github.com/v/r/pull/1',
-    }
     await createSandbox(
-      { key: 'SULF-1', members: [{ repo: 'r', workload: 'api', source: pr }] },
+      { key: 'SULF-1', members: [{ repo: 'r', workload: 'api', path: '/wt/r' }] },
       '',
     )
     await updateSandbox('SULF-1', { remove: [{ repo: 'r', workload: 'api' }] }, '')

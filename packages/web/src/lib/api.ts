@@ -602,24 +602,29 @@ export function sendResize(ws: WebSocket, cols: number, rows: number): void {
 
 // ---- sandboxes ----
 // Ticket sandboxes: a namespace slot leased from a pool, a set of members (one
-// repo workload each, built from a PR, branch or local worktree), woken and
-// slept as a unit. The personal sandbox is the kube context's own namespace,
+// repo workload each, built from an agent worktree or the repo's registered
+// checkout, uncommitted files included), woken and slept as a unit. The personal sandbox is the kube context's own namespace,
 // listed first. A successful build records a snapshot: the images each member
 // showed, restorable after expiry without a rebuild.
 
 export interface SandboxMemberInput {
   repo: string
   workload: string
-  source:
-    | { kind: 'pr'; repoSlug: string; number: number; url: string }
-    | { kind: 'branch'; ref: string }
-    | { kind: 'worktree'; path: string }
+  /** Absolute path of an agent worktree; omitted builds the repo's registered checkout. */
+  path?: string
+}
+/** Display only: the PR gh found for the built branch. */
+export interface SandboxPr {
+  number: number
+  url: string
 }
 export interface SandboxMember extends SandboxMemberInput {
   mode: 'built' | 'dev'
-  headSha?: string
+  /** Branch checked out at the last build; absent when detached. */
+  branch?: string
+  pr?: SandboxPr
   deployedSha?: string
-  /** Paths baked beyond deployedSha: a worktree's uncommitted changes. */
+  /** Paths baked beyond deployedSha: the checkout's uncommitted changes. */
   dirtyFiles?: string[]
   image?: string
   build: {
@@ -628,7 +633,6 @@ export interface SandboxMember extends SandboxMemberInput {
     startedAt?: number
     error?: string
   }
-  merged?: boolean
 }
 export interface SandboxSnapshotMember {
   repo: string
@@ -636,6 +640,8 @@ export interface SandboxSnapshotMember {
   sha: string
   dirtyFiles: string[]
   image: string
+  branch?: string
+  pr?: SandboxPr
 }
 export interface SandboxSnapshot {
   at: number
@@ -675,7 +681,6 @@ export interface SandboxView extends Sandbox {
   /** PR-body block describing what the sandbox shows. */
   markdown: string
   expiresAt: number
-  allMerged: boolean
   personal?: boolean
   pool: { slot: string; key?: string }[]
   /** Asleep sandbox a restore may evict; present only while the pool is full. */
@@ -724,9 +729,6 @@ export const fetchSandbox = (key: string, instance: string) =>
   sandboxRequest<SandboxView>(sandboxPath(key), instance)
 export const fetchSandboxController = (instance: string) =>
   sandboxRequest<SandboxControllerStatus>('/sandboxes/controller', instance)
-/** Open PRs whose head branch mentions the ticket key, one proposed member each. */
-export const discoverSandbox = (key: string, instance: string) =>
-  sandboxRequest<SandboxMemberInput[]>(`${sandboxPath(key)}/discover`, instance)
 export const createSandbox = (
   input: { key: string; title?: string; members: SandboxMemberInput[]; wake?: boolean },
   instance: string,
@@ -740,12 +742,8 @@ export const updateSandbox = (
     ...input,
     actor: UI_ACTOR,
   })
-/** Build every stale member, or one repo's; `force` rebuilds even when current. */
-export const buildSandbox = (
-  key: string,
-  input: { repo?: string; force?: boolean },
-  instance: string,
-) =>
+/** Rebuild every member, or one repo's, from its checkout's current files. */
+export const buildSandbox = (key: string, input: { repo?: string }, instance: string) =>
   sandboxRequest<SandboxOperation>(`${sandboxPath(key)}/build`, instance, 'POST', {
     ...input,
     actor: UI_ACTOR,

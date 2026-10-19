@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { RepoState, SandboxMemberInput } from './api'
-  import { memberSource } from './sandboxUi'
+  import { memberPath } from './sandboxUi'
 
   let {
     repos,
@@ -17,7 +17,7 @@
 
   let repo = $state('')
   let workload = $state('')
-  let source = $state('')
+  let path = $state('')
   let error = $state('')
 
   // Replicas are not sandbox members; the daemon validates against parents.
@@ -45,8 +45,9 @@
       return
     }
     try {
-      onadd({ repo, workload: activeWorkload, source: memberSource(source) })
-      source = ''
+      const worktree = memberPath(path)
+      onadd({ repo, workload: activeWorkload, ...(worktree ? { path: worktree } : {}) })
+      path = ''
     } catch (e) {
       error = e instanceof Error ? e.message : String(e)
     }
@@ -69,12 +70,12 @@
   </select>
   <input
     class="field mono"
-    aria-label="PR URL or branch"
-    placeholder="PR URL or branch"
-    bind:value={source}
+    aria-label="Checkout path"
+    placeholder="Worktree path (empty: repo checkout)"
+    bind:value={path}
     {disabled}
   />
-  <button class="btn" type="submit" disabled={disabled || !repo || !source.trim()}>Add</button>
+  <button class="btn" type="submit" disabled={disabled || !repo}>Add</button>
   {#if error}<span class="err" role="alert">{error}</span>{/if}
 </form>
 
