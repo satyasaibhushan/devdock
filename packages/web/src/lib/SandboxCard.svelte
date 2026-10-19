@@ -6,9 +6,8 @@
     cardAction,
     cardSentence,
     memberKey,
+    builtLabel,
     relativeTime,
-    shortSha,
-    showsCompare,
   } from './sandboxUi'
 
   // One sandbox as a snapshot card: ribbon, key, one sentence, what it shows,
@@ -31,8 +30,6 @@
 
   const action = $derived<CardAction>(cardAction(sandbox))
   const expired = $derived(sandbox.ribbon === 'expired' || sandbox.ribbon === 'expired restorable')
-  const snapshotMember = (m: { repo: string; workload: string }) =>
-    sandbox.members.find((c) => memberKey(c) === memberKey(m))
   const ribbonMeta = $derived(
     sandbox.personal
       ? sandbox.slot ?? ''
@@ -68,11 +65,11 @@
     <div class="shows">
       <div class="sh"><span>shows</span><span class="ago">by {sandbox.snapshot.actor}</span></div>
       {#each sandbox.snapshot.members as m (memberKey(m))}
-        {@const cmp = showsCompare(m, snapshotMember(m))}
         <div class="ln">
           <span class="repo" title="{m.repo} {m.workload}">{m.repo} <span class="wl">{m.workload}</span></span>
-          <span class="h" title={m.sha}>{shortSha(m.sha)}</span>
-          <span class="cmp {cmp.tone}" title={m.dirtyFiles.join('\n')}>{cmp.text}</span>
+          <span class="h" title={m.sha}>{builtLabel(m.branch, m.sha)}</span>
+          {#if m.pr}<a class="pr" href={m.pr.url} target="_blank" rel="noreferrer" title={m.pr.url}>PR #{m.pr.number}</a>{/if}
+          {#if m.dirtyFiles.length}<span class="dirty" title={m.dirtyFiles.join('\n')}>+{m.dirtyFiles.length} files</span>{/if}
         </div>
       {/each}
     </div>
@@ -82,8 +79,8 @@
       {#each sandbox.members as m (memberKey(m))}
         <div class="ln">
           <span class="repo" title="{m.repo} {m.workload}">{m.repo} <span class="wl">{m.workload}</span></span>
-          <span class="h" title={m.deployedSha}>{shortSha(m.deployedSha) || '-'}</span>
-          <span class="cmp none">{m.build.state === 'idle' ? (m.deployedSha ? '' : 'not built') : m.build.state}</span>
+          <span class="h" title={m.deployedSha}>{builtLabel(m.branch, m.deployedSha) || '-'}</span>
+          <span class="cmp">{m.build.state === 'idle' ? (m.deployedSha ? '' : 'not built') : m.build.state}</span>
         </div>
       {:else}
         <div class="ln"><span class="repo">no members</span></div>
@@ -223,39 +220,38 @@
     letter-spacing: 0;
   }
   .ln {
-    display: grid;
-    grid-template-columns: minmax(0, 1.5fr) 58px minmax(0, 1fr);
-    gap: 8px;
+    display: flex;
+    gap: 10px;
     padding: 2px 0;
+    white-space: nowrap;
   }
   .repo {
+    flex: 0 1 auto;
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
-    white-space: nowrap;
   }
   .wl {
     color: var(--muted);
   }
   .h {
-    color: var(--ink-2);
-  }
-  .cmp {
-    text-align: right;
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
-    white-space: nowrap;
+    color: var(--ink-2);
+  }
+  .pr {
     color: var(--accent);
+    text-decoration: none;
   }
-  .cmp.ok {
-    color: var(--ok);
+  .pr:hover {
+    text-decoration: underline;
   }
-  .cmp.warn {
-    color: var(--warn);
-  }
-  .cmp.dirty {
+  .dirty {
     color: var(--deployed);
   }
-  .cmp.none {
+  .cmp {
+    margin-left: auto;
     color: var(--muted);
   }
   .ft {

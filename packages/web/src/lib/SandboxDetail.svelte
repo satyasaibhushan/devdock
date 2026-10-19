@@ -17,7 +17,7 @@
   import Icon from './Icon.svelte'
   import SandboxLogs from './SandboxLogs.svelte'
   import SandboxMemberForm from './SandboxMemberForm.svelte'
-  import { expiryLabel, memberBuildState, memberKey, memberStale, relativeTime, shortSha, sourceLabel } from './sandboxUi'
+  import { builtLabel, checkoutLabel, expiryLabel, memberBuildState, memberKey, relativeTime } from './sandboxUi'
 
   let {
     sandbox,
@@ -119,7 +119,7 @@
   const act = (action: SandboxAction) => run(() => sandboxAction(sandbox.key, action, instance))
   const buildAll = () => run(() => buildSandbox(sandbox.key, {}, instance))
   const buildRepo = (m: SandboxMember) =>
-    run(() => buildSandbox(sandbox.key, { repo: m.repo, force: true }, instance))
+    run(() => buildSandbox(sandbox.key, { repo: m.repo }, instance))
   const remove = (m: SandboxMember) =>
     run(() =>
       updateSandbox(sandbox.key, { remove: [{ repo: m.repo, workload: m.workload }] }, instance),
@@ -147,7 +147,7 @@
   <div class="actions">
     <button
       class="btn"
-      title="Build stale members, then scale every deployment up"
+      title="Scale every deployment up"
       disabled={locked || expired || sandbox.power === 'awake'}
       onclick={() => act('wake')}
     >Wake</button>
@@ -159,7 +159,7 @@
     >Sleep</button>
     <button
       class="btn primary"
-      title={expired ? 'Lease a slot and build every member' : 'Build members whose head moved'}
+      title={expired ? 'Lease a slot and build every member' : 'Build every member from its checkout'}
       disabled={locked || sandbox.members.length === 0}
       onclick={buildAll}
     >{expired ? 'Rebuild' : 'Build'}</button>
@@ -177,7 +177,6 @@
   {#if sandbox.slot}<span class="fact mono" title="namespace slot"><Icon name="layers" size={12} />{sandbox.slot}</span>{/if}
   {#if sandbox.power !== 'unknown'}<span class="fact">{sandbox.power}</span>{/if}
   <span class="fact" class:due={!!sandbox.slot && sandbox.expiresAt <= now}>{expiryLabel(sandbox, now)}</span>
-  {#if sandbox.allMerged}<span class="fact ok"><Icon name="check" size={12} />all merged</span>{/if}
   {#if operation && (operationActive || (operation.state !== 'succeeded' && dismissedOperation !== operation.id))}
     <details class="operation">
       <summary class:failed={!operationActive}>
@@ -221,8 +220,7 @@
     <thead>
       <tr>
         <th>Repo</th>
-        <th>Source</th>
-        <th>Head</th>
+        <th>Checkout</th>
         <th>Deployed</th>
         <th>Build</th>
         <th><span class="sr">Actions</span></th>
@@ -230,7 +228,6 @@
     </thead>
     <tbody>
       {#each sandbox.members as m (memberKey(m))}
-        {@const stale = memberStale(m)}
         <tr class:picked={picked === m}>
           <td>
             <button class="repo" title="Show logs for {m.repo} {m.workload}" aria-pressed={picked === m} onclick={() => onselect(memberKey(m))}>
@@ -238,29 +235,23 @@
               <span class="wl">{m.workload}</span>
             </button>
           </td>
+          <td class="mono"><span title={m.path ?? "The repo's registered checkout"}>{checkoutLabel(m)}</span></td>
           <td class="mono">
-            {#if m.source.kind === 'pr'}
-              <a href={m.source.url} target="_blank" rel="noreferrer" title={m.source.url}>{sourceLabel(m.source)}</a>
-            {:else if m.source.kind === 'branch'}<span title="branch {m.source.ref}">{m.source.ref}</span>
-            {:else}<span title={m.source.path}>{sourceLabel(m.source)}</span>{/if}
-            {#if m.merged}<span class="merged">merged</span>{/if}
-          </td>
-          <td class="mono"><span title={m.headSha}>{shortSha(m.headSha) || '·'}</span></td>
-          <td class="mono">
-            <span title={m.deployedSha}>{shortSha(m.deployedSha) || '·'}</span>
-            {#if stale && m.build.state === 'idle'}<span class="stale" title="deployed code is behind the head">stale</span>{/if}
+            <span title={m.deployedSha}>{builtLabel(m.branch, m.deployedSha) || '·'}</span>
+            {#if m.pr}<a class="pr" href={m.pr.url} target="_blank" rel="noreferrer" title={m.pr.url}>PR #{m.pr.number}</a>{/if}
+            {#if m.dirtyFiles?.length}<span class="dirty" title={m.dirtyFiles.join('\n')}>+{m.dirtyFiles.length} files</span>{/if}
           </td>
           <td>
-            <span class="bst {m.build.state}" class:stale={stale && m.build.state === 'idle'}>{memberBuildState(m) === 'ready' ? 'current' : memberBuildState(m)}</span>
+            <span class="bst {m.build.state}">{memberBuildState(m)}</span>
             {#if m.build.error}<span class="berr" title={m.build.error}>{m.build.error}</span>{/if}
           </td>
           <td class="ops">
-            <button class="btn sm" title="Rebuild {m.repo} at its head" disabled={locked || expired || m.merged} onclick={() => buildRepo(m)}>Build</button>
+            <button class="btn sm" title="Rebuild {m.repo} from its checkout" disabled={locked || expired} onclick={() => buildRepo(m)}>Build</button>
             <button class="btn sm quiet" title="Remove {m.repo} {m.workload} from the sandbox" disabled={locked} onclick={() => remove(m)}>Remove</button>
           </td>
         </tr>
       {:else}
-        <tr><td colspan="6" class="muted">No members. Add a repo to build.</td></tr>
+        <tr><td colspan="5" class="muted">No members. Add a repo to build.</td></tr>
       {/each}
     </tbody>
   </table>
@@ -315,7 +306,7 @@
   </div>
 </div>
 
-<footer class="controller" title="The one daemon that polls heads, sleeps idle sandboxes and expires old ones">
+<footer class="controller" title="The one daemon that sleeps idle sandboxes and expires old ones">
   {#if !controller}controller status unavailable
   {:else}
     controller: {leader ? `${leader}${controller.isLeader ? ' (this machine)' : ''}` : 'no leader'}
@@ -400,9 +391,6 @@
   .fact.mono {
     font-family: var(--mono);
     font-size: 12.5px;
-  }
-  .fact.ok {
-    color: var(--ok);
   }
   .fact.due {
     color: var(--warn);
@@ -668,20 +656,13 @@
     color: var(--muted);
     background: color-mix(in srgb, var(--muted) 14%, transparent);
   }
-  .merged {
+  .pr,
+  .dirty {
     margin-left: 7px;
-    font-family: var(--sans);
-    font-size: 11px;
-    padding: 1px 5px;
-    border-radius: var(--r-1);
-    color: var(--ok);
-    background: color-mix(in srgb, var(--ok) 14%, transparent);
+    font-size: 11.5px;
   }
-  .stale {
-    margin-left: 6px;
-    font-family: var(--sans);
-    font-size: 11px;
-    color: var(--warn);
+  .dirty {
+    color: var(--deployed);
   }
   .bst {
     font-size: 12px;
@@ -695,9 +676,6 @@
   }
   .bst.failed {
     color: var(--danger);
-  }
-  .bst.stale {
-    color: var(--warn);
   }
   .berr {
     display: block;

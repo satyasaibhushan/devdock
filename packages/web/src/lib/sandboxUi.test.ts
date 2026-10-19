@@ -2,23 +2,21 @@ import { describe, expect, it } from 'vitest'
 import type { SandboxMember, SandboxView } from './api'
 import {
   applySandboxEvent,
+  builtLabel,
   cardAction,
   cardSentence,
+  checkoutLabel,
   expiryLabel,
   memberBuildState,
   memberKey,
-  memberSource,
-  memberStale,
+  memberPath,
   relativeTime,
   selectedMember,
-  showsCompare,
-  sourceLabel,
 } from './sandboxUi'
 
 const member = (over: Partial<SandboxMember> = {}): SandboxMember => ({
   repo: 'acs-org',
   workload: 'api',
-  source: { kind: 'branch', ref: 'SULF-1' },
   mode: 'built',
   build: { state: 'idle' },
   ...over,
@@ -39,37 +37,16 @@ const view = (over: Partial<SandboxView> = {}): SandboxView => ({
   markdown: '',
   pool: [{ slot: 'sandbox-a', key: 'SULF-1' }],
   expiresAt: 1_000 + 3_600_000,
-  allMerged: false,
   ...over,
 })
 
-describe('memberSource', () => {
-  it('parses a GitHub PR URL into a PR source', () => {
-    expect(memberSource(' https://github.com/vmockinc/acs-org/pull/42/ ')).toEqual({
-      kind: 'pr',
-      repoSlug: 'vmockinc/acs-org',
-      number: 42,
-      url: 'https://github.com/vmockinc/acs-org/pull/42',
-    })
+describe('memberPath', () => {
+  it('treats an empty field as the repo checkout and trims a path', () => {
+    expect(memberPath('  ')).toBeUndefined()
+    expect(memberPath(' /w/app ')).toBe('/w/app')
   })
-  it('treats anything that is not a URL as a branch ref', () => {
-    expect(memberSource('feature/SULF-1')).toEqual({ kind: 'branch', ref: 'feature/SULF-1' })
-  })
-  it('rejects empty input, option-like refs and non-PR URLs', () => {
-    expect(() => memberSource('  ')).toThrow('Enter a PR URL or branch')
-    expect(() => memberSource('--force')).toThrow('Enter a PR URL or branch')
-    expect(() => memberSource('https://github.com/vmockinc/acs-org')).toThrow('GitHub PR URL')
-    expect(() => memberSource('http://github.com/v/r/pull/1')).toThrow('GitHub PR URL')
-    expect(() => memberSource('https://gitlab.com/v/r/pull/1')).toThrow('GitHub PR URL')
-  })
-})
-
-describe('memberStale', () => {
-  it('is stale until the head is deployed, never once merged', () => {
-    expect(memberStale(member({ headSha: 'a' }))).toBe(true)
-    expect(memberStale(member({ headSha: 'a', deployedSha: 'b' }))).toBe(true)
-    expect(memberStale(member({ headSha: 'a', deployedSha: 'a' }))).toBe(false)
-    expect(memberStale(member({ headSha: 'a', deployedSha: 'b', merged: true }))).toBe(false)
+  it('rejects a relative path', () => {
+    expect(() => memberPath('w/app')).toThrow('absolute')
   })
 })
 
@@ -94,19 +71,14 @@ describe('applySandboxEvent', () => {
     ])
   })
   it('keeps cluster-derived fields and slides expiry with lastUsedAt', () => {
-    const { power: _p, urls: _u, expiresAt: _e, allMerged: _m, ...record } = view()
-    const [next] = applySandboxEvent([view()], {
-      ...record,
-      lastUsedAt: 2_000,
-      members: [member({ merged: true })],
-    })
+    const { power: _p, urls: _u, expiresAt: _e, ...record } = view()
+    const [next] = applySandboxEvent([view()], { ...record, lastUsedAt: 2_000 })
     expect(next?.power).toBe('awake')
     expect(next?.urls).toEqual(['https://a.example'])
     expect(next?.expiresAt).toBe(2_000 + 3_600_000)
-    expect(next?.allMerged).toBe(true)
   })
   it('appends an unknown sandbox with placeholder view fields', () => {
-    const { power: _p, urls: _u, expiresAt: _e, allMerged: _m, ...record } = view({ key: 'NEW' })
+    const { power: _p, urls: _u, expiresAt: _e, ...record } = view({ key: 'NEW' })
     const list = applySandboxEvent([view()], record)
     expect(list.map((s) => s.key)).toEqual(['SULF-1', 'NEW'])
     expect(list[1]).toMatchObject({
@@ -121,33 +93,12 @@ describe('applySandboxEvent', () => {
 })
 
 describe('snapshot cards', () => {
-  const saved = {
-    repo: 'acs-org',
-    workload: 'api',
-    sha: 'a'.repeat(40),
-    dirtyFiles: [],
-    image: 'i',
-  }
-  it('compares a snapshot row with its source head, dirty files first', () => {
-    expect(showsCompare(saved, member({ headSha: saved.sha }))).toEqual({
-      text: '= branch head',
-      tone: 'ok',
-    })
-    expect(showsCompare(saved, member({ headSha: 'b'.repeat(40) }))).toEqual({
-      text: 'behind branch head',
-      tone: 'warn',
-    })
-    expect(showsCompare({ ...saved, dirtyFiles: ['x'] }, member({ headSha: saved.sha }))).toEqual({
-      text: '+1 file',
-      tone: 'dirty',
-    })
-    expect(
-      showsCompare(
-        saved,
-        member({ headSha: saved.sha, source: { kind: 'worktree', path: '/w/app' } }),
-      ),
-    ).toEqual({ text: '', tone: 'none' })
-    expect(sourceLabel({ kind: 'worktree', path: '/w/app/' })).toBe('worktree app')
+  it('labels what a member builds from and what it baked', () => {
+    expect(checkoutLabel({})).toBe('repo checkout')
+    expect(checkoutLabel({ path: '/w/app/' })).toBe('app')
+    expect(builtLabel('SULF-1-fix', 'a'.repeat(40))).toBe('SULF-1-fix @ aaaaaaa')
+    expect(builtLabel(undefined, 'a'.repeat(40))).toBe('aaaaaaa')
+    expect(builtLabel('SULF-1-fix', undefined)).toBe('')
   })
   it('picks one primary action per ribbon', () => {
     expect(cardAction(view())).toBe('open')
@@ -169,16 +120,13 @@ describe('snapshot cards', () => {
 })
 
 describe('memberBuildState', () => {
-  it('prioritizes build progress and failure over stale code', () => {
-    for (const state of ['queued', 'building', 'failed'] as const) {
-      expect(memberBuildState(member({ build: { state }, headSha: 'a' }))).toBe(state)
-    }
+  it('prioritizes build progress and failure', () => {
+    for (const state of ['queued', 'building', 'failed'] as const)
+      expect(memberBuildState(member({ build: { state }, deployedSha: 'a' }))).toBe(state)
   })
-  it('distinguishes undeployed, stale, current and merged members', () => {
-    expect(memberBuildState(member())).toBe('stale')
-    expect(memberBuildState(member({ headSha: 'a', deployedSha: 'b' }))).toBe('stale')
-    expect(memberBuildState(member({ headSha: 'a', deployedSha: 'a' }))).toBe('ready')
-    expect(memberBuildState(member({ merged: true }))).toBe('ready')
+  it('distinguishes undeployed and deployed members', () => {
+    expect(memberBuildState(member())).toBe('not built')
+    expect(memberBuildState(member({ deployedSha: 'a' }))).toBe('ready')
   })
 })
 
