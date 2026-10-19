@@ -9,6 +9,7 @@ import {
   imageDigest,
   parallelMembers,
   pinSandboxBases,
+  sandboxArchitecture,
   sandboxCacheTag,
   sandboxImageKey,
   sandboxRestart,
@@ -75,7 +76,7 @@ describe('sandbox image inputs', () => {
   it('rejects missing bases and unsupported FROM flags', async () => {
     await expect(
       pinSandboxBases('FROM registry/base:latest', {}, async () => undefined),
-    ).rejects.toThrow('not found')
+    ).rejects.toThrow('Sandbox base image not found: registry/base:latest')
     await expect(
       pinSandboxBases('FROM --platform=linux/amd64 base', {}, async () => undefined),
     ).rejects.toThrow('flags')
@@ -178,4 +179,59 @@ it('refuses build flags that can read inputs outside the fingerprinted context',
   await expect(
     sandboxImageKey({ ...image, buildKit: { args: ['--secret=id=env,src=/elsewhere/env'] } }, root),
   ).rejects.toThrow('external')
+})
+
+it('separates Docker builder architectures in image keys', async () => {
+  expect(await sandboxImageKey(image, root, 'linux/arm64')).not.toBe(
+    await sandboxImageKey(image, root, 'linux/amd64'),
+  )
+})
+
+it.each([
+  'COPY --from=registry/image:latest /app /app',
+  'COPY --from=0 /app /app',
+  'COPY --from=later /app /app\nFROM scratch AS later',
+  'RUN --mount=type=bind,from=registry/image:latest,target=/app echo ok',
+  'RUN --mount=type=bind,\\\nfrom=external,target=/app echo ok',
+  'ADD https://example.com/app.tar.gz /app',
+  'ADD ["http://example.com/app.tar.gz", "/app"]',
+  'ADD git@github.com:team/app.git /app',
+  'ADD git://github.com/team/app.git /app',
+  'ADD ssh://git@example.com/app.git /app',
+  'RUN --mount="from=external,type=bind,target=/app" echo ok',
+])('rejects unfingerprinted Dockerfile sources: %s', async (instruction) => {
+  const source = `FROM scratch AS builder\n${instruction}\n`
+  writeFileSync(join(root, 'Dockerfile'), source)
+  await expect(sandboxImageKey(image, root)).rejects.toThrow(/Unsupported/)
+  await expect(pinSandboxBases(source, {}, async () => undefined)).rejects.toThrow(/Unsupported/)
+})
+
+it('accepts pinned ECR bases, local copies and stage-local copy and mount sources', async () => {
+  const source = `ARG AWS_ACCOUNT_ID
+ARG AWS_REGION
+FROM \${AWS_ACCOUNT_ID}.dkr.ecr.\${AWS_REGION}.amazonaws.com/base/php:latest AS builder
+COPY . /app
+ADD ["local.tar.gz", "/app"]
+FROM scratch AS app
+COPY --from=builder /app /app
+RUN --mount=type=bind,from=builder,target=/app echo ok
+`
+  const pinned = await pinSandboxBases(
+    source,
+    {
+      AWS_ACCOUNT_ID: '123456789012',
+      AWS_REGION: 'us-east-1',
+    },
+    async () => `sha256:${'a'.repeat(64)}`,
+  )
+  writeFileSync(join(root, 'Dockerfile'), pinned)
+  expect(await sandboxImageKey(image, root)).toMatch(/^sb-/)
+})
+
+it('reads Docker server architecture from pipeline output and rejects absent or malformed results', () => {
+  expect(sandboxArchitecture('info Selecting namespace\ninfo SANDBOX_ARCH=linux/arm64\n')).toBe(
+    'linux/arm64',
+  )
+  expect(() => sandboxArchitecture('linux/amd64')).toThrow('Cannot determine')
+  expect(() => sandboxArchitecture('SANDBOX_ARCH=<no value>')).toThrow('Cannot determine')
 })

@@ -12,6 +12,7 @@ import {
   imageDigest,
   parallelMembers,
   pinSandboxBases,
+  sandboxArchitecture,
   sandboxCacheTag,
   sandboxImageKey,
   sandboxImagePipeline,
@@ -683,6 +684,11 @@ export class Sandboxes {
     const doc = parseDocument(readFileSync(sourcePath, 'utf8'))
     const chart = m.workload === 'ui' ? 'web' : m.workload
     doc.setIn(['pipelines', 'sandbox-image', 'run'], sandboxImagePipeline)
+    doc.setIn(
+      ['pipelines', 'sandbox-architecture', 'run'],
+      `architecture=$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}') || exit 1
+echo "SANDBOX_ARCH=$architecture"`,
+    )
     for (const variable of ['SANDBOX_REGISTRY', 'SANDBOX_REPOSITORY', 'SANDBOX_TAG'])
       doc.setIn(['vars', variable], '')
     doc.setIn(
@@ -852,8 +858,12 @@ export class Sandboxes {
       },
       'image',
     )
-    if (result.code !== 0) throw new Error('Sandbox ECR lookup failed')
-    return imageDigest(result.stdout)
+    if (result.code !== 0) throw new Error(`Sandbox ECR lookup failed for ${image}:${tag}`)
+    try {
+      return imageDigest(result.stdout)
+    } catch {
+      throw new Error(`Sandbox ECR lookup failed for ${image}:${tag}: invalid response`)
+    }
   }
   private async prepareImage(repo: Repo, member: SandboxMember): Promise<string> {
     const printed = await this.deps.supervisor.sandbox(repo, 'print')
@@ -863,21 +873,31 @@ export class Sandboxes {
       throw new Error('Sandbox requires exactly one app image')
     const image = effective.images.app
     if (typeof image.image !== 'string') throw new Error('Invalid sandbox image repository')
-    const cache = `${image.image}:${sandboxCacheTag(member.repo, member.workload)}`
-    // Pin the effective build settings; IMAGE_TAG must only affect the output tag.
-    const buildArgs = image.buildKit?.args ?? []
-    image.buildKit = {
-      ...image.buildKit,
-      args: [
-        // Sandbox nodes use amd64; pin it so host builder architecture cannot
-        // change the image behind an otherwise identical key.
-        ...(buildArgs.some((a) => a === '--platform' || a.startsWith('--platform='))
-          ? []
-          : ['--platform=linux/amd64']),
-        ...buildArgs.filter((a) => !a.startsWith('--cache-to') && !a.startsWith('--cache-from')),
-        `--cache-to=mode=max,image-manifest=true,oci-mediatypes=true,type=registry,ref=${cache}`,
-        `--cache-from=type=registry,ref=${cache}`,
-      ],
+    let architecture: string | undefined
+    // Preserve the printed builder. Registry cache exports require BuildKit.
+    if (image.buildKit) {
+      const cache = `${image.image}:${sandboxCacheTag(member.repo, member.workload)}`
+      const buildArgs = image.buildKit.args ?? []
+      image.buildKit = {
+        ...image.buildKit,
+        args: [
+          ...(buildArgs.some((a) => a === '--platform' || a.startsWith('--platform='))
+            ? []
+            : ['--platform=linux/amd64']),
+          ...buildArgs.map((arg, i) => {
+            if (
+              !/^--cache-(?:to|from)(?:=|$)/.test(arg) &&
+              !/^--cache-(?:to|from)$/.test(buildArgs[i - 1] ?? '')
+            )
+              return arg
+            return arg.replace(/\bref=[^,]+/, `ref=${cache}`)
+          }),
+        ],
+      }
+    } else {
+      const result = await this.deps.supervisor.sandbox(repo, 'architecture')
+      if (result.code !== 0) throw new Error('Cannot determine sandbox Docker builder architecture')
+      architecture = sandboxArchitecture(result.stdout)
     }
     const dockerfile = resolve(repo.path, image.dockerfile ?? 'Dockerfile')
     const checkout = realpathSync(repo.root ?? repo.path)
@@ -892,7 +912,7 @@ export class Sandboxes {
         this.queryImage(repo, base, tag),
       ),
     )
-    const tag = await sandboxImageKey(image, repo.path)
+    const tag = await sandboxImageKey(image, repo.path, architecture)
     image.tags = [`${tag}-persistent`]
     repo.varDefaults = { ...repo.varDefaults, IMAGE_TAG: tag }
     const doc = parseDocument(readFileSync(repo.configPath, 'utf8'))

@@ -174,7 +174,7 @@ export class Supervisor {
 
   sandbox(
     repo: Repo,
-    action: 'sync' | 'deploy' | 'reset' | 'print' | 'image',
+    action: 'sync' | 'deploy' | 'reset' | 'print' | 'image' | 'architecture',
     awake = false,
     skipBuild = false,
   ): Promise<RunResult> {
@@ -200,7 +200,9 @@ export class Supervisor {
             ? 'print --skip-info -p persistent -p sandbox'
             : action === 'image'
               ? 'run-pipeline sandbox-image'
-              : `deploy -p persistent -p sandbox${skipBuild ? ' --skip-build' : ''}`
+              : action === 'architecture'
+                ? 'run-pipeline sandbox-architecture'
+                : `deploy -p persistent -p sandbox${skipBuild ? ' --skip-build' : ''}`
     return this.runner(loginShell, [loginShellArgs, devspaceCommand(target, verb)])
   }
 

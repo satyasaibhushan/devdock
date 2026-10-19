@@ -21,7 +21,11 @@ const excluded = (name: string) =>
 /** Hash a superset of Docker's context, including ignored/generated files. Extra
  * misses are safe; implementing a second, subtly different dockerignore isn't.
  * The only omitted files are explicitly excluded from Docker's context too. */
-export async function sandboxImageKey(image: SandboxImage, cwd: string): Promise<string> {
+export async function sandboxImageKey(
+  image: SandboxImage,
+  cwd: string,
+  architecture?: string,
+): Promise<string> {
   // These can read files or credentials outside the hashed context. Fail closed
   // until their inputs can be fingerprinted, rather than reuse an unrelated image.
   if (
@@ -35,6 +39,7 @@ export async function sandboxImageKey(image: SandboxImage, cwd: string): Promise
     throw new Error('Sandbox build args must have explicit values')
   const context = resolve(cwd, image.context ?? '.')
   const dockerfile = resolve(cwd, image.dockerfile ?? 'Dockerfile')
+  validateSandboxDockerfile(await readFile(dockerfile, 'utf8'))
   const ignore = `${dockerfile}.dockerignore`
   for (const path of [join(context, '.dockerignore'), ...(existsSync(ignore) ? [ignore] : [])]) {
     if (existsSync(path) && lstatSync(path).isSymbolicLink())
@@ -50,7 +55,7 @@ export async function sandboxImageKey(image: SandboxImage, cwd: string): Promise
   const hash = createHash('sha256')
   const add = (value: unknown) => hash.update(JSON.stringify(value)).update('\0')
   const { tags, buildKit, context: _context, dockerfile: _dockerfile, ...settings } = image
-  add(stable({ ...settings, dockerfile: relative(context, dockerfile), buildKit }))
+  add(stable({ ...settings, dockerfile: relative(context, dockerfile), buildKit, architecture }))
   // Docker always reads the Dockerfile, even when .dockerignore excludes it.
   add(await readFile(dockerfile))
   async function walk(path: string): Promise<void> {
@@ -189,7 +194,7 @@ if [ "$code" -eq 0 ]; then
 elif printf '%s' "$result" | grep -q '(ImageNotFoundException)'; then
   echo SANDBOX_IMAGE=missing
 else
-  echo 'Sandbox ECR lookup failed' >&2
+  echo "Sandbox ECR lookup failed for \${SANDBOX_REPOSITORY}:\${SANDBOX_TAG}" >&2
   exit "$code"
 fi
 `
@@ -213,12 +218,22 @@ export function imageDigest(output: string): string | undefined {
   return result === 'missing' ? undefined : result
 }
 
+/** DevSpace may prefix pipeline output with log levels and ANSI sequences. */
+export function sandboxArchitecture(output: string): string {
+  const architecture = /\bSANDBOX_ARCH=([a-z0-9]+\/[a-z0-9_]+)\s*$/m.exec(
+    output.split('\n').map(cleanLine).join('\n'),
+  )?.[1]
+  if (!architecture) throw new Error('Cannot determine sandbox Docker builder architecture')
+  return architecture
+}
+
 /** Resolve FROM args and pin mutable base tags before hashing/building. */
 export async function pinSandboxBases(
   dockerfile: string,
   args: Record<string, string>,
   digest: (image: string, tag: string) => Promise<string | undefined>,
 ): Promise<string> {
+  validateSandboxDockerfile(dockerfile)
   const vars: Record<string, string> = {}
   const stages = new Set<string>()
   const lines = dockerfile.split('\n')
@@ -239,10 +254,40 @@ export async function pinSandboxBases(
       const image = colon > source.lastIndexOf('/') ? source.slice(0, colon) : source
       const tag = colon > source.lastIndexOf('/') ? source.slice(colon + 1) : 'latest'
       const found = await digest(image, tag)
-      if (!found) throw new Error('Sandbox base image not found')
+      if (!found) throw new Error(`Sandbox base image not found: ${image}:${tag}`)
       lines[i] = `${from[1]}${image}@${found}${from[3]}`
     }
     if (stage) stages.add(stage.toLowerCase())
   }
   return lines.join('\n')
+}
+
+/** These sources bypass the hashed context and pinned FROM images. */
+function validateSandboxDockerfile(dockerfile: string): void {
+  if (/^#\s*escape\s*=\s*`/im.test(dockerfile))
+    throw new Error('Unsupported sandbox Dockerfile escape directive')
+  const stages = new Set<string>()
+  for (const line of dockerfile.replace(/\\\r?\n/g, '').split(/\r?\n/)) {
+    const instruction = /^\s*(\w+)\s+(.*)$/.exec(line)
+    if (!instruction) continue
+    const command = instruction[1]?.toUpperCase()
+    const body = instruction[2] ?? ''
+    if (command === 'COPY' || command === 'RUN') {
+      const sources =
+        command === 'COPY'
+          ? [...body.matchAll(/--from(?:=|\s+)([^\s]+)/gi)].map((m) => m[1] ?? '')
+          : [...body.matchAll(/--mount(?:=|\s+)([^\s]+)/gi)].flatMap((m) =>
+              [...(m[1] ?? '').matchAll(/\bfrom=([^,]+)/gi)].map((v) => v[1] ?? ''),
+            )
+      for (const source of sources)
+        if (!stages.has(source.toLowerCase()))
+          throw new Error(`Unsupported external sandbox ${command} source: ${source}`)
+    }
+    if (command === 'ADD' && /(?:https?:\/\/|git:\/\/|ssh:\/\/|git@)/i.test(body))
+      throw new Error('Unsupported remote sandbox ADD source')
+    if (command === 'FROM') {
+      const stage = /\s+AS\s+(\S+)\s*$/i.exec(body)?.[1]
+      if (stage) stages.add(stage.toLowerCase())
+    }
+  }
 }

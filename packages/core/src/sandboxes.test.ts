@@ -108,7 +108,9 @@ function fixture(instanceId = 'machine1') {
         ? 'images:\n  app:\n    image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/devspace\n    context: .\n    dockerfile: Dockerfile\n'
         : action === 'image'
           ? 'SANDBOX_IMAGE=missing\n'
-          : '',
+          : action === 'architecture'
+            ? 'info SANDBOX_ARCH=linux/arm64\n'
+            : '',
     stderr: '',
   })
   const sandbox = vi.spyOn(supervisor, 'sandbox').mockImplementation(sandboxResult)
@@ -530,7 +532,11 @@ it('finishes other members and mirrors every failure without configmap conflicts
     release = resolve
   })
   f.sandbox.mockImplementation(async (repo, action) => {
-    if (action !== 'deploy') return f.sandboxResult(repo, action)
+    if (action !== 'deploy') {
+      const result = await f.sandboxResult(repo, action)
+      if (action === 'print') result.stdout += `    buildArgs:\n      WORKLOAD: ${repo.name}\n`
+      return result
+    }
     started.push(repo.name)
     if (repo.name === 'app-api') {
       await gate
@@ -575,6 +581,73 @@ it('deploys an existing ECR image with skip-build and freezes effective build se
   if (!repo) throw new Error('missing deployed repo')
   const text = readFileSync(repo.configPath, 'utf8')
   expect(text).toContain(`- ${repo.varDefaults?.IMAGE_TAG}-persistent`)
-  expect(text).toContain('sb-cache-')
+  expect(text).not.toContain('buildKit:')
+  expect(text).not.toContain('sb-cache-')
   expect(text).not.toContain('slot1-persistent-cache')
+})
+
+it.each(['linux/arm64', 'linux/amd64', '', 'not an architecture'])(
+  'fingerprints Docker architecture and fails closed for invalid output: %s',
+  async (architecture) => {
+    const f = fixture()
+    f.sandbox.mockImplementation(async (repo, action) =>
+      action === 'architecture'
+        ? { code: 0, stdout: `info SANDBOX_ARCH=${architecture}\n`, stderr: '' }
+        : f.sandboxResult(repo, action),
+    )
+    const result = await f.done(
+      await f.core.create({ key: 'arch', actor: 'you', members: [input] }),
+    )
+    expect(result.state).toBe(architecture.startsWith('linux/') ? 'succeeded' : 'failed')
+    if (result.state === 'failed') {
+      expect(result.logs.at(-1)?.message).toContain('Docker builder architecture')
+      expect(f.sandbox.mock.calls.some((c) => c[1] === 'deploy')).toBe(false)
+    }
+  },
+)
+
+it('preserves the existing BuildKit builder and cache options while stabilizing refs', async () => {
+  const f = fixture()
+  f.sandbox.mockImplementation(async (repo, action) => {
+    const result = await f.sandboxResult(repo, action)
+    if (action === 'print')
+      result.stdout += `    buildKit:
+      inCluster:
+        namespace: builders
+      args:
+        - --cache-to=type=registry,mode=max,ref=old-slot-cache
+        - --cache-from
+        - type=registry,ref=old-slot-cache
+`
+    return result
+  })
+  const result = await f.done(await f.core.create({ key: 'kit', actor: 'you', members: [input] }))
+  expect(result.state).toBe('succeeded')
+  const repo = f.sandbox.mock.calls.find((c) => c[1] === 'deploy')?.[0]
+  if (!repo) throw new Error('missing deployed repo')
+  const text = readFileSync(repo.configPath, 'utf8')
+  expect(text).toContain('namespace: builders')
+  expect(text).toContain('--platform=linux/amd64')
+  expect(text).toContain(
+    'type=registry,mode=max,ref=123456789012.dkr.ecr.us-east-1.amazonaws.com/devspace:sb-cache-',
+  )
+  expect(text).not.toContain('old-slot-cache')
+  expect(f.sandbox.mock.calls.some((c) => c[1] === 'architecture')).toBe(false)
+})
+
+it('names the image and tag when an ECR lookup fails', async () => {
+  const f = fixture()
+  f.sandbox.mockImplementation(async (repo, action) =>
+    action === 'image'
+      ? { code: 1, stdout: '', stderr: 'AccessDeniedException' }
+      : f.sandboxResult(repo, action),
+  )
+  const result = await f.done(
+    await f.core.create({ key: 'denied', actor: 'you', members: [input] }),
+  )
+  expect(result.state).toBe('failed')
+  expect(result.logs.at(-1)?.message).toMatch(
+    /lookup failed for .*\/devspace:sb-[a-f0-9]+-persistent/,
+  )
+  expect(f.sandbox.mock.calls.some((c) => c[1] === 'deploy')).toBe(false)
 })
