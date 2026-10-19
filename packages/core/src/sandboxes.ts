@@ -1,10 +1,23 @@
 import { createHash } from 'node:crypto'
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
-import { dirname, join, relative, resolve } from 'node:path'
-import { parseDocument } from 'yaml'
+import { existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
+import { parse, parseDocument } from 'yaml'
 import type { RunResult } from './exec.js'
 import type { Operations } from './operations.js'
 import { replicaCheckoutPath } from './replicas.js'
+import {
+  type SandboxImage,
+  SandboxImageBuilds,
+  ecrQuery,
+  imageDigest,
+  parallelMembers,
+  pinSandboxBases,
+  sandboxArchitecture,
+  sandboxCacheTag,
+  sandboxImageKey,
+  sandboxImagePipeline,
+  sandboxRestart,
+} from './sandboxImages.js'
 import type { StateStore } from './stateStore.js'
 import type { Supervisor } from './supervisor.js'
 import type { Repo } from './types.js'
@@ -108,6 +121,9 @@ interface SandboxDeps {
 /** Sandbox lifecycle owns slot claims and serializes mutations. The controller only schedules it. */
 export class Sandboxes {
   private tasks = new Map<string, Promise<void>>()
+  private gitTasks = new Map<string, Promise<void>>()
+  private mirrors = new Map<string, Promise<void>>()
+  private imageBuilds = new SandboxImageBuilds()
   private active = new Map<string, string>()
   constructor(private readonly deps: SandboxDeps) {}
 
@@ -208,8 +224,20 @@ export class Sandboxes {
       throw new Error('Sandbox operation ownership changed')
     return lease
   }
-  private async mirror(s: Sandbox, expected?: Lease): Promise<void> {
-    const lease = expected ?? (await this.owned(s))
+  private async mirror(s: Sandbox): Promise<void> {
+    // Saves are synchronous on the shared record. Queue the read/patch pair so
+    // parallel members and controller updates cannot race resourceVersion.
+    const previous = this.mirrors.get(s.key) ?? Promise.resolve()
+    const task = previous.catch(() => undefined).then(() => this.writeMirror(s))
+    this.mirrors.set(s.key, task)
+    try {
+      await task
+    } finally {
+      if (this.mirrors.get(s.key) === task) this.mirrors.delete(s.key)
+    }
+  }
+  private async writeMirror(s: Sandbox): Promise<void> {
+    const lease = await this.owned(s)
     await this.checked('kubectl', [
       'patch',
       'configmap',
@@ -655,6 +683,14 @@ export class Sandboxes {
     const sourcePath = resolve(path, relative(root, original.configPath))
     const doc = parseDocument(readFileSync(sourcePath, 'utf8'))
     const chart = m.workload === 'ui' ? 'web' : m.workload
+    doc.setIn(['pipelines', 'sandbox-image', 'run'], sandboxImagePipeline)
+    doc.setIn(
+      ['pipelines', 'sandbox-architecture', 'run'],
+      `architecture=$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}') || exit 1
+echo "SANDBOX_ARCH=$architecture"`,
+    )
+    for (const variable of ['SANDBOX_REGISTRY', 'SANDBOX_REPOSITORY', 'SANDBOX_TAG'])
+      doc.setIn(['vars', variable], '')
     doc.setIn(
       ['pipelines', 'sandbox-reset', 'run'],
       m.workload === 'api' ? 'create_deployments default' : `purge_deployments ${chart}`,
@@ -689,74 +725,116 @@ export class Sandboxes {
   private async head(m: SandboxMember, root: string): Promise<string> {
     const remote = m.source.kind === 'pr' ? `https://github.com/${m.source.repoSlug}.git` : 'origin'
     const ref = m.source.kind === 'pr' ? `pull/${m.source.number}/head` : m.source.ref
-    await this.checked('git', ['fetch', '--', remote, ref], root)
-    const sha = (await this.checked('git', ['rev-parse', 'FETCH_HEAD'], root)).trim()
-    if (!/^[a-f0-9]{40,64}$/i.test(sha)) throw new Error('Cannot resolve sandbox head')
-    return sha
+    return this.gitTask(root, async () => {
+      await this.checked('git', ['fetch', '--', remote, ref], root)
+      const sha = (await this.checked('git', ['rev-parse', 'FETCH_HEAD'], root)).trim()
+      if (!/^[a-f0-9]{40,64}$/i.test(sha)) throw new Error('Cannot resolve sandbox head')
+      return sha
+    })
   }
+  private async gitTask<T>(root: string, work: () => Promise<T>): Promise<T> {
+    const previous = this.gitTasks.get(root) ?? Promise.resolve()
+    const task = previous.catch(() => undefined).then(work)
+    const settled = task.then(
+      () => undefined,
+      () => undefined,
+    )
+    this.gitTasks.set(root, settled)
+    try {
+      return await task
+    } finally {
+      if (this.gitTasks.get(root) === settled) this.gitTasks.delete(root)
+    }
+  }
+
   private async buildMembers(s: Sandbox, input: SandboxBuild): Promise<void> {
     await this.owned(s)
     await this.available(s, s.slot as string)
     const view = await this.view(s)
     const cluster = JSON.parse(
       await this.checked('kubectl', ['get', 'deployments', '-n', s.slot as string, '-o', 'json']),
-    ) as { items: { metadata: { name: string }; spec?: { replicas?: number } }[] }
+    ) as {
+      items: {
+        metadata: { name: string }
+        spec?: { replicas?: number; template?: { spec?: { containers?: { image?: string }[] } } }
+      }[]
+    }
     if (view.power === 'unknown') throw new Error('Cannot determine sandbox power')
-    for (const m of s.members.filter((m) => !input.repo || m.repo === input.repo)) {
-      if (m.merged) continue
-      await this.deps.authorize(m.repo)
-      const awake =
-        (cluster.items.find((d) => d.metadata.name === this.repo(m).name)?.spec?.replicas ?? 0) > 0
-      const { root, path } = this.checkout(s, m)
-      const observedHead = m.headSha
-      const fetched = await this.head(m, root)
-      if (m.headSha === observedHead) m.headSha = fetched
-      if (!input.force && m.headSha === m.deployedSha) continue
-      do {
-        if (m.merged) break
-        const sha = m.headSha as string
-        const lease = await this.owned(s)
-        const remoteMembers = JSON.parse(lease.data.members) as SandboxMember[]
-        if (
-          remoteMembers.some(
-            (r) =>
-              identity(r) === identity(m) &&
-              r.build.state === 'building' &&
-              r.build.instanceId !== this.deps.instanceId,
-          )
-        )
-          throw new Error('Member is building on another instance')
-        m.build = { state: 'building', instanceId: this.deps.instanceId, startedAt: Date.now() }
-        this.save(s)
-        await this.mirror(s, lease)
+    await parallelMembers(
+      s.members.filter((m) => !input.repo || m.repo === input.repo),
+      async (m) => {
         try {
-          if (existsSync(path))
-            await this.checked('git', ['worktree', 'remove', '--force', path], root)
-          await this.checked('git', ['worktree', 'add', '--detach', path, sha], root)
-          const repo = this.config(s, m, path)
-          const sync = await this.deps.supervisor.sandbox(repo, 'sync')
-          if (sync.code !== 0) throw new Error(sync.stderr || 'Sandbox env sync failed')
-          const deployed = await this.deps.supervisor.sandbox(repo, 'deploy', awake)
-          if (deployed.code !== 0) throw new Error(deployed.stderr || 'Sandbox deploy failed')
-          m.deployedSha = sha
-          m.build = { state: 'idle' }
-          if (awake)
-            await this.checked('kubectl', [
-              'rollout',
-              'restart',
-              `deployment/${this.repo(m).name}`,
-              '-n',
-              s.slot as string,
-            ])
-          const current = await this.owned(s)
-          const observed = (JSON.parse(current.data.members) as SandboxMember[]).find(
-            (r) => identity(r) === identity(m),
-          )
-          if (observed?.headSha && observed.headSha !== sha && m.headSha === sha)
-            m.headSha = observed.headSha
-          if (observed?.merged) m.merged = true
-          this.touch(s, input.actor, 'built', `${identity(m)} ${sha}`)
-          await this.mirror(s, current)
+          if (m.merged) return
+          await this.deps.authorize(m.repo)
+          const deployment = cluster.items.find((d) => d.metadata.name === this.repo(m).name)
+          const awake = (deployment?.spec?.replicas ?? 0) > 0
+          let previous = deployment?.spec?.template?.spec?.containers?.[0]?.image
+          const { root, path } = this.checkout(s, m)
+          const observedHead = m.headSha
+          const fetched = await this.head(m, root)
+          if (m.headSha === observedHead) m.headSha = fetched
+          if (!input.force && m.headSha === m.deployedSha) return
+          do {
+            if (m.merged) break
+            const sha = m.headSha as string
+            const lease = await this.owned(s)
+            const remoteMembers = JSON.parse(lease.data.members) as SandboxMember[]
+            if (
+              remoteMembers.some(
+                (r) =>
+                  identity(r) === identity(m) &&
+                  r.build.state === 'building' &&
+                  r.build.instanceId !== this.deps.instanceId,
+              )
+            )
+              throw new Error('Member is building on another instance')
+            m.build = { state: 'building', instanceId: this.deps.instanceId, startedAt: Date.now() }
+            this.save(s)
+            await this.mirror(s)
+            await this.gitTask(root, async () => {
+              if (existsSync(path))
+                await this.checked('git', ['worktree', 'remove', '--force', path], root)
+              await this.checked('git', ['worktree', 'add', '--detach', path, sha], root)
+            })
+            const repo = this.config(s, m, path)
+            const sync = await this.deps.supervisor.sandbox(repo, 'sync')
+            if (sync.code !== 0) throw new Error(sync.stderr || 'Sandbox env sync failed')
+            const image = await this.prepareImage(repo, m)
+            await this.imageBuilds.deploy(
+              image,
+              async () =>
+                (await this.queryImage(
+                  repo,
+                  image.slice(0, image.lastIndexOf(':')),
+                  image.slice(image.lastIndexOf(':') + 1),
+                )) !== undefined,
+              async (skip) => {
+                await this.owned(s)
+                const deployed = await this.deps.supervisor.sandbox(repo, 'deploy', awake, skip)
+                if (deployed.code !== 0) throw new Error(deployed.stderr || 'Sandbox deploy failed')
+              },
+            )
+            m.deployedSha = sha
+            m.build = { state: 'idle' }
+            if (sandboxRestart(awake, previous, image))
+              await this.checked('kubectl', [
+                'rollout',
+                'restart',
+                `deployment/${this.repo(m).name}`,
+                '-n',
+                s.slot as string,
+              ])
+            previous = image
+            const current = await this.owned(s)
+            const observed = (JSON.parse(current.data.members) as SandboxMember[]).find(
+              (r) => identity(r) === identity(m),
+            )
+            if (observed?.headSha && observed.headSha !== sha && m.headSha === sha)
+              m.headSha = observed.headSha
+            if (observed?.merged) m.merged = true
+            this.touch(s, input.actor, 'built', `${identity(m)} ${sha}`)
+            await this.mirror(s)
+          } while (m.headSha !== m.deployedSha)
         } catch (error) {
           m.build = {
             state: 'failed',
@@ -764,13 +842,95 @@ export class Sandboxes {
           }
           this.save(s)
           await this.mirror(s)
-          throw error
+          throw new Error(`${identity(m)}: ${m.build.error}`, { cause: error })
         }
-      } while (m.headSha !== m.deployedSha)
-    }
+      },
+    )
     s.state = 'active'
     this.save(s)
     await this.mirror(s)
+  }
+  private async queryImage(repo: Repo, image: string, tag: string): Promise<string | undefined> {
+    const result = await this.deps.supervisor.sandbox(
+      {
+        ...repo,
+        varDefaults: { ...repo.varDefaults, ...ecrQuery(image, tag) },
+      },
+      'image',
+    )
+    if (result.code !== 0) throw new Error(`Sandbox ECR lookup failed for ${image}:${tag}`)
+    try {
+      return imageDigest(result.stdout)
+    } catch {
+      throw new Error(`Sandbox ECR lookup failed for ${image}:${tag}: invalid response`)
+    }
+  }
+  private async prepareImage(repo: Repo, member: SandboxMember): Promise<string> {
+    const printed = await this.deps.supervisor.sandbox(repo, 'print')
+    if (printed.code !== 0) throw new Error(printed.stderr || 'Cannot resolve sandbox build config')
+    const effective = parse(printed.stdout) as { images?: Record<string, SandboxImage> }
+    if (!effective?.images?.app || Object.keys(effective.images).length !== 1)
+      throw new Error('Sandbox requires exactly one app image')
+    const image = effective.images.app
+    if (typeof image.image !== 'string') throw new Error('Invalid sandbox image repository')
+    let architecture: string | undefined
+    // Preserve the printed builder. Registry cache exports require BuildKit.
+    if (image.buildKit) {
+      const cache = `${image.image}:${sandboxCacheTag(member.repo, member.workload)}`
+      const buildArgs = image.buildKit.args ?? []
+      image.buildKit = {
+        ...image.buildKit,
+        args: [
+          ...(buildArgs.some((a) => a === '--platform' || a.startsWith('--platform='))
+            ? []
+            : ['--platform=linux/amd64']),
+          ...buildArgs.map((arg, i) => {
+            if (
+              !/^--cache-(?:to|from)(?:=|$)/.test(arg) &&
+              !/^--cache-(?:to|from)$/.test(buildArgs[i - 1] ?? '')
+            )
+              return arg
+            return arg.replace(/\bref=[^,]+/, `ref=${cache}`)
+          }),
+        ],
+      }
+    } else {
+      const result = await this.deps.supervisor.sandbox(repo, 'architecture')
+      if (result.code !== 0) throw new Error('Cannot determine sandbox Docker builder architecture')
+      architecture = sandboxArchitecture(result.stdout)
+    }
+    const dockerfile = resolve(repo.path, image.dockerfile ?? 'Dockerfile')
+    const checkout = realpathSync(repo.root ?? repo.path)
+    for (const path of [dockerfile, resolve(repo.path, image.context ?? '.')]) {
+      const inside = relative(checkout, realpathSync(path))
+      if (inside === '..' || inside.startsWith('../') || isAbsolute(inside))
+        throw new Error('Sandbox build inputs must stay inside the detached checkout')
+    }
+    writeFileSync(
+      dockerfile,
+      await pinSandboxBases(readFileSync(dockerfile, 'utf8'), image.buildArgs ?? {}, (base, tag) =>
+        this.queryImage(repo, base, tag),
+      ),
+    )
+    const tag = await sandboxImageKey(image, repo.path, architecture)
+    image.tags = [`${tag}-persistent`]
+    repo.varDefaults = { ...repo.varDefaults, IMAGE_TAG: tag }
+    const doc = parseDocument(readFileSync(repo.configPath, 'utf8'))
+    const list = doc.toJS() as { profiles: { name: string; patches?: unknown[] }[] }
+    const profile = list.profiles.find((p) => p.name === 'sandbox')
+    if (!profile) throw new Error('Missing sandbox profile')
+    profile.patches = [
+      ...(profile.patches ?? []),
+      { op: 'replace', path: 'images.app', value: image },
+      {
+        op: 'replace',
+        path: `deployments.${member.workload === 'ui' ? 'web' : member.workload}.helm.values.container.image`,
+        value: `${image.image}:${tag}-persistent`,
+      },
+    ]
+    doc.set('profiles', list.profiles)
+    writeFileSync(repo.configPath, doc.toString())
+    return `${image.image}:${tag}-persistent`
   }
   private async reset(s: Sandbox, m: SandboxMember): Promise<void> {
     await this.owned(s)

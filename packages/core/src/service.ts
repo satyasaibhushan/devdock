@@ -33,6 +33,7 @@ import {
   Sandboxes,
   requireActor,
 } from './sandboxes.js'
+import { startProgress } from './startProgress.js'
 import { type ReplicaRecord, StateStore } from './stateStore.js'
 import { type SessionState, type StreamRunner, Supervisor, verbLabel } from './supervisor.js'
 import { type RunOutcome, type TermInfo, type TermKind, TermRegistry } from './termRegistry.js'
@@ -554,6 +555,8 @@ export class Service {
     if (!['build', 'destroy'].includes(op.action)) {
       this.operationStage(op.repo, workload, 'waiting')
       let ready = false
+      const logPath = this.devLogPath(this.scoped(op.repo, workload).key)
+      let logOffset = existsSync(logPath) ? statSync(logPath).size : 0
       while (
         !this.stopped &&
         this.operations.get(op.id).state === 'active' &&
@@ -562,6 +565,12 @@ export class Service {
         const state = await this.reconcileOne(op.repo)
         const selected = state.workloads.find((w) => w.type === op.workload)
         if (selected && !selected.unreachable) {
+          const slice = readFileSlice(logPath, logOffset)
+          if (slice) logOffset = slice.nextOffset
+          for (const message of startProgress(selected.pods, slice?.lines ?? [])) {
+            if (!this.operations.get(op.id).logs.some((l) => l.message === message))
+              this.operations.update(op.id, {}, message)
+          }
           if (
             selected.hasSession &&
             selected.pods.length > 0 &&

@@ -2146,3 +2146,55 @@ describe('moving a deployment between instances', () => {
     expect(c.owner()).toBeUndefined()
   })
 })
+
+it.each([
+  ['', false],
+  ['Initial sync completed\n', false],
+  ['', true],
+] as const)(
+  'completes readiness without waiting for sync and ignores old sync logs: %j, fresh sync=%s',
+  async (oldLog, freshSync) => {
+    const svc = new Service(
+      { roots: [root], stateFile },
+      { runner: cannedRunner('{"items":[]}', false) },
+    )
+    svc.rescan()
+    const stopped = await svc.reconcileOne('svc-a')
+    const ready = {
+      ...stopped,
+      workloads: stopped.workloads.map((w) => ({
+        ...w,
+        status: 'RUNNING_MANAGED' as const,
+        hasSession: true,
+        pods: [
+          {
+            name: 'svc-a-devspace',
+            phase: 'Running',
+            ready: true,
+            restartCount: 0,
+            scheduled: true,
+            imagePulled: true,
+          },
+        ],
+      })),
+    }
+    const logPath = join(root, 'logs', 'svc-a.dev.log')
+    vi.spyOn(svc, 'reconcileOne').mockImplementation(async () => {
+      if (freshSync) appendFileSync(logPath, 'Initial sync completed\nInitial sync completed\n')
+      return ready
+    })
+    vi.spyOn(svc, 'lifecycle').mockImplementation(async () => {
+      mkdirSync(join(root, 'logs'), { recursive: true })
+      writeFileSync(logPath, oldLog)
+      return { code: 0, stdout: '', stderr: '' }
+    })
+    const op = await svc.beginOperation('svc-a', 'start')
+    await vi.waitFor(() => expect(svc.getOperation(op.id).state).toBe('succeeded'))
+    const messages = svc.getOperation(op.id).logs.map((l) => l.message)
+    for (const milestone of ['Pod scheduled', 'Image pulled', 'Containers ready'])
+      expect(messages.filter((message) => message === milestone)).toHaveLength(1)
+    expect(messages.filter((message) => message === 'Initial file sync done')).toHaveLength(
+      freshSync ? 1 : 0,
+    )
+  },
+)

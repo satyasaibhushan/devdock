@@ -483,3 +483,15 @@ it('runs sandbox pipelines with slot vars, persistent placement, and only the se
   expect(calls[1]).toContain("-n 'slot1'")
   expect(calls[2]).toContain('run-pipeline sandbox-reset')
 })
+
+it('passes skip-build only for cached sandbox deploys and resolves the same profiles for print', async () => {
+  const runner = vi.fn(async (_cmd: string, _args: string[]) => ok())
+  const supervisor = new Supervisor(runner)
+  await supervisor.sandbox(repo, 'deploy', false, true)
+  await supervisor.sandbox(repo, 'print')
+  await supervisor.sandbox(repo, 'architecture')
+  const commands = runner.mock.calls.map((call) => call[1][1])
+  expect(commands[0]).toContain('deploy -p persistent -p sandbox --skip-build')
+  expect(commands[1]).toContain('print --skip-info -p persistent -p sandbox')
+  expect(commands[2]).toContain('run-pipeline sandbox-architecture')
+})
