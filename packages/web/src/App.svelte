@@ -11,6 +11,7 @@
   import RepoList from './lib/RepoList.svelte'
   import SandboxDetail from './lib/SandboxDetail.svelte'
   import SandboxList from './lib/SandboxList.svelte'
+  import SandboxMemberList from './lib/SandboxMemberList.svelte'
   import StartupModal from './lib/StartupModal.svelte'
   import TerminalPanel from './lib/TerminalPanel.svelte'
   import WorkflowPanel from './lib/WorkflowPanel.svelte'
@@ -33,7 +34,7 @@
     openEvents,
     stopSession,
   } from './lib/api'
-  import { applySandboxEvent } from './lib/sandboxUi'
+  import { applySandboxEvent, memberKey, selectedMember } from './lib/sandboxUi'
 
   // Sandboxes come from the preferred machine. The personal one is the kube
   // namespace itself; the repo list below it is its detail, so `sandboxKey`
@@ -46,11 +47,24 @@
   // The create operation id, so the new sandbox's detail shows progress at once.
   let createdOperation = $state({ key: '', id: '' })
   const ticketSandbox = $derived(sandboxes.find((s) => !s.personal && s.key === sandboxKey) ?? null)
+  let memberSelection = $state<string | null>(new URLSearchParams(location.search).get('member'))
+  let addingMember = $state(false)
+  const pickedMember = $derived(selectedMember(ticketSandbox?.members ?? [], memberSelection))
+  function selectMember(key: string) {
+    memberSelection = key
+    if (selectedId === HOST_ID) selectedId = lastRepoId ?? repos[0]?.repo.id ?? null
+    const url = new URL(location.href)
+    url.searchParams.set('member', key)
+    history.replaceState(null, '', url)
+  }
   function selectSandbox(key: string | null) {
     sandboxKey = key
+    memberSelection = null
+    addingMember = false
     // Leaving "All terminals" lands on the last repo rather than an empty pane.
     if (selectedId === HOST_ID) selectedId = lastRepoId ?? repos[0]?.repo.id ?? null
     const url = new URL(location.href)
+    url.searchParams.delete('member')
     if (key) url.searchParams.set('sandbox', key)
     else url.searchParams.delete('sandbox')
     history.replaceState(null, '', url)
@@ -410,7 +424,19 @@
         />
       </div>
     {:else}
-      <div class="repos"></div>
+      <div class="repos">
+        {#if ticketSandbox}
+          <SandboxMemberList
+            members={ticketSandbox.members}
+            selectedKey={pickedMember && selectedId !== HOST_ID ? memberKey(pickedMember) : null}
+            onselect={selectMember}
+            onadd={() => {
+              if (selectedId === HOST_ID) selectedId = lastRepoId ?? repos[0]?.repo.id ?? null
+              addingMember = true
+            }}
+          />
+        {/if}
+      </div>
     {/if}
     <button
       class="hostbtn"
@@ -451,6 +477,9 @@
       {#key `${preferredEndpoint}:${ticketSandbox.key}`}
         <SandboxDetail
           sandbox={ticketSandbox}
+          picked={pickedMember}
+          onselect={selectMember}
+          bind:addingMember
           repos={preferredInstance?.repos ?? []}
           instance={preferredEndpoint}
           {instances}

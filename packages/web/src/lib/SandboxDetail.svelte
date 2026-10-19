@@ -17,10 +17,13 @@
   import Icon from './Icon.svelte'
   import SandboxLogs from './SandboxLogs.svelte'
   import SandboxMemberForm from './SandboxMemberForm.svelte'
-  import { expiryLabel, memberKey, memberStale, relativeTime, shortSha, sourceLabel } from './sandboxUi'
+  import { expiryLabel, memberBuildState, memberKey, memberStale, relativeTime, shortSha, sourceLabel } from './sandboxUi'
 
   let {
     sandbox,
+    picked,
+    onselect,
+    addingMember = $bindable(false),
     repos,
     instance,
     instances,
@@ -29,6 +32,9 @@
     onchanged,
   }: {
     sandbox: SandboxView
+    picked: SandboxMember | null
+    onselect: (key: string) => void
+    addingMember?: boolean
     /** Candidate members: the daemon instance's repos. */
     repos: RepoState[]
     instance: string
@@ -42,17 +48,11 @@
   let error = $state('')
   let busy = $state(false)
   let confirm = $state<'expire' | 'delete' | null>(null)
-  let pickedKey = $state('')
   let copied = $state('')
-  let addingMember = $state(false)
   let now = $state(Date.now())
   let operation = $state<Operation | null>(null)
   let dismissedOperation = $state('')
 
-  // Logs follow the picked member, falling back to the first one.
-  const picked = $derived(
-    sandbox.members.find((m) => memberKey(m) === pickedKey) ?? sandbox.members[0] ?? null,
-  )
   const memberKeys = $derived(sandbox.members.map(memberKey))
   const activity = $derived([...sandbox.activity].sort((a, b) => b.at - a.at))
   const expired = $derived(!sandbox.slot)
@@ -135,14 +135,6 @@
     }
   }
 
-  const BUILD_WORD: Record<SandboxMember['build']['state'], string> = {
-    idle: 'current',
-    queued: 'queued',
-    building: 'building',
-    failed: 'failed',
-  }
-  const buildWord = (m: SandboxMember) =>
-    m.build.state === 'idle' && memberStale(m) ? 'stale' : BUILD_WORD[m.build.state]
 </script>
 
 <div class="head">
@@ -241,7 +233,7 @@
         {@const stale = memberStale(m)}
         <tr class:picked={picked === m}>
           <td>
-            <button class="repo" title="Show logs for {m.repo} {m.workload}" aria-pressed={picked === m} onclick={() => (pickedKey = memberKey(m))}>
+            <button class="repo" title="Show logs for {m.repo} {m.workload}" aria-pressed={picked === m} onclick={() => onselect(memberKey(m))}>
               <span class="rname">{m.repo}</span>
               <span class="wl">{m.workload}</span>
             </button>
@@ -258,7 +250,7 @@
             {#if stale && m.build.state === 'idle'}<span class="stale" title="deployed code is behind the head">stale</span>{/if}
           </td>
           <td>
-            <span class="bst {m.build.state}" class:stale={stale && m.build.state === 'idle'}>{buildWord(m)}</span>
+            <span class="bst {m.build.state}" class:stale={stale && m.build.state === 'idle'}>{memberBuildState(m) === 'ready' ? 'current' : memberBuildState(m)}</span>
             {#if m.build.error}<span class="berr" title={m.build.error}>{m.build.error}</span>{/if}
           </td>
           <td class="ops">
