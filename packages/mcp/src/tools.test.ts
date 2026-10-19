@@ -207,6 +207,7 @@ describe('toolsForScope', () => {
       'devdock_sandbox_create',
       'devdock_sandbox_update',
       'devdock_sandbox_build',
+      'devdock_sandbox_snapshot',
       'devdock_sandbox_wake',
       'devdock_sandbox_sleep',
       'devdock_sandbox_expire',

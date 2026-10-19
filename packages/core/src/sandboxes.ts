@@ -1,5 +1,15 @@
 import { createHash } from 'node:crypto'
-import { existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
+import {
+  cpSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { parse, parseDocument } from 'yaml'
 import type { RunResult } from './exec.js'
@@ -29,11 +39,14 @@ export interface SandboxMemberInput {
   source:
     | { kind: 'pr'; repoSlug: string; number: number; url: string }
     | { kind: 'branch'; ref: string }
+    | { kind: 'worktree'; path: string }
 }
 export interface SandboxMember extends SandboxMemberInput {
   mode: 'built' | 'dev'
   headSha?: string
   deployedSha?: string
+  dirtyFiles?: string[]
+  image?: string
   build: {
     state: 'idle' | 'queued' | 'building' | 'failed'
     instanceId?: string
@@ -48,6 +61,11 @@ export interface ActivityEntry {
   action: string
   detail?: string
 }
+export interface SandboxSnapshot {
+  at: number
+  actor: string
+  members: { repo: string; workload: string; sha: string; dirtyFiles: string[]; image: string }[]
+}
 export interface Sandbox {
   key: string
   title?: string
@@ -57,13 +75,30 @@ export interface Sandbox {
   lastUsedAt: number
   members: SandboxMember[]
   activity: ActivityEntry[]
+  snapshot?: SandboxSnapshot
+  expiredAt?: number
+  error?: string
 }
+export type SandboxPower = 'awake' | 'asleep' | 'partial' | 'unknown'
+/** The one word a card leads with; power when the record itself says nothing more. */
+export type SandboxRibbon = SandboxPower | 'building' | 'failed' | 'expired' | 'expired restorable'
 export interface SandboxView extends Sandbox {
-  power: 'awake' | 'asleep' | 'partial' | 'unknown'
+  power: SandboxPower
+  /** Every member deployment awake with its replicas ready and on the latest template. */
+  healthy: boolean
+  ribbon: SandboxRibbon
   urls: string[]
+  /** The stable per-ticket link served by the daemon; wakes or restores on visit. */
+  link: string
+  /** Short PR-body block: ribbon, link, live URL, and what each member shows. */
+  markdown: string
   expiresAt: number
   allMerged: boolean
   personal?: boolean
+  /** Namespace pool with the key holding each slot. */
+  pool: { slot: string; key?: string }[]
+  /** Least-recently-used asleep sandbox, offered only while the pool is full. */
+  evictionCandidate?: string
 }
 export interface SandboxCreate {
   key: string
@@ -83,6 +118,11 @@ export interface SandboxBuild {
   force?: boolean
   actor: string
 }
+export const snapshotTtl = (): number => {
+  const days = Number(process.env.DEVDOCK_SNAPSHOT_TTL_DAYS ?? 30)
+  if (!Number.isFinite(days) || days <= 0) throw new Error('Invalid snapshot TTL')
+  return days * 86400000
+}
 export const sandboxTtl = (): number => {
   const hours = Number(process.env.DEVDOCK_SANDBOX_TTL_HOURS ?? 24)
   if (!Number.isFinite(hours) || hours <= 0) throw new Error('Invalid sandbox TTL')
@@ -93,6 +133,46 @@ export function isExpired(sandbox: Sandbox, now: number, ttl: number): boolean {
 }
 export function staleMembers(sandbox: Sandbox): SandboxMember[] {
   return sandbox.members.filter((m) => !m.merged && (!m.deployedSha || m.deployedSha !== m.headSha))
+}
+/** A snapshot outlives expiry for this long, so a stable link can restore it. */
+export function snapshotRetained(sandbox: Sandbox, now: number): boolean {
+  if (!sandbox.snapshot) return false
+  if (sandbox.slot) return true
+  return now - (sandbox.expiredAt ?? sandbox.snapshot.at) < snapshotTtl()
+}
+export function sandboxRibbon(sandbox: Sandbox, power: SandboxPower, now: number): SandboxRibbon {
+  if (sandbox.state === 'expired')
+    return snapshotRetained(sandbox, now) ? 'expired restorable' : 'expired'
+  if (sandbox.state === 'failed') return 'failed'
+  if (sandbox.members.some((m) => m.build.state === 'building')) return 'building'
+  return power
+}
+/** PR-body block listing what each member shows against its source head when known. */
+export function sandboxMarkdown(
+  sandbox: Sandbox,
+  ribbon: SandboxRibbon,
+  link: string,
+  urls: string[],
+): string {
+  const lines = (sandbox.snapshot?.members ?? []).map((m) => {
+    const member = sandbox.members.find((candidate) => identity(candidate) === identity(m))
+    const dirty = m.dirtyFiles.length ? ` (+${m.dirtyFiles.length} uncommitted files)` : ''
+    const source = member?.source
+    if (!member?.headSha || !source || source.kind === 'worktree')
+      return `${m.repo} ${m.workload} ${m.sha}${dirty}`
+    const name = source.kind === 'pr' ? `PR #${source.number}` : source.ref
+    const head = m.sha === member.headSha ? `= ${name} head` : `vs ${name} head ${member.headSha}`
+    return `${m.repo} ${m.workload} ${m.sha}${dirty} ${head}`
+  })
+  return [
+    `Sandbox ${sandbox.key}: ${ribbon}`,
+    `Stable link: ${link}`,
+    `Live URL: ${urls.join(', ') || 'unavailable'}`,
+    '',
+    '```',
+    ...(lines.length ? lines : ['no snapshot yet']),
+    '```',
+  ].join('\n')
 }
 export function requireActor(actor: string): void {
   if (typeof actor !== 'string' || !actor.trim()) throw new Error('actor required')
@@ -181,6 +261,9 @@ export class Sandboxes {
           typeof m.source.url !== 'string'
         )
           throw new Error('Invalid PR source')
+      } else if (m.source.kind === 'worktree') {
+        if (typeof m.source.path !== 'string' || !isAbsolute(m.source.path))
+          throw new Error('Worktree path must be absolute')
       } else if (
         m.source.kind !== 'branch' ||
         typeof m.source.ref !== 'string' ||
@@ -290,7 +373,17 @@ export class Sandboxes {
   }
   private operation(
     s: Sandbox,
-    action: 'create' | 'build' | 'rebuild' | 'expire' | 'update' | 'wake' | 'sleep' | 'delete',
+    action:
+      | 'create'
+      | 'build'
+      | 'rebuild'
+      | 'snapshot'
+      | 'expire'
+      | 'update'
+      | 'wake'
+      | 'restore'
+      | 'sleep'
+      | 'delete',
     actor: string,
     work: () => Promise<void>,
   ): { operationId: string } {
@@ -303,6 +396,7 @@ export class Sandboxes {
       s.slot ?? '',
       action === 'expire' || action === 'delete' ? 'destroy' : 'build',
     )
+    s.error = undefined
     this.touch(s, actor, action)
     const lock = JSON.stringify({ instanceId: this.deps.instanceId, operationId: op.id })
     this.active.set(s.key, lock)
@@ -345,7 +439,8 @@ export class Sandboxes {
           if (lease?.data.key === s.key && lease.data.operation === lock)
             await this.unlock(s.slot, lease, lock).catch(() => undefined)
         }
-        s.state = 'failed'
+        s.error = error instanceof Error ? error.message : String(error)
+        if (s.slot) s.state = 'failed'
         this.save(s)
         this.deps.operations.update(
           op.id,
@@ -408,6 +503,7 @@ export class Sandboxes {
         createdAt: saved?.createdAt ?? now,
         lastUsedAt: saved?.lastUsedAt ?? now,
         title: saved?.title,
+        snapshot: saved?.snapshot,
         slot,
         state: 'active',
         members: members.map((m) => ({
@@ -430,7 +526,8 @@ export class Sandboxes {
     }
   }
   async list(): Promise<SandboxView[]> {
-    const views = await Promise.all(this.deps.store.listSandboxes().map((s) => this.view(s)))
+    const pool = await this.poolState()
+    const views = await Promise.all(this.deps.store.listSandboxes().map((s) => this.view(s, pool)))
     const ns = await this.deps.namespace()
     if (!ns) return views
     const now = Date.now()
@@ -454,7 +551,7 @@ export class Sandboxes {
           })),
         ),
     }
-    return [{ ...(await this.view(personal)), personal: true, expiresAt: 0 }, ...views]
+    return [{ ...(await this.view(personal, pool)), personal: true, expiresAt: 0 }, ...views]
   }
   async status(key: string): Promise<SandboxView> {
     if (!this.deps.store.getSandbox(key) && key === (await this.deps.namespace())) {
@@ -463,50 +560,85 @@ export class Sandboxes {
     }
     return this.view(this.get(key))
   }
-  private async view(s: Sandbox): Promise<SandboxView> {
-    let power: SandboxView['power'] = 'asleep'
-    let urls: string[] = []
-    if (s.slot) {
-      try {
-        const deployments = JSON.parse(
-          await this.checked('kubectl', ['get', 'deployments', '-n', s.slot, '-o', 'json']),
-        ) as { items: { metadata: { name: string }; spec?: { replicas?: number } }[] }
-        const names = s.members.map((m) => this.repo(m).name)
-        const replicas = names.map(
-          (name) => deployments.items.find((d) => d.metadata.name === name)?.spec?.replicas,
-        )
-        const awake = replicas.filter((n) => n !== undefined && n > 0).length
-        power =
-          awake === names.length && names.length > 0 ? 'awake' : awake > 0 ? 'partial' : 'asleep'
-        const ingresses = JSON.parse(
-          await this.checked('kubectl', ['get', 'ingresses', '-n', s.slot, '-o', 'json']),
-        ) as {
-          items: {
-            spec?: { rules?: { host?: string; http?: { paths?: { path?: string }[] } }[] }
-          }[]
-        }
-        urls = [
-          ...new Set(
-            ingresses.items.flatMap((i) =>
-              (i.spec?.rules ?? []).flatMap((r) =>
-                r.host
-                  ? (r.http?.paths ?? [{ path: '/' }]).map(
-                      (p) => `https://${r.host}${p.path ?? '/'}`,
-                    )
-                  : [],
-              ),
+  /** One pool read per list, not per sandbox: slot holders and the eviction candidate. */
+  private async poolState(): Promise<Pick<SandboxView, 'pool' | 'evictionCandidate'>> {
+    const pool = await Promise.all(
+      this.pool().map(async (slot) => ({ slot, key: (await this.readLease(slot))?.data.key })),
+    )
+    const full = pool.length > 0 && pool.every((entry) => entry.key)
+    return { pool, evictionCandidate: full ? (await this.evictionCandidate())?.key : undefined }
+  }
+  private async cluster(s: Sandbox): Promise<Pick<SandboxView, 'power' | 'healthy' | 'urls'>> {
+    if (!s.slot) return { power: 'asleep', healthy: false, urls: [] }
+    try {
+      const deployments = JSON.parse(
+        await this.checked('kubectl', ['get', 'deployments', '-n', s.slot, '-o', 'json']),
+      ) as {
+        items: {
+          metadata: { name: string }
+          spec?: { replicas?: number }
+          status?: { readyReplicas?: number; updatedReplicas?: number }
+        }[]
+      }
+      const named = s.members.map((m) =>
+        deployments.items.find((d) => d.metadata.name === this.repo(m).name),
+      )
+      const awake = named.filter((d) => (d?.spec?.replicas ?? 0) > 0).length
+      const power =
+        awake === named.length && named.length > 0 ? 'awake' : awake > 0 ? 'partial' : 'asleep'
+      const healthy =
+        power === 'awake' &&
+        named.every((d) => {
+          const want = d?.spec?.replicas ?? 1
+          return (
+            (d?.status?.readyReplicas ?? 0) >= want && (d?.status?.updatedReplicas ?? 0) >= want
+          )
+        })
+      const ingresses = JSON.parse(
+        await this.checked('kubectl', ['get', 'ingresses', '-n', s.slot, '-o', 'json']),
+      ) as {
+        items: {
+          spec?: { rules?: { host?: string; http?: { paths?: { path?: string }[] } }[] }
+        }[]
+      }
+      const urls = [
+        ...new Set(
+          ingresses.items.flatMap((i) =>
+            (i.spec?.rules ?? []).flatMap((r) =>
+              r.host
+                ? (r.http?.paths ?? [{ path: '/' }]).map((p) => `https://${r.host}${p.path ?? '/'}`)
+                : [],
             ),
           ),
-        ]
-      } catch {
-        power = 'unknown'
-      }
+        ),
+      ]
+      return { power, healthy, urls }
+    } catch {
+      return { power: 'unknown', healthy: false, urls: [] }
     }
+  }
+  private async view(
+    s: Sandbox,
+    pool?: Pick<SandboxView, 'pool' | 'evictionCandidate'>,
+  ): Promise<SandboxView> {
+    const now = Date.now()
+    if (s.snapshot && !snapshotRetained(s, now)) {
+      s.snapshot = undefined
+      this.save(s)
+    }
+    const { power, healthy, urls } = await this.cluster(s)
+    const link = `http://127.0.0.1:7717/s/${encodeURIComponent(s.key)}`
+    const ribbon = sandboxRibbon(s, power, now)
     return {
       ...structuredClone(s),
+      ...(pool ?? (await this.poolState())),
       activity: structuredClone(s.activity.slice(-50)),
       power,
+      healthy,
+      ribbon,
       urls,
+      link,
+      markdown: sandboxMarkdown(s, ribbon, link, urls),
       expiresAt: s.lastUsedAt + sandboxTtl(),
       allMerged: s.members.length > 0 && s.members.every((m) => m.merged === true),
     }
@@ -559,11 +691,15 @@ export class Sandboxes {
       if (input.wake) await this.power(s, 1)
     })
   }
-  build(key: string, input: SandboxBuild): { operationId: string } {
+  build(
+    key: string,
+    input: SandboxBuild,
+    action: 'build' | 'snapshot' = 'build',
+  ): { operationId: string } {
     const s = this.get(key)
     if (input.repo && !s.members.some((m) => m.repo === input.repo))
       throw new Error('unknown sandbox member')
-    return this.operation(s, s.slot ? 'build' : 'rebuild', input.actor, async () => {
+    return this.operation(s, s.slot ? action : 'rebuild', input.actor, async () => {
       const rebuild = !s.slot
       if (rebuild) await this.lease(s)
       await this.buildMembers(s, {
@@ -599,13 +735,114 @@ export class Sandboxes {
     this.touch(s, actor, 'exec')
     if (s.slot) await this.mirror(s)
   }
-  wake(key: string, actor: string): { operationId: string } {
+  /** Rebuild from the sources' current files (worktree members pick up new edits) and record. */
+  snapshot(key: string, input: SandboxBuild): { operationId: string } {
+    return this.build(key, { ...input, force: true }, 'snapshot')
+  }
+  /** Least-recently-used sandbox that is active, idle, unlocked and fully scaled to zero. */
+  private async evictionCandidate(): Promise<Sandbox | undefined> {
+    const candidates = this.deps.store
+      .listSandboxes()
+      .filter(
+        (s) =>
+          s.slot &&
+          s.state === 'active' &&
+          !this.tasks.has(s.key) &&
+          !s.members.some((m) => m.build.state !== 'idle'),
+      )
+      .sort((a, b) => a.lastUsedAt - b.lastUsedAt)
+    for (const candidate of candidates) {
+      const slot = candidate.slot as string
+      const lease = await this.readLease(slot)
+      if (lease?.data.key !== candidate.key || lease.data.operation) continue
+      const raw = JSON.parse(
+        await this.checked('kubectl', ['get', 'deployments', '-n', slot, '-o', 'json']),
+      ) as { items: { spec?: { replicas?: number } }[] }
+      if (raw.items.length && raw.items.every((d) => d.spec?.replicas === 0)) return candidate
+    }
+    return undefined
+  }
+  /** Scale up; an expired sandbox with a retained snapshot is restored into a free slot first.
+   *  `evict` lets a full pool expire its eviction candidate; awake or busy sandboxes are never
+   *  evicted. */
+  wake(key: string, actor: string, options: { evict?: boolean } = {}): { operationId: string } {
     const s = this.get(key)
-    if (!s.slot) throw new Error('Sandbox expired; rebuild first')
-    return this.operation(s, 'wake', actor, async () => {
-      await this.buildMembers(s, { actor })
+    if (!s.slot && !snapshotRetained(s, Date.now()))
+      throw new Error('Sandbox expired without a snapshot; rebuild first')
+    return this.operation(s, s.slot ? 'wake' : 'restore', actor, async () => {
+      if (!s.slot) {
+        const leases = await Promise.all(this.pool().map((slot) => this.readLease(slot)))
+        if (leases.length && leases.every(Boolean)) {
+          const candidate = await this.evictionCandidate()
+          if (!candidate) throw new Error('Sandbox namespace pool full; no asleep sandbox to evict')
+          if (!options.evict)
+            throw new Error(
+              `Sandbox namespace pool full; evict asleep sandbox ${candidate.key} to restore`,
+            )
+          const receipt = this.expire(candidate.key, actor)
+          await this.tasks.get(candidate.key)
+          if (this.deps.operations.get(receipt.operationId).state !== 'succeeded')
+            throw new Error(`Cannot evict ${candidate.key}`)
+        }
+        await this.lease(s)
+        await this.restoreImages(s)
+      }
       await this.power(s, 1)
+      s.state = 'active'
+      this.save(s)
+      await this.mirror(s)
     })
+  }
+  private async restoreImages(s: Sandbox): Promise<void> {
+    const snapshot = s.snapshot
+    if (!snapshot) throw new Error('Sandbox has no retained snapshot')
+    const same =
+      s.members.length === snapshot.members.length &&
+      s.members.every((m) => snapshot.members.some((saved) => identity(saved) === identity(m)))
+    if (!same) throw new Error('Snapshot membership changed; build a new snapshot')
+    for (const saved of snapshot.members) {
+      const m = s.members.find((m) => identity(m) === identity(saved))
+      if (!m) throw new Error('Snapshot member missing')
+      await this.deps.authorize(m.repo)
+      await this.owned(s)
+      await this.available(s, s.slot as string)
+      // The config only needs to exist to deploy; HEAD is fine since nothing is built.
+      const { root, path } = this.checkout(s, m)
+      await this.gitTask(root, async () => {
+        if (existsSync(path))
+          await this.checked('git', ['worktree', 'remove', '--force', path], root)
+        await this.checked('git', ['worktree', 'add', '--detach', path], root)
+      })
+      const repo = this.config(s, m, path)
+      const sync = await this.deps.supervisor.sandbox(repo, 'sync')
+      if (sync.code !== 0) throw new Error(sync.stderr || 'Sandbox env sync failed')
+      this.recordedImage(repo, m, saved.image)
+      // Recorded images are content-addressed in ECR, so skip-build redeploys exactly what was seen.
+      const deployed = await this.deps.supervisor.sandbox(repo, 'deploy', true, true)
+      if (deployed.code !== 0) throw new Error(deployed.stderr || 'Sandbox restore failed')
+      m.deployedSha = saved.sha
+      m.dirtyFiles = [...saved.dirtyFiles]
+      m.image = saved.image
+      m.build = { state: 'idle' }
+    }
+    s.expiredAt = undefined
+    await this.mirror(s)
+  }
+  private recordedImage(repo: Repo, member: SandboxMember, image: string): void {
+    const doc = parseDocument(readFileSync(repo.configPath, 'utf8'))
+    const profiles = (doc.toJS() as { profiles: { name: string; patches?: unknown[] }[] }).profiles
+    const profile = profiles.find((p) => p.name === 'sandbox')
+    if (!profile) throw new Error('Missing sandbox profile')
+    profile.patches = [
+      ...(profile.patches ?? []),
+      {
+        op: 'replace',
+        path: `deployments.${member.workload === 'ui' ? 'web' : member.workload}.helm.values.container.image`,
+        value: image,
+      },
+    ]
+    doc.set('profiles', profiles)
+    writeFileSync(repo.configPath, doc.toString())
   }
   sleep(key: string, actor: string): { operationId: string } {
     const s = this.get(key)
@@ -723,6 +960,14 @@ echo "SANDBOX_ARCH=$architecture"`,
     }
   }
   private async head(m: SandboxMember, root: string): Promise<string> {
+    if (m.source.kind === 'worktree') {
+      const original = this.repo(m)
+      if (!existsSync(resolve(m.source.path, relative(root, original.configPath))))
+        throw new Error(`Worktree ${m.source.path} has no ${relative(root, original.configPath)}`)
+      const sha = (await this.checked('git', ['rev-parse', 'HEAD'], m.source.path)).trim()
+      if (!/^[a-f0-9]{40,64}$/i.test(sha)) throw new Error('Cannot resolve worktree HEAD')
+      return sha
+    }
     const remote = m.source.kind === 'pr' ? `https://github.com/${m.source.repoSlug}.git` : 'origin'
     const ref = m.source.kind === 'pr' ? `pull/${m.source.number}/head` : m.source.ref
     return this.gitTask(root, async () => {
@@ -750,7 +995,7 @@ echo "SANDBOX_ARCH=$architecture"`,
   private async buildMembers(s: Sandbox, input: SandboxBuild): Promise<void> {
     await this.owned(s)
     await this.available(s, s.slot as string)
-    const view = await this.view(s)
+    const { power } = await this.cluster(s)
     const cluster = JSON.parse(
       await this.checked('kubectl', ['get', 'deployments', '-n', s.slot as string, '-o', 'json']),
     ) as {
@@ -759,7 +1004,7 @@ echo "SANDBOX_ARCH=$architecture"`,
         spec?: { replicas?: number; template?: { spec?: { containers?: { image?: string }[] } } }
       }[]
     }
-    if (view.power === 'unknown') throw new Error('Cannot determine sandbox power')
+    if (power === 'unknown') throw new Error('Cannot determine sandbox power')
     await parallelMembers(
       s.members.filter((m) => !input.repo || m.repo === input.repo),
       async (m) => {
@@ -791,49 +1036,64 @@ echo "SANDBOX_ARCH=$architecture"`,
             m.build = { state: 'building', instanceId: this.deps.instanceId, startedAt: Date.now() }
             this.save(s)
             await this.mirror(s)
-            await this.gitTask(root, async () => {
-              if (existsSync(path))
-                await this.checked('git', ['worktree', 'remove', '--force', path], root)
-              await this.checked('git', ['worktree', 'add', '--detach', path, sha], root)
-            })
-            const repo = this.config(s, m, path)
-            const sync = await this.deps.supervisor.sandbox(repo, 'sync')
-            if (sync.code !== 0) throw new Error(sync.stderr || 'Sandbox env sync failed')
-            const image = await this.prepareImage(repo, m)
-            await this.imageBuilds.deploy(
-              image,
-              async () =>
-                (await this.queryImage(
-                  repo,
-                  image.slice(0, image.lastIndexOf(':')),
-                  image.slice(image.lastIndexOf(':') + 1),
-                )) !== undefined,
-              async (skip) => {
-                await this.owned(s)
-                const deployed = await this.deps.supervisor.sandbox(repo, 'deploy', awake, skip)
-                if (deployed.code !== 0) throw new Error(deployed.stderr || 'Sandbox deploy failed')
-              },
-            )
-            m.deployedSha = sha
-            m.build = { state: 'idle' }
-            if (sandboxRestart(awake, previous, image))
-              await this.checked('kubectl', [
-                'rollout',
-                'restart',
-                `deployment/${this.repo(m).name}`,
-                '-n',
-                s.slot as string,
-              ])
-            previous = image
-            const current = await this.owned(s)
-            const observed = (JSON.parse(current.data.members) as SandboxMember[]).find(
-              (r) => identity(r) === identity(m),
-            )
-            if (observed?.headSha && observed.headSha !== sha && m.headSha === sha)
-              m.headSha = observed.headSha
-            if (observed?.merged) m.merged = true
-            this.touch(s, input.actor, 'built', `${identity(m)} ${sha}`)
-            await this.mirror(s)
+            // A worktree member bakes the agent's current files, uncommitted edits included,
+            // from a devdock-owned copy: generated configs never land in the agent's checkout.
+            let buildPath = path
+            let dirtyFiles: string[] = []
+            if (m.source.kind === 'worktree') {
+              buildPath = mkdtempSync(`${path}-build-`)
+              dirtyFiles = await this.copyWorktree(m.source.path, buildPath)
+            } else
+              await this.gitTask(root, async () => {
+                if (existsSync(path))
+                  await this.checked('git', ['worktree', 'remove', '--force', path], root)
+                await this.checked('git', ['worktree', 'add', '--detach', path, sha], root)
+              })
+            try {
+              const repo = this.config(s, m, buildPath)
+              const sync = await this.deps.supervisor.sandbox(repo, 'sync')
+              if (sync.code !== 0) throw new Error(sync.stderr || 'Sandbox env sync failed')
+              const image = await this.prepareImage(repo, m)
+              await this.imageBuilds.deploy(
+                image,
+                async () =>
+                  (await this.queryImage(
+                    repo,
+                    image.slice(0, image.lastIndexOf(':')),
+                    image.slice(image.lastIndexOf(':') + 1),
+                  )) !== undefined,
+                async (skip) => {
+                  await this.owned(s)
+                  const deployed = await this.deps.supervisor.sandbox(repo, 'deploy', awake, skip)
+                  if (deployed.code !== 0)
+                    throw new Error(deployed.stderr || 'Sandbox deploy failed')
+                },
+              )
+              m.image = image
+              m.dirtyFiles = dirtyFiles
+              m.deployedSha = sha
+              m.build = { state: 'idle' }
+              if (sandboxRestart(awake, previous, image))
+                await this.checked('kubectl', [
+                  'rollout',
+                  'restart',
+                  `deployment/${this.repo(m).name}`,
+                  '-n',
+                  s.slot as string,
+                ])
+              previous = image
+              const current = await this.owned(s)
+              const observed = (JSON.parse(current.data.members) as SandboxMember[]).find(
+                (r) => identity(r) === identity(m),
+              )
+              if (observed?.headSha && observed.headSha !== sha && m.headSha === sha)
+                m.headSha = observed.headSha
+              if (observed?.merged) m.merged = true
+              this.touch(s, input.actor, 'built', `${identity(m)} ${sha}`)
+              await this.mirror(s)
+            } finally {
+              if (buildPath !== path) rmSync(buildPath, { recursive: true, force: true })
+            }
           } while (m.headSha !== m.deployedSha)
         } catch (error) {
           m.build = {
@@ -847,8 +1107,54 @@ echo "SANDBOX_ARCH=$architecture"`,
       },
     )
     s.state = 'active'
+    // Every member deployed from a known image: that is the snapshot a stable link restores.
+    const complete =
+      s.members.length > 0 &&
+      s.members.every((m) => m.image && m.deployedSha && m.build.state === 'idle')
+    if (complete) {
+      s.snapshot = {
+        at: Date.now(),
+        actor: input.actor,
+        members: s.members.map((m) => ({
+          repo: m.repo,
+          workload: m.workload,
+          sha: m.deployedSha as string,
+          dirtyFiles: m.dirtyFiles ?? [],
+          image: m.image as string,
+        })),
+      }
+      s.expiredAt = undefined
+    }
     this.save(s)
     await this.mirror(s)
+  }
+  /** Copy tracked and untracked non-ignored files (deleted ones excluded) into a build dir and
+   *  return the paths that differ from HEAD. */
+  private async copyWorktree(source: string, destination: string): Promise<string[]> {
+    const listed = await this.checked(
+      'git',
+      ['ls-files', '-co', '--exclude-standard', '-z'],
+      source,
+    )
+    for (const file of new Set(listed.split('\0').filter(Boolean))) {
+      const target = resolve(destination, file)
+      if (isAbsolute(file) || relative(destination, target).startsWith('..'))
+        throw new Error('Invalid worktree file path')
+      const from = join(source, file)
+      if (!existsSync(from)) continue
+      const stat = lstatSync(from)
+      if (!stat.isFile() && !stat.isSymbolicLink())
+        throw new Error(`Unsupported worktree entry: ${file}`)
+      mkdirSync(dirname(target), { recursive: true })
+      cpSync(from, target, { dereference: false })
+    }
+    const changed = await this.checked('git', ['diff', 'HEAD', '--name-only', '-z'], source)
+    const untracked = await this.checked(
+      'git',
+      ['ls-files', '--others', '--exclude-standard', '-z'],
+      source,
+    )
+    return [...new Set(`${changed}${untracked}`.split('\0').filter(Boolean))].sort()
   }
   private async queryImage(repo: Repo, image: string, tag: string): Promise<string | undefined> {
     const result = await this.deps.supervisor.sandbox(
@@ -959,6 +1265,7 @@ echo "SANDBOX_ARCH=$architecture"`,
     await this.checked('kubectl', ['delete', 'configmap', 'devdock-sandbox', '-n', s.slot])
     s.slot = undefined
     s.state = 'expired'
+    s.expiredAt = Date.now()
     this.save(s)
   }
 }

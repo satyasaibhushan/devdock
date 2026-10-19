@@ -407,8 +407,11 @@ export class Service {
   buildSandbox(key: string, input: SandboxBuild) {
     return this.sandboxes.build(key, input)
   }
-  wakeSandbox(key: string, actor: string) {
-    return this.sandboxes.wake(key, actor)
+  snapshotSandbox(key: string, input: SandboxBuild) {
+    return this.sandboxes.snapshot(key, input)
+  }
+  wakeSandbox(key: string, actor: string, options: { evict?: boolean } = {}) {
+    return this.sandboxes.wake(key, actor, options)
   }
   sleepSandbox(key: string, actor: string) {
     return this.sandboxes.sleep(key, actor)

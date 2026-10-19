@@ -68,6 +68,7 @@ describe('sandbox MCP', () => {
       'create',
       'update',
       'build',
+      'snapshot',
       'wake',
       'sleep',
       'expire',

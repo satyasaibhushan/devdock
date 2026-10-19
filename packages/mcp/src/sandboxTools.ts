@@ -14,6 +14,7 @@ const member = z.object({
       url: z.string().url(),
     }),
     z.object({ kind: z.literal('branch'), ref: z.string().min(1) }),
+    z.object({ kind: z.literal('worktree'), path: z.string().min(1) }),
   ]),
 })
 const key = { key: z.string().min(1) }
@@ -28,6 +29,7 @@ export const sandboxMethods = {
   createSandbox: 'create',
   updateSandbox: 'update',
   buildSandbox: 'build',
+  snapshotSandbox: 'snapshot',
   wakeSandbox: 'wake',
   sleepSandbox: 'sleep',
   expireSandbox: 'expire',
@@ -86,12 +88,23 @@ export function sandboxTools(client: DaemonClient): ToolDef[] {
       schema: { ...key, ...actor, repo: z.string().optional(), force: z.boolean().optional() },
       call: (a) => client.sandboxBuild?.(a.key as string, a as unknown as SandboxBuild),
     },
+    {
+      name: 'snapshot',
+      scope: 'rw',
+      schema: { ...key, ...actor, repo: z.string().optional() },
+      call: (a) => client.sandboxSnapshot?.(a.key as string, a as unknown as SandboxBuild),
+    },
     ...(['wake', 'sleep', 'expire', 'delete'] as const).map((action) => ({
       name: action,
       scope: 'rw' as const,
-      schema: { ...key, ...actor },
+      schema: { ...key, ...actor, ...(action === 'wake' ? { evict: z.boolean().optional() } : {}) },
       call: (a: Record<string, unknown>) =>
-        client.sandboxAction?.(a.key as string, action, a.actor as string),
+        client.sandboxAction?.(
+          a.key as string,
+          action,
+          a.actor as string,
+          action === 'wake' ? { evict: a.evict as boolean | undefined } : undefined,
+        ),
     })),
     {
       name: 'head',
