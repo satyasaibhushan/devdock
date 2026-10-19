@@ -24,6 +24,26 @@ const parseJson = (text: string): unknown => {
  *  serves the UI too — there's no separate dev server to keep alive. */
 const WEB_DIST = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'web', 'dist')
 
+// Only expose known transport diagnostics, never arbitrary response bodies or credentials.
+function peerError(error: unknown): string {
+  const message = error instanceof Error ? error.message.trim() : ''
+  const safe = [
+    'SSH connection failed; check the host alias and socket',
+    'SSH connection timed out',
+    'Peer identity changed; relink explicitly',
+    'Peer needs a compatible DevDock version',
+    'Return connection unavailable; no link saved',
+    'Instance unlinked',
+  ]
+  if (safe.includes(message)) return message
+  if (message.startsWith('Peer request timed out;')) return 'Peer request timed out'
+  const code = (error as NodeJS.ErrnoException | undefined)?.code
+  if (code === 'ECONNREFUSED') return 'Peer tunnel connection refused'
+  if (code === 'ENOENT') return 'Peer tunnel socket unavailable'
+  if (code === 'ECONNRESET' || code === 'EPIPE') return 'Peer tunnel connection closed'
+  return 'Peer unavailable'
+}
+
 export function buildApp(
   service: Service,
   gate?: AccessGate,
@@ -93,8 +113,8 @@ export function buildApp(
               online: true,
               repos: JSON.parse(repos.body.toString()),
             }
-          } catch {
-            return { ...link, local: false, online: false, repos: [] }
+          } catch (error) {
+            return { ...link, local: false, online: false, error: peerError(error), repos: [] }
           }
         }),
       )),

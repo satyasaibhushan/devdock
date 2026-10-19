@@ -168,6 +168,7 @@ export interface InstanceView {
   name: string
   local: boolean
   online: boolean
+  error?: string
   terminals?: boolean
   auth?: AuthState
   aws?: { configured: boolean; fresh: boolean }

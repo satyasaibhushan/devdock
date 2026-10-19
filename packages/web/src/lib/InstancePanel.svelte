@@ -25,13 +25,13 @@
   const authLine = (item: InstanceView) =>
     item.online
       ? `Kubernetes: ${item.auth?.phase ?? 'unknown'} · AWS: ${item.aws?.fresh ? 'ready' : item.aws?.configured ? 'refresh on demand' : 'not configured'}`
-      : 'Offline. Deployment ownership retained.'
+      : `Offline${item.error ? `: ${item.error}` : ''}. Deployment ownership retained.`
 </script>
 
 <div class="instances">
   <div class="strip" aria-label="Connected machines">
     {#each instances as item (item.id)}
-      <button class="chip" class:offline={!item.online} title="{item.name}: {item.online ? 'online' : 'offline'}. Connection details."
+      <button class="chip" class:offline={!item.online} title="{item.name}: {item.online ? 'online' : `offline${item.error ? `: ${item.error}` : ''}`}. Connection details."
         onclick={() => expanded = !expanded} aria-expanded={expanded}>
         <span class="symbol">{instanceSymbol(item, instances)}</span>
         <span class="cname">{shortName(item.name)}</span>
@@ -208,6 +208,7 @@
     white-space: nowrap;
   }
   .meta {
+    overflow-wrap: anywhere;
     margin-top: 4px;
   }
   form {
