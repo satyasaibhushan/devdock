@@ -686,6 +686,25 @@ describe('Service', () => {
     expect(await svc.lookup('nope')).toBeUndefined()
   })
 
+  it('throttles the filesystem scan unknown repo ids trigger', async () => {
+    const svc = new Service(
+      { roots: [root], stateFile },
+      { runner: cannedRunner('{"items":[]}', false) },
+    )
+    svc.rescan()
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1_000_000)
+    try {
+      expect(await svc.lookup('nope')).toBeUndefined()
+      mkdirSync(join(root, 'svc-c'), { recursive: true })
+      writeFileSync(join(root, 'svc-c', 'devspace.yaml'), 'name: svc-c\ndeployments:\n  app: {}\n')
+      expect(await svc.lookup('svc-c')).toBeUndefined()
+      now.mockReturnValue(1_010_000)
+      expect((await svc.lookup('svc-c'))?.repo.id).toBe('svc-c')
+    } finally {
+      now.mockRestore()
+    }
+  })
+
   it('terminal falls back to a devspace-enter pod shell for external deployments', async () => {
     const podsJson = JSON.stringify({
       items: [

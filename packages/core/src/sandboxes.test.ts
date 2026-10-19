@@ -9,7 +9,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { Operations } from './operations.js'
 import { type SandboxMemberInput, Sandboxes, isExpired, staleMembers } from './sandboxes.js'
@@ -166,9 +166,16 @@ function fixture(instanceId = 'machine1') {
     available,
     emit,
     done,
+    repoPath,
     setHead: (sha: string) => {
       head = sha
     },
+    imagePresent: () =>
+      sandbox.mockImplementation(async (repo, action) =>
+        action === 'image'
+          ? { code: 0, stdout: `SANDBOX_IMAGE=sha256:${'d'.repeat(64)}\n`, stderr: '' }
+          : sandboxResult(repo, action),
+      ),
   }
 }
 
@@ -743,6 +750,32 @@ describe('snapshots', () => {
       }),
     ).rejects.toThrow('absolute')
   })
+  it('rejects a worktree with a submodule and removes its partial build copy', async () => {
+    const f = fixture()
+    const wt = join(root, 'wt')
+    mkdirSync(join(wt, 'vendor', 'lib'), { recursive: true })
+    const mocked = f.runner.getMockImplementation()
+    f.runner.mockImplementation(async (cmd, args, options) =>
+      cmd === 'git' && options?.cwd === wt
+        ? {
+            code: 0,
+            stdout: args[0] === 'rev-parse' ? sha1 : 'Dockerfile\0vendor/lib\0',
+            stderr: '',
+          }
+        : (mocked as NonNullable<typeof mocked>)(cmd, args, options),
+    )
+    writeFileSync(join(wt, 'Dockerfile'), 'FROM scratch\n')
+    writeFileSync(join(wt, 'devspace.yaml'), 'version: v2beta1\nname: app\n')
+    const member: SandboxMemberInput = { ...input, source: { kind: 'worktree', path: wt } }
+    const result = await f.done(
+      await f.core.create({ key: 'SULF-1', actor: 'agent', members: [member] }),
+    )
+    expect(result.state).toBe('failed')
+    expect(result.logs.at(-1)?.message).toBe(
+      'app:api: Submodules are not supported in worktree members: vendor/lib',
+    )
+    expect(readdirSync(dirname(f.repoPath)).filter((n) => n.includes('-build-'))).toEqual([])
+  })
   it('records a snapshot after every full build and renders PR markdown against the source head', async () => {
     const f = fixture()
     await f.done(await f.core.create({ key: 'SULF-1', actor: 'you', members: [input] }))
@@ -783,9 +816,18 @@ describe('snapshots', () => {
     await f.done(f.core.expire('SULF-1', 'expiry'))
     expect((await f.core.status('SULF-1')).ribbon).toBe('expired restorable')
     f.sandbox.mockClear()
-    const result = await f.done(f.core.wake('SULF-1', 'link'))
+    // A tag pruned from ECR inside the TTL fails the restore instead of deploying a dead image.
+    let result = await f.done(f.core.wake('SULF-1', 'link'))
+    expect(result.state).toBe('failed')
+    expect(result.logs.at(-1)?.message).toBe(`Snapshot image ${image} is gone; rebuild the sandbox`)
+    expect(f.sandbox.mock.calls.some((c) => c[1] === 'deploy')).toBe(false)
+    expect(f.store.getSandbox('SULF-1')).toMatchObject({ state: 'expired', slot: undefined })
+    expect(f.leases.has('slot1')).toBe(false)
+    expect((await f.core.status('SULF-1')).ribbon).toBe('expired restorable')
+    f.imagePresent()
+    f.sandbox.mockClear()
+    result = await f.done(f.core.wake('SULF-1', 'link'))
     expect(result.state).toBe('succeeded')
-    expect(f.sandbox.mock.calls.some((c) => c[1] === 'image')).toBe(false)
     const deploy = f.sandbox.mock.calls.find((c) => c[1] === 'deploy')
     expect(deploy?.slice(1)).toEqual(['deploy', true, true])
     expect(readFileSync(deploy?.[0].configPath as string, 'utf8')).toContain(`value: ${image}`)
@@ -817,6 +859,7 @@ describe('snapshots', () => {
     if (!second) throw new Error('missing sandbox')
     second.lastUsedAt -= 60_000
     f.store.setSandbox(second)
+    f.imagePresent()
     // No deployments yet means nothing provably asleep, so nothing to evict.
     let result = await f.done(f.core.wake('SULF-1', 'link'))
     expect(result.state).toBe('failed')

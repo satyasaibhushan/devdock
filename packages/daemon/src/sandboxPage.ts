@@ -63,8 +63,7 @@ function shows(view: SandboxView): string {
   return `<div class="shows"><div class="sh"><span>shows</span><span class="ago">${esc(ago(snap.at))} by ${esc(snap.actor)}</span></div>${rows}</div>`
 }
 
-function sentence(view: SandboxView, error?: string): string {
-  if (error) return error
+function sentence(view: SandboxView): string {
   switch (view.ribbon) {
     case 'awake':
       return view.healthy ? 'Up; sending you over.' : 'Awake; waiting for pods to report ready.'
@@ -89,9 +88,10 @@ function shell(title: string, body: string, script = ''): string {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)}</title><style>${STYLE}</style></head><body>${body}${script}</body></html>`
 }
 
-// Poll the sandbox until it is awake and healthy, then leave for its URL. A
-// Restore button posts the same wake call the dashboard uses; the daemon's
-// same-origin rules admit it because this page is served from the daemon.
+// Poll the sandbox until it is awake and healthy, then leave for its URL. An
+// asleep sandbox is woken on load, and the Restore button posts the same wake call
+// the dashboard uses; the daemon's same-origin rules admit both because this page
+// is served from the daemon.
 const SCRIPT = `<script>
 (() => {
   const data = JSON.parse(document.getElementById('d').textContent)
@@ -105,17 +105,32 @@ const SCRIPT = `<script>
       if (v.ribbon === 'failed' && v.error) status.textContent = v.error
     } catch {}
   }
+  const wake = (evict) => fetch('/sandboxes/' + encodeURIComponent(data.key) + '/wake', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ actor: 'link', evict }),
+  })
+  const fail = async (res) => {
+    const body = await res.json().catch(() => ({}))
+    status.textContent = body.error ?? 'Wake failed.'
+    status.classList.add('err')
+    return String(body.error ?? '')
+  }
   const act = async (evict) => {
     const btn = document.getElementById('act')
     btn.disabled = true
-    const res = await fetch('/sandboxes/' + encodeURIComponent(data.key) + '/wake', {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ actor: 'link', evict }),
-    })
-    if (!res.ok) { status.textContent = (await res.json()).error; status.classList.add('err'); btn.disabled = false; return }
+    const res = await wake(evict)
+    if (!res.ok) { await fail(res); btn.disabled = false; return }
     status.textContent = 'Restoring; this page moves to the sandbox when it is ready.'
     setInterval(poll, 3000)
   }
+  // A wake already in flight (another tab, the dashboard) is not an error for this page.
+  if (data.wake) wake(false).then(async (res) => {
+    if (res.ok) return
+    if ((await fail(res)).includes('operation already active')) {
+      status.textContent = 'Waking; this page moves to the sandbox when it is ready.'
+      status.classList.remove('err')
+    }
+  }).catch(() => {})
   if (data.poll) setInterval(poll, 3000)
   const btn = document.getElementById('act')
   if (btn) btn.addEventListener('click', () => act(data.evict))
@@ -129,14 +144,14 @@ export const sandboxPage = {
       `<div class="card expired"><div class="rib expired">not found</div><div class="hd"><div class="k">${esc(key)}</div></div><div class="one">No sandbox is recorded for this key.</div></div>`,
     )
   },
-  card(view: SandboxView, error?: string): string {
+  card(view: SandboxView): string {
     const ribbonClass = view.ribbon.split(' ')[0]
+    const wake = Boolean(view.slot) && view.power === 'asleep' && view.ribbon === 'asleep'
     const poll =
-      !error &&
-      (view.ribbon === 'asleep' ||
-        view.ribbon === 'awake' ||
-        view.ribbon === 'partial' ||
-        view.ribbon === 'building')
+      view.ribbon === 'asleep' ||
+      view.ribbon === 'awake' ||
+      view.ribbon === 'partial' ||
+      view.ribbon === 'building'
     const restorable = view.ribbon === 'expired restorable'
     const evict = restorable && Boolean(view.evictionCandidate)
     const button = restorable
@@ -144,11 +159,11 @@ export const sandboxPage = {
       : view.ribbon === 'failed'
         ? `<a class="btn" href="/?sandbox=${encodeURIComponent(view.key)}">Build logs</a>`
         : ''
-    const data = JSON.stringify({ key: view.key, poll, evict }).replaceAll('</', '<\\/')
+    const data = JSON.stringify({ key: view.key, poll, evict, wake }).replaceAll('</', '<\\/')
     const body = `<div class="card ${restorable || view.ribbon === 'expired' ? 'expired' : ''}">
 <div class="rib ${ribbonClass}"><span>${esc(view.ribbon)}</span><span class="r">${esc(view.slot ?? 'no slot')}</span></div>
 <div class="hd"><div class="k">${esc(view.key)}</div>${view.title ? `<div class="n">${esc(view.title)}</div>` : ''}</div>
-<div id="one" class="one${error ? ' err' : ''}">${esc(sentence(view, error))}</div>
+<div id="one" class="one">${esc(sentence(view))}</div>
 ${shows(view)}
 <div class="ft"><a class="lk" href="${esc(view.link)}">${esc(view.link)}</a>${button}</div>
 </div><script id="d" type="application/json">${data}</script>`

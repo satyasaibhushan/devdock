@@ -521,6 +521,7 @@ export class Sandboxes {
       if (s.slot && this.pool().includes(s.slot) && observed.get(s.slot)?.data.key !== s.key) {
         s.slot = undefined
         s.state = 'expired'
+        s.expiredAt ??= Date.now()
         this.save(s)
       }
     }
@@ -627,7 +628,7 @@ export class Sandboxes {
       this.save(s)
     }
     const { power, healthy, urls } = await this.cluster(s)
-    const link = `http://127.0.0.1:7717/s/${encodeURIComponent(s.key)}`
+    const link = `http://127.0.0.1:${process.env.DEVDOCK_PORT ?? 7717}/s/${encodeURIComponent(s.key)}`
     const ribbon = sandboxRibbon(s, power, now)
     return {
       ...structuredClone(s),
@@ -785,7 +786,17 @@ export class Sandboxes {
             throw new Error(`Cannot evict ${candidate.key}`)
         }
         await this.lease(s)
-        await this.restoreImages(s)
+        try {
+          await this.restoreImages(s)
+        } catch (err) {
+          // A half-restored slot would read as wakeable with nothing deployed; hand it back and
+          // keep the original expiry so the failed attempt does not extend snapshot retention.
+          const expiredAt = s.expiredAt
+          await this.expireRecord(s).catch(() => undefined)
+          s.expiredAt = expiredAt
+          this.save(s)
+          throw err
+        }
       }
       await this.power(s, 1)
       s.state = 'active'
@@ -816,6 +827,14 @@ export class Sandboxes {
       const repo = this.config(s, m, path)
       const sync = await this.deps.supervisor.sandbox(repo, 'sync')
       if (sync.code !== 0) throw new Error(sync.stderr || 'Sandbox env sync failed')
+      // ECR lifecycle rules can prune a tag inside the snapshot TTL; deploying it would only
+      // leave pods in ImagePullBackOff.
+      const at = saved.image.lastIndexOf(':')
+      if (
+        (await this.queryImage(repo, saved.image.slice(0, at), saved.image.slice(at + 1))) ===
+        undefined
+      )
+        throw new Error(`Snapshot image ${saved.image} is gone; rebuild the sandbox`)
       this.recordedImage(repo, m, saved.image)
       // Recorded images are content-addressed in ECR, so skip-build redeploys exactly what was seen.
       const deployed = await this.deps.supervisor.sandbox(repo, 'deploy', true, true)
@@ -1042,7 +1061,12 @@ echo "SANDBOX_ARCH=$architecture"`,
             let dirtyFiles: string[] = []
             if (m.source.kind === 'worktree') {
               buildPath = mkdtempSync(`${path}-build-`)
-              dirtyFiles = await this.copyWorktree(m.source.path, buildPath)
+              try {
+                dirtyFiles = await this.copyWorktree(m.source.path, buildPath)
+              } catch (err) {
+                rmSync(buildPath, { recursive: true, force: true })
+                throw err
+              }
             } else
               await this.gitTask(root, async () => {
                 if (existsSync(path))
@@ -1143,6 +1167,9 @@ echo "SANDBOX_ARCH=$architecture"`,
       const from = join(source, file)
       if (!existsSync(from)) continue
       const stat = lstatSync(from)
+      // ls-files lists a submodule as its directory; its files would be missing from the image.
+      if (stat.isDirectory())
+        throw new Error(`Submodules are not supported in worktree members: ${file}`)
       if (!stat.isFile() && !stat.isSymbolicLink())
         throw new Error(`Unsupported worktree entry: ${file}`)
       mkdirSync(dirname(target), { recursive: true })

@@ -877,7 +877,7 @@ describe('stable sandbox link', () => {
     pool: [{ slot: 'slot1', key: 'SULF-1' }],
     ...over,
   })
-  it('redirects an awake healthy sandbox and polls while waking or building', async () => {
+  it('redirects an awake healthy sandbox and leaves waking to the page', async () => {
     const { svc } = makeService()
     const app = buildApp(svc)
     const status = vi.spyOn(svc, 'sandboxStatus').mockResolvedValue(view({}))
@@ -891,21 +891,16 @@ describe('stable sandbox link', () => {
       const asleep = await app.inject('/s/SULF-1')
       expect(asleep.statusCode).toBe(200)
       expect(asleep.headers['content-type']).toContain('text/html')
-      expect(wake).toHaveBeenCalledWith('SULF-1', 'link')
+      // GET never wakes: an <img> on any site could otherwise wake and extend a sandbox.
+      expect(wake).not.toHaveBeenCalled()
       expect(asleep.body).toContain('Waking the sandbox')
       expect(asleep.body).toContain('+1 files')
       expect(asleep.body).toContain('"poll":true')
-      wake.mockImplementation(() => {
-        throw new Error('Sandbox operation already active')
-      })
-      expect((await app.inject('/s/SULF-1')).body).toContain('Waking the sandbox')
-      wake.mockImplementation(() => {
-        throw new Error('Cannot determine sandbox power')
-      })
-      expect((await app.inject('/s/SULF-1')).body).toContain('Cannot determine sandbox power')
+      expect(asleep.body).toContain('"wake":true')
       status.mockResolvedValue(view({ power: 'asleep', healthy: false, ribbon: 'building' }))
-      wake.mockClear()
-      expect((await app.inject('/s/SULF-1')).body).toContain('Build in progress')
+      const building = await app.inject('/s/SULF-1')
+      expect(building.body).toContain('Build in progress')
+      expect(building.body).toContain('"wake":false')
       expect(wake).not.toHaveBeenCalled()
     } finally {
       await app.close()

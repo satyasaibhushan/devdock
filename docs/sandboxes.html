@@ -171,7 +171,7 @@
 
   <h2 id="power">6 · Wake and sleep</h2>
   <ul>
-    <li><b>Wake</b>: if any member is stale (<code>deployedSha ≠ headSha</code>) build it first, then patch <code>spec.replicas=1</code> on each member's api/ui deployment. Typical 20 to 60s when nothing is stale.</li>
+    <li><b>Wake</b>: patch <code>spec.replicas=1</code> on each member's api/ui deployment, showing what was last deployed; nothing is rebuilt. Stale members (<code>deployedSha ≠ headSha</code>) are left to the controller's next build. Typical 20 to 60s.</li>
     <li><b>Restore</b>: wake on an expired sandbox with a retained snapshot leases a free slot and deploys the recorded images with <code>--skip-build</code>; nothing is rebuilt. A full pool fails naming the least-recently-used asleep sandbox; <code>evict: true</code> expires that one first. Awake, building or creating sandboxes are never evicted. Without a snapshot the call fails: rebuild first.</li>
     <li><b>Sleep</b>: patch <code>spec.replicas=0</code>. Images and releases stay.</li>
     <li>Both are any-machine operations: only builds and dev sessions are tied to a machine.</li>
@@ -218,7 +218,7 @@
 
   <h2 id="http">10 · HTTP</h2>
   <p><code>GET /sandboxes</code>, <code>GET /sandboxes/:key</code>, <code>POST /sandboxes</code>, <code>PATCH /sandboxes/:key</code>, <code>POST /sandboxes/:key/{build,snapshot,wake,sleep}</code>, <code>DELETE /sandboxes/:key</code>. Read-only discovery is <code>GET /sandboxes/:key/discover</code>; controller parity adds <code>POST /sandboxes/:key/{expire,head}</code>. Every mutating body requires <code>actor</code>. Sandbox changes are pushed over the existing websocket as <code>sandbox</code> events.</p>
-  <p><b>Stable link</b>: <code>GET /s/:key</code> on the daemon (<code>http://127.0.0.1:7717/s/SULF-1234</code>) is the one URL a ticket or PR carries. Awake and healthy: 302 to the live URL. Asleep: the daemon triggers a wake (actor <code>link</code>) and serves a self-contained snapshot card that polls <code>GET /sandboxes/:key</code> and redirects when ready. Expired with a retained snapshot: the card offers Restore, or Evict and restore when the pool is full. No snapshot: a 404-style card. A failed wake shows its error; outside node hours (§2) that error is what the reader sees.</p>
+  <p><b>Stable link</b>: <code>GET /s/:key</code> on the daemon (<code>http://127.0.0.1:7717/s/SULF-1234</code>, port from <code>DEVDOCK_PORT</code>) is the one URL a ticket or PR carries. Awake and healthy: 302 to the live URL. Asleep: the daemon serves a self-contained snapshot card that POSTs the wake itself (actor <code>link</code>; the GET never mutates, so a cross-site <code>&lt;img&gt;</code> cannot wake a sandbox) and polls <code>GET /sandboxes/:key</code> and redirects when ready. Expired with a retained snapshot: the card offers Restore, or Evict and restore when the pool is full. No snapshot: a 404-style card. A failed wake shows its error; outside node hours (§2) that error is what the reader sees.</p>
 
   <h2 id="controller">11 · Controller</h2>
   <ul>

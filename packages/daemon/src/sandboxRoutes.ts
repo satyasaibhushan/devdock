@@ -2,9 +2,6 @@ import type { SandboxBuild, SandboxCreate, SandboxUpdate, Service } from '@devdo
 import type { FastifyInstance } from 'fastify'
 import { sandboxPage } from './sandboxPage.js'
 
-/** Actor recorded for wakes the stable link triggers on its own. */
-const LINK_ACTOR = 'link'
-
 export function sandboxRoutes(app: FastifyInstance, service: Service): void {
   app.get('/sandboxes/controller', () => service.sandboxControllerStatus())
   app.get('/sandboxes', () => service.listSandboxes())
@@ -49,8 +46,9 @@ export function sandboxRoutes(app: FastifyInstance, service: Service): void {
   })
 }
 
-/** The stable per-ticket link: redirect when the sandbox is up, otherwise wake or restore it
- *  and show the snapshot card while that happens. */
+/** The stable per-ticket link: redirect when the sandbox is up, otherwise show the snapshot card.
+ *  GET stays read-only: any page can make the browser load this URL without an Origin header, so
+ *  the wake is a same-origin POST the served page sends itself. */
 export function sandboxLinkRoute(app: FastifyInstance, service: Service): void {
   app.get<{ Params: { key: string } }>('/s/:key', async (req, reply) => {
     let view: Awaited<ReturnType<Service['sandboxStatus']>>
@@ -61,16 +59,7 @@ export function sandboxLinkRoute(app: FastifyInstance, service: Service): void {
     }
     if (view.power === 'awake' && view.healthy && view.urls[0])
       return reply.redirect(view.urls[0], 302)
-    let error: string | undefined
-    if (view.slot && view.power === 'asleep' && view.ribbon === 'asleep') {
-      try {
-        service.wakeSandbox(view.key, LINK_ACTOR)
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err)
-        if (!message.includes('operation already active')) error = message
-      }
-    }
     const status = view.ribbon === 'expired' ? 410 : 200
-    return reply.code(status).type('text/html').send(sandboxPage.card(view, error))
+    return reply.code(status).type('text/html').send(sandboxPage.card(view))
   })
 }

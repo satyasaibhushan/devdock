@@ -87,6 +87,8 @@ const AUTH_MAINTAIN_MS = 5 * 60 * 1000
  *  deleted by the hourly GC pass. */
 const REPLICA_TTL_MS = 2 * 24 * 60 * 60 * 1000
 const REPLICA_GC_MS = 60 * 60 * 1000
+/** Floor between filesystem scans triggered by unknown repo ids. */
+const MISS_SCAN_INTERVAL_MS = 10_000
 
 /** RFC 1123 label — what Kubernetes accepts as a namespace name. */
 const NAMESPACE_RE = /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/
@@ -218,6 +220,7 @@ export class Service {
   private readonly streamSpawner: SpawnFn
   private readonly store: StateStore
   private readonly repos = new Map<string, Repo>()
+  private missScanAt = 0
   private scanWarnings: string[] = []
   private readonly states = new Map<string, RepoState>()
   /** One log stream per workload: pod logs + verb activity. The `devspace dev`
@@ -682,6 +685,10 @@ export class Service {
     const replicas = this.store.listReplicas()
     // A replica record owns its id even when its checkout is missing.
     if (replicas.some((rec) => rec.id === id)) return undefined
+    // The scan is synchronous; a caller polling a stale id must not block the loop on every call.
+    const now = Date.now()
+    if (now - this.missScanAt < MISS_SCAN_INTERVAL_MS) return undefined
+    this.missScanAt = now
     const found = this.scanRoots(replicas, (warning) => console.warn(warning)).find(
       (r) => r.id === id,
     )
