@@ -8,7 +8,7 @@ import Fastify, { type FastifyInstance, type FastifyReply } from 'fastify'
 import type { AccessGate } from './accessGate.js'
 import { type Instances, peerPathAllowed } from './instances.js'
 import { type InstanceCall, type MoveFollowUp, moveDeployment, planMove } from './move.js'
-import { sandboxRoutes } from './sandboxRoutes.js'
+import { sandboxLinkRoute, sandboxRoutes } from './sandboxRoutes.js'
 import { copyStartupCommands } from './startup.js'
 
 const parseJson = (text: string): unknown => {
@@ -419,6 +419,7 @@ export function buildApp(
     })
     sandboxRoutes(sandboxApp, service)
   })
+  sandboxLinkRoute(app, service)
 
   // One-shot command in the workload's pod with a REAL exit code (kubectl
   // exec) — the agent-loop counterpart to /exec's fire-and-forget send-keys.

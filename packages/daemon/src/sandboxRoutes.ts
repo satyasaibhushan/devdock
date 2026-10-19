@@ -1,5 +1,9 @@
 import type { SandboxBuild, SandboxCreate, SandboxUpdate, Service } from '@devdock/core'
 import type { FastifyInstance } from 'fastify'
+import { sandboxPage } from './sandboxPage.js'
+
+/** Actor recorded for wakes the stable link triggers on its own. */
+const LINK_ACTOR = 'link'
 
 export function sandboxRoutes(app: FastifyInstance, service: Service): void {
   app.get('/sandboxes/controller', () => service.sandboxControllerStatus())
@@ -17,11 +21,17 @@ export function sandboxRoutes(app: FastifyInstance, service: Service): void {
   app.post<{ Params: { key: string }; Body: SandboxBuild }>('/sandboxes/:key/build', (req) =>
     service.buildSandbox(req.params.key, req.body),
   )
+  app.post<{ Params: { key: string }; Body: SandboxBuild }>('/sandboxes/:key/snapshot', (req) =>
+    service.snapshotSandbox(req.params.key, req.body),
+  )
   for (const action of ['wake', 'sleep', 'expire', 'delete'] as const) {
-    app.route<{ Params: { key: string }; Body: { actor: string } }>({
+    app.route<{ Params: { key: string }; Body: { actor: string; evict?: boolean } }>({
       method: action === 'delete' ? 'DELETE' : 'POST',
       url: action === 'delete' ? '/sandboxes/:key' : `/sandboxes/:key/${action}`,
-      handler: (req) => service[`${action}Sandbox`](req.params.key, req.body.actor),
+      handler: (req) =>
+        action === 'wake'
+          ? service.wakeSandbox(req.params.key, req.body.actor, { evict: req.body.evict })
+          : service[`${action}Sandbox`](req.params.key, req.body.actor),
     })
   }
   app.post<{
@@ -36,5 +46,31 @@ export function sandboxRoutes(app: FastifyInstance, service: Service): void {
       req.body.merged,
     )
     return { ok: true }
+  })
+}
+
+/** The stable per-ticket link: redirect when the sandbox is up, otherwise wake or restore it
+ *  and show the snapshot card while that happens. */
+export function sandboxLinkRoute(app: FastifyInstance, service: Service): void {
+  app.get<{ Params: { key: string } }>('/s/:key', async (req, reply) => {
+    let view: Awaited<ReturnType<Service['sandboxStatus']>>
+    try {
+      view = await service.sandboxStatus(req.params.key)
+    } catch {
+      return reply.code(404).type('text/html').send(sandboxPage.missing(req.params.key))
+    }
+    if (view.power === 'awake' && view.healthy && view.urls[0])
+      return reply.redirect(view.urls[0], 302)
+    let error: string | undefined
+    if (view.slot && view.power === 'asleep' && view.ribbon === 'asleep') {
+      try {
+        service.wakeSandbox(view.key, LINK_ACTOR)
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        if (!message.includes('operation already active')) error = message
+      }
+    }
+    const status = view.ribbon === 'expired' ? 410 : 200
+    return reply.code(status).type('text/html').send(sandboxPage.card(view, error))
   })
 }

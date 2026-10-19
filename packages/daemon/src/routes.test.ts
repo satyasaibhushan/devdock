@@ -716,7 +716,7 @@ it('serves sandbox reads on the development socket and validates actors on every
       { method: 'POST' as const, url: '/sandboxes' },
       { method: 'PATCH' as const, url: '/sandboxes/SULF-1' },
       { method: 'DELETE' as const, url: '/sandboxes/SULF-1' },
-      ...['build', 'wake', 'sleep', 'expire', 'head'].map((a) => ({
+      ...['build', 'snapshot', 'wake', 'sleep', 'expire', 'head'].map((a) => ({
         method: 'POST' as const,
         url: `/sandboxes/SULF-1/${a}`,
       })),
@@ -778,8 +778,24 @@ it('routes sandbox mutations and head updates to the core and forwards log/exec 
         payload: { actor: 'you' },
       })
       expect(response.json()).toEqual(receipt)
-      expect(method).toHaveBeenCalledWith('SULF-1', 'you')
+      if (action === 'wake')
+        expect(method).toHaveBeenCalledWith('SULF-1', 'you', { evict: undefined })
+      else expect(method).toHaveBeenCalledWith('SULF-1', 'you')
     }
+    const snapshot = vi.spyOn(svc, 'snapshotSandbox').mockReturnValue(receipt)
+    await app.inject({
+      method: 'POST',
+      url: '/sandboxes/SULF-1/snapshot',
+      payload: { actor: 'you', repo: 'svc-a' },
+    })
+    expect(snapshot).toHaveBeenCalledWith('SULF-1', { actor: 'you', repo: 'svc-a' })
+    const wake = vi.spyOn(svc, 'wakeSandbox').mockReturnValue(receipt)
+    await app.inject({
+      method: 'POST',
+      url: '/sandboxes/SULF-1/wake',
+      payload: { actor: 'you', evict: true },
+    })
+    expect(wake).toHaveBeenCalledWith('SULF-1', 'you', { evict: true })
     await app.inject({
       method: 'POST',
       url: '/sandboxes/SULF-1/head',
@@ -820,4 +836,147 @@ it('routes sandbox mutations and head updates to the core and forwards log/exec 
   } finally {
     await app.close()
   }
+})
+
+describe('stable sandbox link', () => {
+  const sha = 'a'.repeat(40)
+  const view = (
+    over: Partial<Awaited<ReturnType<Service['sandboxStatus']>>>,
+  ): Awaited<ReturnType<Service['sandboxStatus']>> => ({
+    key: 'SULF-1',
+    title: 'Fix login',
+    slot: 'slot1',
+    state: 'active',
+    lastUsedAt: Date.now(),
+    createdAt: Date.now(),
+    activity: [],
+    members: [
+      {
+        repo: 'svc-a',
+        workload: 'api',
+        source: { kind: 'branch', ref: 'SULF-1' },
+        mode: 'built',
+        headSha: sha,
+        deployedSha: sha,
+        build: { state: 'idle' },
+      },
+    ],
+    snapshot: {
+      at: Date.now(),
+      actor: 'you',
+      members: [{ repo: 'svc-a', workload: 'api', sha, dirtyFiles: ['src/a.ts'], image: 'img' }],
+    },
+    power: 'awake',
+    healthy: true,
+    ribbon: 'awake',
+    urls: ['https://slot1.example/'],
+    link: 'http://127.0.0.1:7717/s/SULF-1',
+    markdown: '',
+    expiresAt: 0,
+    allMerged: false,
+    pool: [{ slot: 'slot1', key: 'SULF-1' }],
+    ...over,
+  })
+  it('redirects an awake healthy sandbox and polls while waking or building', async () => {
+    const { svc } = makeService()
+    const app = buildApp(svc)
+    const status = vi.spyOn(svc, 'sandboxStatus').mockResolvedValue(view({}))
+    const wake = vi.spyOn(svc, 'wakeSandbox').mockReturnValue({ operationId: 'op1' })
+    try {
+      const awake = await app.inject('/s/SULF-1')
+      expect(awake.statusCode).toBe(302)
+      expect(awake.headers.location).toBe('https://slot1.example/')
+      expect(wake).not.toHaveBeenCalled()
+      status.mockResolvedValue(view({ power: 'asleep', healthy: false, ribbon: 'asleep' }))
+      const asleep = await app.inject('/s/SULF-1')
+      expect(asleep.statusCode).toBe(200)
+      expect(asleep.headers['content-type']).toContain('text/html')
+      expect(wake).toHaveBeenCalledWith('SULF-1', 'link')
+      expect(asleep.body).toContain('Waking the sandbox')
+      expect(asleep.body).toContain('+1 files')
+      expect(asleep.body).toContain('"poll":true')
+      wake.mockImplementation(() => {
+        throw new Error('Sandbox operation already active')
+      })
+      expect((await app.inject('/s/SULF-1')).body).toContain('Waking the sandbox')
+      wake.mockImplementation(() => {
+        throw new Error('Cannot determine sandbox power')
+      })
+      expect((await app.inject('/s/SULF-1')).body).toContain('Cannot determine sandbox power')
+      status.mockResolvedValue(view({ power: 'asleep', healthy: false, ribbon: 'building' }))
+      wake.mockClear()
+      expect((await app.inject('/s/SULF-1')).body).toContain('Build in progress')
+      expect(wake).not.toHaveBeenCalled()
+    } finally {
+      await app.close()
+    }
+  })
+  it('offers restore for expired snapshots, names the eviction candidate, and 404s unknown keys', async () => {
+    const { svc } = makeService()
+    const app = buildApp(svc)
+    const status = vi.spyOn(svc, 'sandboxStatus').mockResolvedValue(
+      view({
+        slot: undefined,
+        state: 'expired',
+        power: 'asleep',
+        healthy: false,
+        ribbon: 'expired restorable',
+        urls: [],
+      }),
+    )
+    const wake = vi.spyOn(svc, 'wakeSandbox').mockReturnValue({ operationId: 'op1' })
+    try {
+      const restorable = await app.inject('/s/SULF-1')
+      expect(restorable.statusCode).toBe(200)
+      expect(restorable.body).toContain('>Restore<')
+      expect(restorable.body).toContain('"evict":false')
+      expect(wake).not.toHaveBeenCalled()
+      status.mockResolvedValue(
+        view({
+          slot: undefined,
+          state: 'expired',
+          power: 'asleep',
+          healthy: false,
+          ribbon: 'expired restorable',
+          urls: [],
+          evictionCandidate: 'SULF-9',
+        }),
+      )
+      const full = await app.inject('/s/SULF-1')
+      expect(full.body).toContain('Evict SULF-9 and restore')
+      expect(full.body).toContain('"evict":true')
+      status.mockResolvedValue(
+        view({
+          slot: undefined,
+          state: 'expired',
+          snapshot: undefined,
+          ribbon: 'expired',
+          urls: [],
+        }),
+      )
+      const gone = await app.inject('/s/SULF-1')
+      expect(gone.statusCode).toBe(410)
+      expect(gone.body).toContain('aged out')
+      status.mockRejectedValue(new Error('unknown sandbox: SULF-1'))
+      const missing = await app.inject('/s/SULF-1')
+      expect(missing.statusCode).toBe(404)
+      expect(missing.body).toContain('No sandbox is recorded')
+      status.mockResolvedValue(
+        view({
+          title: '<b>x</b>',
+          power: 'asleep',
+          healthy: false,
+          ribbon: 'failed',
+          state: 'failed',
+          error: 'Build failed',
+        }),
+      )
+      const failed = await app.inject('/s/SULF-1')
+      expect(failed.body).toContain('&lt;b&gt;x&lt;/b&gt;')
+      expect(failed.body).toContain('Build failed')
+      expect(failed.body).toContain('Build logs')
+    } finally {
+      await app.close()
+    }
+  })
 })
