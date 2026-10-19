@@ -93,7 +93,7 @@
 
   <div class="box">
     <div class="t">TL;DR</div>
-    A <b>sandbox</b> is a ticket key bound to a <b>namespace slot</b> plus a list of <b>members</b> (repo + workload + PR or branch). Members are built as <code>persistent</code> images from detached git worktrees and helm-upgraded over the slot's UAT proxy releases. Short in-cluster service names resolve inside the slot, so members call each other and everything else proxies to <code>uat-us</code>. Pods sleep at 0 replicas until woken. Unused for 24h, a sandbox <b>expires</b>: its slot is reset and freed, the record stays for a one-click rebuild. Nothing is deleted except by an explicit agent or human call.
+    A <b>sandbox</b> is a ticket key bound to a <b>namespace slot</b> plus a list of <b>members</b> (repo + workload + an optional checkout path). Members are built as <code>persistent</code> images from a checkout's current files, uncommitted edits included, and helm-upgraded over the slot's UAT proxy releases. Short in-cluster service names resolve inside the slot, so members call each other and everything else proxies to <code>uat-us</code>. Pods sleep at 0 replicas until woken. Unused for 24h, a sandbox <b>expires</b>: its slot is reset and freed, the record stays for a one-click rebuild. Nothing is deleted except by an explicit agent or human call.
   </div>
 
   <h2 id="why">1 · Why</h2>
@@ -127,26 +127,28 @@
 <span class="k">interface</span> SandboxMember {
   repo: string                <span class="c">// devdock repo id</span>
   workload: string            <span class="c">// 'api' | 'ui' | 'worker' | 'cron' …</span>
-  source: { kind: 'pr', repoSlug, number, url } | { kind: 'branch', ref } | { kind: 'worktree', path }
+  path?: string               <span class="c">// absolute agent worktree; absent builds the registered checkout</span>
   mode: 'built' | 'dev'
-  headSha?, deployedSha?: string
-  dirtyFiles?: string[]       <span class="c">// worktree paths baked beyond deployedSha</span>
+  branch?: string             <span class="c">// checkout branch at the last build; absent when detached</span>
+  pr?: { number, url }        <span class="c">// best-effort gh pr view for that branch; display only</span>
+  deployedSha?: string
+  dirtyFiles?: string[]       <span class="c">// paths baked beyond deployedSha</span>
   image?: string              <span class="c">// content-addressed ECR ref of the last build</span>
   build: { state: 'idle'|'queued'|'building'|'failed', instanceId?, startedAt?, error? }
-  merged?: boolean
 }
 <span class="k">interface</span> SandboxSnapshot {
   at: number, actor: string
-  members: { repo, workload, sha, dirtyFiles: string[], image: string }[]
+  members: { repo, workload, sha, dirtyFiles: string[], image: string, branch?, pr? }[]
 }
 <span class="k">interface</span> ActivityEntry { at: number, actor: string, action: string, detail?: string }</pre>
   <ul>
     <li><b>Power</b> (<code>awake | asleep | partial</code>; <code>unknown</code> when cluster reads fail) is derived from the cluster on each reconcile, never stored.</li>
-    <li><b>actor</b> is required on every mutation: <code>you</code>, <code>agent:&lt;name&gt;</code>, <code>poller</code>, <code>sleeper</code>, <code>expiry</code>.</li>
+    <li><b>actor</b> is required on every mutation: <code>you</code>, <code>agent:&lt;name&gt;</code>, <code>link</code>, <code>controller</code>.</li>
+    <li><b>Legacy records</b>: members saved with a <code>source</code> still load. A <code>worktree</code> source keeps its path; <code>pr</code> and <code>branch</code> sources build from the registered checkout. <code>headSha</code>, <code>merged</code> and similar fields are ignored.</li>
     <li><b>Personal sandbox</b>: the kube context namespace (<code>saibhushan</code>) is shown as a sandbox whose members are today's repos in <code>dev</code> mode. It is a view over existing repo state, not a record, and keeps today's runtime behaviour exactly.</li>
     <li>Workers and crons default to 0 replicas: they would consume UAT's SQS messages. A member must name them explicitly.</li>
     <li><b>Snapshot</b>: a record, not storage. Images are already content-addressed in ECR; the snapshot names which image each member showed, at which sha, plus any uncommitted paths. It is written after every build that leaves all members deployed, and on demand.</li>
-    <li>The view adds <code>link</code> (the stable per-ticket URL, §10), <code>markdown</code> (a PR-body block: state, link, live URL, per-member <code>repo workload sha (+N uncommitted files)</code> against the source head), <code>healthy</code>, <code>ribbon</code>, <code>pool</code> and <code>evictionCandidate</code>.</li>
+    <li>The view adds <code>link</code> (the stable per-ticket URL, §10), <code>markdown</code> (a PR-body block: state, link, live URL, per-member <code>repo workload &lt;branch&gt; @ &lt;sha&gt; (+N uncommitted files) PR #n</code>), <code>healthy</code>, <code>ribbon</code>, <code>pool</code> and <code>evictionCandidate</code>.</li>
   </ul>
 
   <h2 id="slots">4 · Namespace slots</h2>
@@ -160,18 +162,19 @@
 
   <h2 id="build">5 · Building a member</h2>
   <ol>
-    <li>Worktree: detached checkout at <code>headSha</code> beside the parent checkout (same placement rule as replicas: outside any sync root), path <code>../.devdock-sb-&lt;slot&gt;-&lt;member-hash&gt;</code> (a stable hash of repo + workload, so two workloads of one repo can use different heads). PR heads are fetched as <code>pull/&lt;n&gt;/head</code> from the PR's repo, so fork PRs work.</li>
-    <li>A <code>worktree</code> source bakes an agent's checkout as it is: <code>git ls-files -co --exclude-standard</code> (tracked and untracked, ignored and deleted excluded) is copied into a devdock-owned temp build dir next to the member path and built from there, so generated configs never land in the agent's checkout. <code>headSha</code> is that checkout's HEAD; <code>dirtyFiles</code> are the changed and untracked paths. The controller does not poll worktree members; <code>devdock_sandbox_snapshot</code> rebuilds them from current files.</li>
-    <li>Env: <code>devspace run-pipeline sync-env</code> in the worktree with <code>--var ENVIRONMENT_NAME=&lt;slot&gt;</code>, so <code>prepare_local_env</code> rewrites hosts for the slot.</li>
+    <li>Source: the member's <code>path</code> (an agent worktree of the repo) or, when absent, the repo's registered checkout. devdock never checks out, fetches or switches branches; it builds whatever the checkout holds.</li>
+    <li>Copy: <code>git ls-files -co --exclude-standard</code> (tracked and untracked, ignored and deleted excluded) is copied into a devdock-owned temp build dir beside the parent checkout (same placement rule as replicas: outside any sync root, keyed by slot and a hash of repo + workload) and built from there, so generated configs never land in the source checkout. The dir is removed after the build. Submodules are refused.</li>
+    <li>Record: <code>deployedSha</code> is the source's HEAD, <code>dirtyFiles</code> its changed and untracked paths, <code>branch</code> its branch (absent when detached). With a branch, <code>gh pr view</code> (15s timeout) fills <code>pr</code>; any gh failure just leaves it out and never fails or stalls the build.</li>
+    <li>Env: <code>devspace run-pipeline sync-env</code> in the build dir with <code>--var ENVIRONMENT_NAME=&lt;slot&gt;</code>, so <code>prepare_local_env</code> rewrites hosts for the slot.</li>
     <li>Deploy: <code>devspace deploy -n &lt;slot&gt; -p persistent</code> with vars <code>ENVIRONMENT_NAME=&lt;slot&gt;</code>, <code>WORKLOAD_TYPE=&lt;workload&gt;</code>, <code>API_PERSISTENT_REPLICAS</code>/<code>WEB_PERSISTENT_REPLICAS</code> = current power (0 asleep, 1 awake), <code>CRON_/WORKER_PERSISTENT_REPLICAS=0</code> unless named.</li>
-    <li>Placement: the <code>persistent</code> profile pins <code>nodeSelector: workload: products</code> (the UAT nodegroup). A generated, untracked config in the worktree adds a values file setting <code>workload: development</code> so sandboxes never consume UAT capacity.</li>
+    <li>Placement: the <code>persistent</code> profile pins <code>nodeSelector: workload: products</code> (the UAT nodegroup). A generated, untracked config in the build dir adds a values file setting <code>workload: development</code> so sandboxes never consume UAT capacity.</li>
     <li>Same tag every build, so an awake member gets a <code>rollout restart</code> after a successful deploy.</li>
-    <li>One build per (sandbox, member). A newer <code>headSha</code> marks the running build stale; it restarts from the new head when done (latest wins).</li>
+    <li>One build per (sandbox, member). Builds run only when asked (create, build, snapshot, rebuild); nothing watches the checkout.</li>
   </ol>
 
   <h2 id="power">6 · Wake and sleep</h2>
   <ul>
-    <li><b>Wake</b>: patch <code>spec.replicas=1</code> on each member's api/ui deployment, showing what was last deployed; nothing is rebuilt. Stale members (<code>deployedSha ≠ headSha</code>) are left to the controller's next build. Typical 20 to 60s.</li>
+    <li><b>Wake</b>: patch <code>spec.replicas=1</code> on each member's api/ui deployment, showing what was last deployed; nothing is rebuilt. Typical 20 to 60s.</li>
     <li><b>Restore</b>: wake on an expired sandbox with a retained snapshot leases a free slot and deploys the recorded images with <code>--skip-build</code>; nothing is rebuilt. A full pool fails naming the least-recently-used asleep sandbox; <code>evict: true</code> expires that one first. Awake, building or creating sandboxes are never evicted. Without a snapshot the call fails: rebuild first.</li>
     <li><b>Sleep</b>: patch <code>spec.replicas=0</code>. Images and releases stay.</li>
     <li>Both are any-machine operations: only builds and dev sessions are tied to a machine.</li>
@@ -187,8 +190,7 @@
   <ul>
     <li><b>Used</b> = wake, build, or any mutating MCP/UI call. Request traffic is not tracked.</li>
     <li><b>Expire</b>: reset every member release in the slot to its default (UAT proxy for api, purge for others; a generated reset pipeline runs <code>create_deployments default</code> for api and <code>purge_deployments</code> for other members; the shared UI purge pipeline restores a proxy, so it cannot implement the non-api rule directly), delete the slot ConfigMap, remove worktrees, free the slot. Keep key, members, last shas, activity.</li>
-    <li><b>Rebuild</b>: lease a slot, build every member at current head, leave asleep unless asked to wake.</li>
-    <li><b>Merged PRs</b>: member gets <code>merged: true</code> and stops building. Never auto-deletes. When all members are merged, status says so for an agent to act on.</li>
+    <li><b>Rebuild</b>: lease a slot, build every member from its checkout's current files, leave asleep unless asked to wake.</li>
     <li><b>Delete</b>: explicit only. Expires first if active, then removes the record.</li>
   </ul>
 
@@ -203,34 +205,30 @@
   <table>
     <tr><th>Tool</th><th>Endpoint</th><th>Notes</th></tr>
     <tr><td><code>devdock_sandbox_list</code></td><td>/mcp</td><td>key, state, power, slot, member summary, urls, lastUsedAt, expiresAt</td></tr>
-    <tr><td><code>devdock_sandbox_status {key}</code></td><td>/mcp</td><td>full members with shas, build state and errors, urls, last 50 activity entries, allMerged</td></tr>
-    <tr><td><code>devdock_sandbox_discover {key}</code></td><td>/mcp</td><td>open PRs whose head branch contains the key, across repos devdock knows</td></tr>
-    <tr><td><code>devdock_sandbox_create {key, members?, discover?, wake?, actor}</code></td><td>/mcp/rw</td><td>returns operationId</td></tr>
-    <tr><td><code>devdock_sandbox_update {key, add?, remove?, actor}</code></td><td>/mcp/rw</td><td>membership; removal resets that release</td></tr>
-    <tr><td><code>devdock_sandbox_build {key, repo?, force?, actor}</code></td><td>/mcp/rw</td><td>stale members, or all with force; on an expired sandbox this is the rebuild</td></tr>
-    <tr><td><code>devdock_sandbox_snapshot {key, repo?, actor}</code></td><td>/mcp/rw</td><td>force-rebuild from the sources' current files (worktree members pick up new edits), deploy, record the snapshot</td></tr>
+    <tr><td><code>devdock_sandbox_status {key}</code></td><td>/mcp</td><td>full members with shas, build state and errors, urls, last 50 activity entries</td></tr>
+    <tr><td><code>devdock_sandbox_create {key, title?, members?, wake?, actor}</code></td><td>/mcp/rw</td><td>members are <code>{repo, workload, path?}</code>; agents pass their worktree path. Returns operationId</td></tr>
+    <tr><td><code>devdock_sandbox_update {key, add?, remove?, actor}</code></td><td>/mcp/rw</td><td>membership, same member shape as create; removal resets that release</td></tr>
+    <tr><td><code>devdock_sandbox_build {key, repo?, actor}</code></td><td>/mcp/rw</td><td>rebuild every member, or one repo, from its checkout's current files; on an expired sandbox this is the rebuild</td></tr>
+    <tr><td><code>devdock_sandbox_snapshot {key, repo?, actor}</code></td><td>/mcp/rw</td><td>same build from current files, then record the snapshot</td></tr>
     <tr><td><code>devdock_sandbox_wake {key, evict?, actor}</code> / <code>_sleep {key, actor}</code></td><td>/mcp/rw</td><td>wake may build first; on an expired sandbox it restores the snapshot (§6)</td></tr>
     <tr><td><code>devdock_sandbox_delete {key, actor}</code></td><td>/mcp/rw</td><td>the only deleting call</td></tr>
     <tr><td><code>devdock_sandbox_expire {key, actor}</code></td><td>/mcp/rw</td><td>Free the slot and retain the record; also callable by the later controller.</td></tr>
-    <tr><td><code>devdock_sandbox_head {key, repo, workload, sha, merged?, actor}</code></td><td>/mcp/rw</td><td>Record an observed head and optional merged state without starting a build.</td></tr>
   </table>
   <p>Logs and exec reuse <code>devdock_logs</code> / <code>devdock_exec</code> with an optional <code>sandbox</code> param. Sandbox exec also requires <code>actor</code> and runs in the member deployment through kubectl instead of a dev session. A test asserts every public sandbox method on the core service has an MCP tool, so the MCP surface cannot drift behind the UI.</p>
 
   <h2 id="http">10 · HTTP</h2>
-  <p><code>GET /sandboxes</code>, <code>GET /sandboxes/:key</code>, <code>POST /sandboxes</code>, <code>PATCH /sandboxes/:key</code>, <code>POST /sandboxes/:key/{build,snapshot,wake,sleep}</code>, <code>DELETE /sandboxes/:key</code>. Read-only discovery is <code>GET /sandboxes/:key/discover</code>; controller parity adds <code>POST /sandboxes/:key/{expire,head}</code>. Every mutating body requires <code>actor</code>. Sandbox changes are pushed over the existing websocket as <code>sandbox</code> events.</p>
+  <p><code>GET /sandboxes</code>, <code>GET /sandboxes/:key</code>, <code>POST /sandboxes</code>, <code>PATCH /sandboxes/:key</code>, <code>POST /sandboxes/:key/{build,snapshot,wake,sleep}</code>, <code>DELETE /sandboxes/:key</code>, plus <code>POST /sandboxes/:key/expire</code> and <code>GET /sandboxes/controller</code>. Every mutating body requires <code>actor</code>. Sandbox changes are pushed over the existing websocket as <code>sandbox</code> events.</p>
   <p><b>Stable link</b>: <code>GET /s/:key</code> on the daemon (<code>http://127.0.0.1:7717/s/SULF-1234</code>, port from <code>DEVDOCK_PORT</code>) is the one URL a ticket or PR carries. Awake and healthy: 302 to the live URL. Asleep: the daemon serves a self-contained snapshot card that POSTs the wake itself (actor <code>link</code>; the GET never mutates, so a cross-site <code>&lt;img&gt;</code> cannot wake a sandbox) and polls <code>GET /sandboxes/:key</code> and redirects when ready. Expired with a retained snapshot: the card offers Restore, or Evict and restore when the pool is full. No snapshot: a 404-style card. A failed wake shows its error; outside node hours (§2) that error is what the reader sees.</p>
 
   <h2 id="controller">11 · Controller</h2>
   <ul>
     <li><b>Leadership</b>: ConfigMap <code>devdock-controller</code> in the personal namespace, <code>{holder, renewedAt}</code>, renewed every 30s via resourceVersion CAS; another instance takes over after 90s of silence. Default holder: vmockbox (inside the network, no VPN). The Mac takes over when it is down.</li>
-    <li><b>Poller</b> (60s): for each active sandbox, read PR head sha and merged state with <code>gh</code>; record new heads with actor <code>poller</code>.</li>
-    <li><b>Debounced builds</b>: build a stale member after 5 min of quiet while asleep, 30s while awake.</li>
-    <li><b>Idle sleep</b>: awake sandbox with no use for 30 min goes to sleep (actor <code>sleeper</code>).</li>
-    <li><b>Expiry</b>: hourly sweep per §7 (actor <code>expiry</code>).</li>
-    <li>Builds may run on any instance that has the repo checked out, Docker and ECR auth; the leader assigns, a caller may pin an instance.</li>
+    <li><b>Idle sleep</b>: awake sandbox with no use for 30 min goes to sleep, checked every 30s tick.</li>
+    <li><b>Expiry</b>: hourly sweep per §7.</li>
+    <li>The controller never builds. Builds run only on an explicit create, build, snapshot or rebuild.</li>
   </ul>
 
-  <p>Controller implementation deviations: every action records actor <code>controller</code>. Leadership has no preferred host; any instance in <code>DEVDOCK_CONTROLLER=auto</code> (default) may acquire it, while <code>off</code> disables acquisition. Builds run locally on the leader through the existing lifecycle, without assignment or instance pinning. Branch heads are polled alongside PR heads. Scheduling runs on the 30s renewal tick, so a quiet period may finish up to 30s before a build starts. Failed heads require an explicit retry or a new head; controller head observations preserve idle and expiry clocks.</p>
+  <p>Controller implementation deviations: every action records actor <code>controller</code>. Leadership has no preferred host; any instance in <code>DEVDOCK_CONTROLLER=auto</code> (default) may acquire it, while <code>off</code> disables acquisition. Sandboxes with an operation in flight, personal sandboxes and ones without a slot are skipped.</p>
 
   <h2 id="ui">12 · UI</h2>
 <pre class="ascii">┌ devdock ───────────────────────── instances · auth · ● connected ┐
@@ -240,17 +238,17 @@
 │                      │ │ SULF-1234          │ │ PROJACS-746        ││
 │                      │ │ Up and ready.      │ │ Expired; images    ││
 │ ⌨ All terminals      │ │ SHOWS   by agent:x │ │ restore, no rebuild││
-│                      │ │ acs-org api a1f3   │ │ SHOWS              ││
-│                      │ │  = PR head         │ │ org-ui ui 44d0 +3  ││
+│                      │ │ acs-org api        │ │ SHOWS              ││
+│                      │ │ SULF-1234 @ a1f3   │ │ org-ui ui 44d0 +3  ││
 │                      │ │ /s/SULF-1234 [Open]│ │ /s/PROJ… [Restore] ││
 │                      │ └────────────────────┘ └────────────────────┘│
 └──────────────────────┴─────────────────────────────────────────────┘</pre>
   <ul>
-    <li><b>Snapshot cards</b>: the Sandboxes entry at the top of the sidebar opens a card grid under a thin rail of pool slots and their holders. One card per sandbox (personal first, full width): state ribbon (awake, building, asleep, expired restorable, failed), key and title, one sentence, a <i>shows</i> box listing per member <code>repo workload sha</code> with <code>= PR head</code>, <code>behind head</code> or <code>+N files</code>, the stable link, and one primary action: Open, Wake, Restore (or Evict and restore), or Build logs. The key opens the sandbox page below. <code>/s/:key</code> renders the same card server-side.</li>
+    <li><b>Snapshot cards</b>: the Sandboxes entry at the top of the sidebar opens a card grid under a thin rail of pool slots and their holders. One card per sandbox (personal first, full width): state ribbon (awake, building, asleep, expired restorable, failed), key and title, one sentence, a <i>shows</i> box listing per member <code>repo workload  branch @ sha7  PR #n  +N files</code>, the stable link, and one primary action: Open, Wake, Restore (or Evict and restore), or Build logs. The key opens the sandbox page below. <code>/s/:key</code> renders the same card server-side.</li>
     <li>The personal sandbox is selected by default; its detail is today's repo detail (verbs, logs, terminal, machine picker) with repos as rows and <b>+ add repo</b> searching discovered repos.</li>
     <li>The namespace picker leaves the top bar: choosing a sandbox chooses its namespace.</li>
-    <li>Ticket detail: header actions, URL chips, members table (deployed → head sha, build state, owning machine), activity feed with actors, log pane for the selected member.</li>
-    <li>New sandbox: type a key, discovered PRs come pre-ticked, Create starts one operation shown in the existing WorkflowPanel.</li>
+    <li>Ticket detail: header actions, URL chips, members table (checkout, deployed branch @ sha with PR and dirty files, build state, owning machine), activity feed with actors, log pane for the selected member.</li>
+    <li>New sandbox: type a key, add rows of repo, workload and an optional worktree path (empty builds the repo's checkout), Create starts one operation shown in the existing WorkflowPanel.</li>
   </ul>
 
   <h2 id="replicas">13 · Replicas</h2>
@@ -265,7 +263,7 @@
   <h2 id="prs">15 · PR plan</h2>
   <ol>
     <li><b>Core</b>: this spec, model, slots, builds, wake/sleep, expiry/rebuild/delete, recovery, HTTP and MCP with the parity test.</li>
-    <li><b>Controller</b>: leadership, poller, debounced builds, idle sleep, expiry sweep.</li>
+    <li><b>Controller</b>: leadership, idle sleep, expiry sweep.</li>
     <li><b>UI</b>: sandbox-first sidebar, personal sandbox, ticket detail.</li>
   </ol>
 
