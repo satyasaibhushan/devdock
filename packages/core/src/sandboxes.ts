@@ -13,6 +13,7 @@ import {
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { parse, parseDocument } from 'yaml'
 import type { RunResult } from './exec.js'
+import { parseIngressUrls } from './ingressUrl.js'
 import type { Operations } from './operations.js'
 import { replicaCheckoutPath } from './replicas.js'
 import {
@@ -111,6 +112,7 @@ export interface SandboxView extends Sandbox {
   healthy: boolean
   ribbon: SandboxRibbon
   urls: string[]
+  memberUrls: Record<string, string>
   /** The stable per-ticket link served by the daemon; wakes or restores on visit. */
   link: string
   /** Short PR-body block: ribbon, link, live URL, and what each member shows. */
@@ -641,8 +643,8 @@ export class Sandboxes {
   private async cluster(
     s: Sandbox,
     personal = false,
-  ): Promise<Pick<SandboxView, 'power' | 'healthy' | 'urls'>> {
-    if (!s.slot) return { power: 'asleep', healthy: false, urls: [] }
+  ): Promise<Pick<SandboxView, 'power' | 'healthy' | 'urls' | 'memberUrls'>> {
+    if (!s.slot) return { power: 'asleep', healthy: false, urls: [], memberUrls: {} }
     try {
       const deployments = JSON.parse(
         await this.checked('kubectl', [
@@ -678,7 +680,7 @@ export class Sandboxes {
             (d?.status?.observedGeneration ?? 0) >= (d?.metadata.generation ?? 0)
           )
         })
-      const ingresses = JSON.parse(
+      const ingresses = parseIngressUrls(
         await this.checked('kubectl', [
           'get',
           'ingresses',
@@ -687,35 +689,17 @@ export class Sandboxes {
           '-o',
           'json',
         ]),
-      ) as {
-        items: {
-          metadata?: { name?: string }
-          spec?: { rules?: { host?: string; http?: { paths?: { path?: string }[] } }[] }
-        }[]
+      )
+      const memberUrls: Record<string, string> = {}
+      for (const member of s.members) {
+        const name = personal ? this.repo(member).name : this.name(s, member)
+        const url = ingresses.get(name)
+        if (url) memberUrls[`${member.repo}:${member.workload}`] = url
       }
-      const urls = [
-        ...new Set(
-          ingresses.items
-            .filter((i) =>
-              personal
-                ? !i.metadata?.name?.split('-').some(sandboxSlot)
-                : i.metadata?.name?.split('-').includes(s.slot as string) &&
-                  !i.metadata.name.startsWith('devdock-'),
-            )
-            .flatMap((i) =>
-              (i.spec?.rules ?? []).flatMap((r) =>
-                r.host
-                  ? (r.http?.paths ?? [{ path: '/' }]).map(
-                      (p) => `https://${r.host}${p.path ?? '/'}`,
-                    )
-                  : [],
-              ),
-            ),
-        ),
-      ]
-      return { power, healthy, urls }
+      const urls = [...new Set(Object.values(memberUrls))]
+      return { power, healthy, urls, memberUrls }
     } catch {
-      return { power: 'unknown', healthy: false, urls: [] }
+      return { power: 'unknown', healthy: false, urls: [], memberUrls: {} }
     }
   }
   private async view(
@@ -728,7 +712,7 @@ export class Sandboxes {
       s.snapshot = undefined
       this.save(s)
     }
-    const { power, healthy, urls } = await this.cluster(s, personal)
+    const { power, healthy, urls, memberUrls } = await this.cluster(s, personal)
     const link = `http://127.0.0.1:${process.env.DEVDOCK_PORT ?? 7717}/s/${encodeURIComponent(s.key)}`
     const ribbon = sandboxRibbon(s, power, now)
     return {
@@ -739,6 +723,7 @@ export class Sandboxes {
       healthy,
       ribbon,
       urls,
+      memberUrls,
       link,
       markdown: sandboxMarkdown(s, ribbon, link, urls),
       expiresAt: s.lastUsedAt + sandboxTtl(),
@@ -1205,6 +1190,18 @@ echo "SANDBOX_ARCH=$architecture"`,
             m.branch = branch
             m.pr = pr
             m.build = { state: 'idle' }
+            // The ui chart renders `replicas: 0` as 1, so an asleep sandbox would
+            // come back with only this member up. Put it back to sleep.
+            if (!awake)
+              await this.checked('kubectl', [
+                'patch',
+                'deployment',
+                this.name(s, m),
+                '-n',
+                await this.namespace(),
+                '-p',
+                JSON.stringify({ spec: { replicas: 0 } }),
+              ])
             if (sandboxRestart(awake, previous, image))
               await this.checked('kubectl', [
                 'rollout',

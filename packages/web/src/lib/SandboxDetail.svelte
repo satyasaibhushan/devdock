@@ -15,6 +15,7 @@
   } from './api'
   import ConfirmModal from './ConfirmModal.svelte'
   import Icon from './Icon.svelte'
+  import LiveLink from './LiveLink.svelte'
   import SandboxLogs from './SandboxLogs.svelte'
   import SandboxMemberForm from './SandboxMemberForm.svelte'
   import { expiryLabel, memberBuildState, memberKey, relativeTime } from './sandboxUi'
@@ -46,11 +47,11 @@
   let error = $state('')
   let busy = $state(false)
   let confirm = $state<'expire' | 'delete' | null>(null)
-  let copied = $state('')
   let now = $state(Date.now())
   let operation = $state<Operation | null>(null)
   let dismissedOperation = $state('')
 
+  const memberUrl = $derived(picked ? sandbox.memberUrls[memberKey(picked)] : undefined)
   const memberKeys = $derived(sandbox.members.map(memberKey))
   const activity = $derived([...sandbox.activity].sort((a, b) => b.at - a.at))
   const expired = $derived(!sandbox.slot)
@@ -122,17 +123,6 @@
     run(() =>
       updateSandbox(sandbox.key, { remove: [{ repo: m.repo, workload: m.workload }] }, instance),
     )
-
-  async function copy(url: string) {
-    try {
-      await navigator.clipboard.writeText(url)
-      copied = url
-      setTimeout(() => (copied = ''), 1500)
-    } catch {
-      error = 'Could not copy the URL'
-    }
-  }
-
 </script>
 
 <div class="head">
@@ -175,6 +165,7 @@
   {#if sandbox.slot}<span class="fact mono" title="personal namespace suffix"><Icon name="layers" size={12} />{sandbox.slot}</span>{/if}
   {#if sandbox.power !== 'unknown'}<span class="fact">{sandbox.power}</span>{/if}
   <span class="fact" class:due={!!sandbox.slot && sandbox.expiresAt <= now}>{expiryLabel(sandbox, now)}</span>
+  {#if memberUrl}<LiveLink url={memberUrl} />{/if}
   <span class="spacer"></span>
   <details class="pop">
     <summary>Activity<span class="secs">{activity.length}</span></summary>
@@ -210,22 +201,6 @@
     {/if}
   {/if}
 </div>
-
-{#if sandbox.urls.length}
-  <div class="urls">
-    {#each sandbox.urls as url (url)}
-      <span class="chip">
-        <a href={url} target="_blank" rel="noreferrer" title={url}>
-          <span class="url">{url.replace(/^https?:\/\//, '')}</span>
-          <Icon name="external" size={11} />
-        </a>
-        <button class="copy" title="Copy URL" aria-label="Copy {url}" onclick={() => copy(url)}>
-          <Icon name={copied === url ? 'check' : 'copy'} size={11} />
-        </button>
-      </span>
-    {/each}
-  </div>
-{/if}
 
 {#if error}<p class="error" role="alert"><Icon name="alert" size={13} /><span>{error}</span></p>{/if}
 
@@ -474,61 +449,6 @@
     color: var(--muted);
   }
 
-  .urls {
-    display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 6px;
-    padding: 8px 16px;
-    border-bottom: 1px solid var(--line);
-  }
-  .chip {
-    display: inline-flex;
-    align-items: center;
-    max-width: 100%;
-    height: 24px;
-    background: var(--bg-2);
-    border: 1px solid var(--line-strong);
-    border-radius: var(--r-1);
-    overflow: hidden;
-  }
-  .chip a {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    min-width: 0;
-    height: 100%;
-    padding: 0 8px;
-    color: var(--accent);
-    text-decoration: none;
-    font-family: var(--mono);
-    font-size: 12px;
-  }
-  .chip a:hover {
-    background: var(--bg-3);
-  }
-  .url {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    max-width: 320px;
-  }
-  .copy {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 24px;
-    height: 100%;
-    border: 0;
-    border-left: 1px solid var(--line-strong);
-    background: transparent;
-    color: var(--muted);
-    padding: 0;
-  }
-  .copy:hover {
-    color: var(--ink);
-    background: var(--bg-3);
-  }
   .add {
     display: flex;
     align-items: center;

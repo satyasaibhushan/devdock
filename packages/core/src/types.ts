@@ -81,6 +81,7 @@ export interface Repo {
 /** Per-workload reconciled view for a multi-workload repo (one entry per
  *  `WORKLOAD_TYPE`). Single-workload repos have exactly one of these. */
 export interface WorkloadState {
+  url?: string
   /** Workload type, e.g. `api` | `cron` | `worker`. */
   type: string
   status: RepoStatus

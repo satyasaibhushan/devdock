@@ -1872,7 +1872,8 @@ export class Service {
         hasSession = false
       }
       const ws = await this.reconciler.reconcileWorkload(
-        scoped,
+        // Multi-config members carry their own id but share the replica's alias ingress.
+        repo.parentId ? { ...scoped, id: repo.id, parentId: repo.parentId } : scoped,
         hasSession,
         cc,
         type ?? repo.defaultWorkload ?? '',

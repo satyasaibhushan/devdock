@@ -2,6 +2,7 @@
 // Queries kubectl for pod + deployment reality, checks the tmux session,
 // derives status.
 import { type RunResult, run } from './exec.js'
+import { parseIngressUrls } from './ingressUrl.js'
 import { lifecycleActions } from './lifecycle.js'
 import type {
   DeploymentInfo,
@@ -169,7 +170,7 @@ export function parseDeployments(json: string): DeploymentInfo[] {
 
 /** One reconcile pass's worth of kubectl list results, keyed by query shape.
  *  Repos sharing a namespace share the answer — a 47-repo pass costs one
- *  `get pods` + one `get deployments` per namespace, not one pair per repo.
+ *  `get pods`, `get deployments`, and `get ingress` per namespace.
  *  Make a fresh cache per pass; a single-repo reconcile after a verb uses its
  *  own so it never sees pre-verb data. `null` records a query that FAILED —
  *  "couldn't ask" is cached too (don't re-ask a broken kubectl 47 times) but
@@ -177,13 +178,14 @@ export function parseDeployments(json: string): DeploymentInfo[] {
 export interface ClusterCache {
   pods: Map<string, PodInfo[] | null>
   deployments: Map<string, DeploymentInfo[] | null>
+  ingresses: Map<string, Map<string, string>>
   /** Every name that can claim pods/deployments this pass (repo, member, and
    *  workload-scoped names) — lets attribution give the longest name priority. */
   knownNames?: string[]
 }
 
 export function newClusterCache(): ClusterCache {
-  return { pods: new Map(), deployments: new Map() }
+  return { pods: new Map(), deployments: new Map(), ingresses: new Map() }
 }
 
 export class Reconciler {
@@ -215,8 +217,20 @@ export class Reconciler {
     const rawDeployments = await this.fetchDeployments(repo, cache)
     const pods = rawPods ?? []
     const deployments = matchDeployments(rawDeployments ?? [], repo.name, cache.knownNames)
+    const ingresses = await this.fetchIngresses(repo, cache)
+    // Replica aliases use a rewrite regex; their public entry point is /<id>/.
+    const aliasUrl = repo.parentId
+      ? ingresses.get(`${repo.id}-alias`)?.replace(`/${repo.id}(/|$)(.*)`, `/${repo.id}/`)
+      : undefined
+    // Prefix matching can attribute a sandbox's `<name>-sb1-…` deployment to this
+    // repo, so the ingress named exactly after the repo wins.
+    const url =
+      aliasUrl ??
+      ingresses.get(repo.name) ??
+      deployments.map((d) => ingresses.get(d.name.replace(/-devspace$/, ''))).find(Boolean)
     const ws: WorkloadState = {
       type,
+      ...(url ? { url } : {}),
       status: deriveStatus(pods, hasSession, deployments.length > 0, sessionDead, {
         deployedWhenRunning: repo.codeArea === 'frontend',
       }),
@@ -230,6 +244,20 @@ export class Reconciler {
     // the service can hold the last known status and skip retire decisions.
     if (rawPods === null || rawDeployments === null) ws.unreachable = true
     return ws
+  }
+
+  private async fetchIngresses(repo: Repo, cache: ClusterCache): Promise<Map<string, string>> {
+    const key = repo.namespace ?? ''
+    let ingresses = cache.ingresses.get(key)
+    if (ingresses === undefined) {
+      const args = ['get', 'ingress', '-o', 'json']
+      if (repo.namespace) args.push('-n', repo.namespace)
+      const r = await this.runner('kubectl', args).catch(() => undefined)
+      // Links are optional; a failed read must not affect lifecycle decisions.
+      ingresses = !r || r.code !== 0 ? new Map() : parseIngressUrls(r.stdout)
+      cache.ingresses.set(key, ingresses)
+    }
+    return ingresses
   }
 
   /** `null` = the query failed (cluster unreachable / bad credentials), which

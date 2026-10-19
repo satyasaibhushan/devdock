@@ -129,6 +129,7 @@ export function applySandboxEvent(list: SandboxView[], event: SandboxEvent): San
         healthy: false,
         ribbon,
         urls: [],
+        memberUrls: {},
         link: stableLink(list, event.key),
         markdown: '',
         pool: list[0]?.pool ?? [],

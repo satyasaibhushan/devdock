@@ -24,6 +24,7 @@ function sandbox(patch: Partial<SandboxView> = {}): SandboxView {
     activity: [],
     power: 'awake',
     urls: [],
+    memberUrls: {},
     expiresAt: 0,
     ...patch,
   }

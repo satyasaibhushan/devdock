@@ -33,6 +33,7 @@ const view = (over: Partial<SandboxView> = {}): SandboxView => ({
   healthy: true,
   ribbon: 'awake',
   urls: ['https://a.example'],
+  memberUrls: { 'acs-org:api': 'https://a.example' },
   link: 'http://127.0.0.1:7717/s/SULF-1',
   markdown: '',
   pool: [{ slot: 'sandbox-a', key: 'SULF-1' }],
@@ -71,14 +72,15 @@ describe('applySandboxEvent', () => {
     ])
   })
   it('keeps cluster-derived fields and slides expiry with lastUsedAt', () => {
-    const { power: _p, urls: _u, expiresAt: _e, ...record } = view()
+    const { power: _p, urls: _u, memberUrls: _mu, expiresAt: _e, ...record } = view()
     const [next] = applySandboxEvent([view()], { ...record, lastUsedAt: 2_000 })
     expect(next?.power).toBe('awake')
     expect(next?.urls).toEqual(['https://a.example'])
+    expect(next?.memberUrls).toEqual({ 'acs-org:api': 'https://a.example' })
     expect(next?.expiresAt).toBe(2_000 + 3_600_000)
   })
   it('appends an unknown sandbox with placeholder view fields', () => {
-    const { power: _p, urls: _u, expiresAt: _e, ...record } = view({ key: 'NEW' })
+    const { power: _p, urls: _u, memberUrls: _mu, expiresAt: _e, ...record } = view({ key: 'NEW' })
     const list = applySandboxEvent([view()], record)
     expect(list.map((s) => s.key)).toEqual(['SULF-1', 'NEW'])
     expect(list[1]).toMatchObject({
@@ -86,6 +88,7 @@ describe('applySandboxEvent', () => {
       ribbon: 'unknown',
       link: 'http://127.0.0.1:7717/s/NEW',
       urls: [],
+      memberUrls: {},
       expiresAt: 0,
       pool: [{ slot: 'sandbox-a', key: 'SULF-1' }],
     })

@@ -45,6 +45,7 @@ function fixture(instanceId = 'machine1') {
   >()
   const deployments = new Map<string, number>()
   const applied: { metadata: { name: string }; spec: unknown }[] = []
+  let ingressJson: string | undefined
   let head = sha1
   let branch = 'ticket'
   let gh: () => { code: number; stdout: string } = () => ({ code: 0, stdout: JSON.stringify(pr7) })
@@ -101,6 +102,8 @@ function fixture(instanceId = 'machine1') {
             spec: { replicas },
           })),
         })
+      if (args[1] === 'ingresses' && ingressJson !== undefined)
+        return { code: 0, stdout: ingressJson, stderr: '' }
       if (args[1] === 'ingresses')
         stdout = JSON.stringify({
           items: [
@@ -258,6 +261,9 @@ function fixture(instanceId = 'machine1') {
     emit,
     done,
     repoPath,
+    setIngresses: (items: unknown[]) => {
+      ingressJson = JSON.stringify({ items })
+    },
     setHead: (sha: string) => {
       head = sha
     },
@@ -284,9 +290,14 @@ describe('sandbox lifecycle', () => {
     ).toBe('succeeded')
     expect(f.store.getSandbox('SULF-1')?.members[0]?.deployedSha).toBe(sha1)
     expect(f.leases.get('sb1')?.data.members).toContain(sha1)
+    // Asleep builds scale back to zero even when a chart renders 0 replicas as 1.
+    expect(f.deployments.get('app-sb1-api')).toBe(0)
     expect((await f.core.status('SULF-1')).urls).toEqual([
       'https://api-personal-sb1-candidate.vmock.dev/app',
     ])
+    expect((await f.core.status('SULF-1')).memberUrls).toEqual({
+      'app:api': 'https://api-personal-sb1-candidate.vmock.dev/app',
+    })
     expect((await f.core.list())[0]?.personal).toBe(true)
     await f.done(f.core.wake('SULF-1', 'you'))
     expect(f.deployments.get('app-sb1-api')).toBe(1)
@@ -1035,7 +1046,9 @@ describe('snapshots', () => {
     second.lastUsedAt -= 60_000
     f.store.setSandbox(second)
     f.imagePresent()
-    // No deployments yet means nothing provably asleep, so nothing to evict.
+    // Awake sandboxes are never evicted.
+    f.deployments.set('app-sb1-api', 1)
+    f.deployments.set('app-sb2-api', 1)
     let result = await f.done(f.core.wake('SULF-1', 'link'))
     expect(result.state).toBe('failed')
     expect(result.logs.at(-1)?.message).toContain('no asleep sandbox to evict')
@@ -1200,4 +1213,64 @@ it('rewrites API and UI env before baking and configures each suffixed chart', a
   expect(f.applied.find((i) => i.metadata.name === 'devdock-sb1-tls')?.spec).toMatchObject({
     tls: [{ hosts: ['dashboard-personal-sb1.vmock.dev', 'api-personal-sb1-candidate.vmock.dev'] }],
   })
+})
+
+function linkIngress(name: string, host: string, path: string) {
+  return {
+    metadata: { name },
+    spec: { rules: [{ host, http: { paths: [{ path }, { path: `${path}-2` }] } }] },
+  }
+}
+
+it('maps only member ingresses and keeps URLs unique in member order', async () => {
+  const f = fixture()
+  f.store.setSandbox({
+    key: 'links',
+    slot: 'sb1',
+    state: 'active',
+    createdAt: Date.now(),
+    lastUsedAt: Date.now(),
+    activity: [],
+    members: ['ui', 'api', 'worker', 'cron'].map((workload) => ({
+      repo: 'app',
+      workload,
+      mode: 'built',
+      build: { state: 'idle' },
+    })),
+  })
+  f.setIngresses([
+    linkIngress('app-sb1-api', 'api.example', '/app'),
+    linkIngress('unrelated-sb1-api', 'other.example', '/'),
+    linkIngress('devdock-sb1-routing', 'routing.example', '/'),
+    linkIngress('app-sb1-ui', 'dashboard.example', '/'),
+    linkIngress('app-sb1-worker', 'api.example', '/app'),
+    { metadata: { name: 'app-sb1-cron' }, spec: { rules: [{ host: 'tls.example' }] } },
+    { metadata: { name: 'devdock-sb1-tls' }, spec: { tls: [{ hosts: ['tls.example'] }] } },
+  ])
+  const view = await f.core.status('links')
+  expect(view.memberUrls).toEqual({
+    'app:ui': 'https://dashboard.example/',
+    'app:api': 'https://api.example/app',
+    'app:worker': 'https://api.example/app',
+  })
+  expect(view.urls).toEqual(['https://dashboard.example/', 'https://api.example/app'])
+})
+
+it('maps personal member URLs by their unsuffixed deployment names', async () => {
+  const f = fixture()
+  f.deployments.set('app-api', 1)
+  f.deployments.set('app-ui', 1)
+  f.setIngresses([
+    linkIngress('app-api', 'api.example', '/app'),
+    linkIngress('app-ui', 'dashboard.example', '/'),
+    linkIngress('app-sb1-api', 'sandbox.example', '/app'),
+    linkIngress('unrelated', 'other.example', '/'),
+    { metadata: { name: 'personal' }, spec: { rules: [{ host: 'tls.example' }] } },
+  ])
+  const view = (await f.core.list()).find((s) => s.personal)
+  expect(view?.memberUrls).toEqual({
+    'app:api': 'https://api.example/app',
+    'app:ui': 'https://dashboard.example/',
+  })
+  expect(view?.urls).toEqual(['https://api.example/app', 'https://dashboard.example/'])
 })

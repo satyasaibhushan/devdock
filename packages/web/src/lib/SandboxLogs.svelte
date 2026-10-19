@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from 'svelte'
   import { fetchSandboxLogs } from './api'
 
   // Sandbox pods have no dev session, so there is no log socket to attach to.
@@ -19,7 +20,10 @@
   let loaded = $state(false)
   let box: HTMLDivElement
 
-  $effect(() => {
+  // The parent remounts this pane per member, so the poll starts once. Parent
+  // polls can still re-run an effect that tracks props, and a re-run would
+  // reset the pane while a slow read is in flight.
+  $effect(() => untrack(() => {
     const key = sandbox
     const member = { repo, workload }
     const machine = instance
@@ -47,7 +51,7 @@
         if (!disposed) error = e instanceof Error ? e.message : String(e)
       } finally {
         reading = false
-        loaded = true
+        if (!disposed) loaded = true
       }
     }
     void read()
@@ -56,7 +60,7 @@
       disposed = true
       clearInterval(poll)
     }
-  })
+  }))
 </script>
 
 <div class="logs" bind:this={box}>

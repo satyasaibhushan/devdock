@@ -4,6 +4,7 @@
   import InstancePanel from './lib/InstancePanel.svelte'
   import ConfirmModal from './lib/ConfirmModal.svelte'
   import Icon from './lib/Icon.svelte'
+  import LiveLink from './lib/LiveLink.svelte'
   import LogViewer from './lib/LogViewer.svelte'
   import MoveModal from './lib/MoveModal.svelte'
   import NewSandboxModal from './lib/NewSandboxModal.svelte'
@@ -595,6 +596,7 @@
       <div class="meta">
         <span class="fact" title="pods for this workload"><Icon name="layers" size={12} />{podCount} pod{podCount === 1 ? '' : 's'}</span>
         {#if selected.repo.ports.length}<span class="fact mono">:{selected.repo.ports.join(' :')}</span>{/if}
+        {#if active?.url}<LiveLink url={active.url} />{/if}
         {#if selected.repo.parentId}
           <span class="fact mono">/{selected.repo.id}/</span>
         {/if}

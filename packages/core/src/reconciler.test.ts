@@ -231,13 +231,111 @@ describe('Reconciler', () => {
   }
 
   /** Dispatches on the kubectl resource being listed. */
-  function clusterRunner(podsJson: string, deploymentsJson = '{"items":[]}') {
+  function clusterRunner(
+    podsJson: string,
+    deploymentsJson = '{"items":[]}',
+    ingressesJson = '{"items":[]}',
+  ) {
     return vi.fn(async (_cmd: string, args: string[]) => ({
       code: 0,
-      stdout: args[1] === 'deployments' ? deploymentsJson : podsJson,
+      stdout:
+        args[1] === 'deployments'
+          ? deploymentsJson
+          : args[1] === 'ingress'
+            ? ingressesJson
+            : podsJson,
       stderr: '',
     }))
   }
+
+  it.each(['svc-api', 'svc-api-devspace'])(
+    'carries the matched deployment URL into workload state: %s',
+    async (name) => {
+      const runner = clusterRunner(
+        '{"items":[]}',
+        JSON.stringify({ items: [{ metadata: { name: 'other-api' } }, { metadata: { name } }] }),
+        JSON.stringify({
+          items: [
+            {
+              metadata: { name: 'other-api' },
+              spec: { rules: [{ host: 'other.example', http: { paths: [{ path: '/' }] } }] },
+            },
+            {
+              metadata: { name: 'svc-api' },
+              spec: {
+                rules: [
+                  { host: 'svc.example', http: { paths: [{ path: '/svc' }, { path: '/svc-2' }] } },
+                ],
+              },
+            },
+          ],
+        }),
+      )
+      const state = await new Reconciler(runner).reconcile(repo, false)
+      expect(state.workloads[0]?.url).toBe('https://svc.example/svc')
+      expect(runner).toHaveBeenCalledWith('kubectl', ['get', 'ingress', '-o', 'json', '-n', 'ns'])
+    },
+  )
+
+  it.each([true, false])('prefers a replica alias when present: %s', async (aliasPresent) => {
+    const ingress = (name: string, path: string) => ({
+      metadata: { name },
+      spec: { rules: [{ host: 'svc.example', http: { paths: [{ path }] } }] },
+    })
+    const runner = clusterRunner(
+      '{"items":[]}',
+      JSON.stringify({ items: [{ metadata: { name: 'svc-r1-api-devspace' } }] }),
+      JSON.stringify({
+        items: [
+          ingress('svc-r1-api', '/svc'),
+          ...(aliasPresent ? [ingress('svc-r1-alias', '/svc-r1(/|$)(.*)')] : []),
+        ],
+      }),
+    )
+    const state = await new Reconciler(runner).reconcile(
+      { ...repo, id: 'svc-r1', name: 'svc-r1-api', parentId: 'svc' },
+      false,
+    )
+    expect(state.workloads[0]?.url).toBe(
+      aliasPresent ? 'https://svc.example/svc-r1/' : 'https://svc.example/svc',
+    )
+  })
+
+  it.each(['exit', 'throw'])(
+    'an ingress query failure leaves status and reachability unchanged: %s',
+    async (failure) => {
+      const base = clusterRunner('{"items":[]}', '{"items":[{"metadata":{"name":"svc"}}]}')
+      const runner = vi.fn(async (cmd: string, args: string[]) => {
+        if (args[1] !== 'ingress') return base(cmd, args)
+        if (failure === 'throw') throw new Error('Unavailable')
+        return { code: 1, stdout: '', stderr: 'Unavailable' }
+      })
+      const rec = new Reconciler(runner)
+      const cache = newClusterCache()
+      for (let i = 0; i < 2; i++) {
+        const state = await rec.reconcile(repo, false, cache)
+        expect(state.status).toBe('DEPLOYED')
+        expect(state.workloads[0]?.unreachable).toBeUndefined()
+        expect(state.workloads[0]?.url).toBeUndefined()
+      }
+      expect(runner.mock.calls.filter(([, args]) => args[1] === 'ingress')).toHaveLength(1)
+    },
+  )
+
+  it('caches ingress URLs separately for each namespace, including the current context', async () => {
+    const runner = clusterRunner('{"items":[]}')
+    const rec = new Reconciler(runner)
+    const cache = newClusterCache()
+    for (const namespace of ['ns', 'other', undefined, 'ns', 'other', undefined]) {
+      await rec.reconcile({ ...repo, namespace }, false, cache)
+    }
+    const calls = runner.mock.calls.filter(([, args]) => args[1] === 'ingress')
+    expect(calls.map(([, args]) => args)).toEqual([
+      ['get', 'ingress', '-o', 'json', '-n', 'ns'],
+      ['get', 'ingress', '-o', 'json', '-n', 'other'],
+      ['get', 'ingress', '-o', 'json'],
+    ])
+  })
 
   it('passes namespace to kubectl and reports status', async () => {
     const podsJson = JSON.stringify({
@@ -348,7 +446,7 @@ describe('Reconciler', () => {
     const other: Repo = { ...repo, id: 'svc2', name: 'svc2', session: 'devdock-svc2' }
     await rec.reconcile(repo, false, cache)
     await rec.reconcile(other, false, cache)
-    // one pods + one deployments call total, not two of each
-    expect(runner).toHaveBeenCalledTimes(2)
+    // One query for each resource, shared by both repos.
+    expect(runner).toHaveBeenCalledTimes(3)
   })
 })

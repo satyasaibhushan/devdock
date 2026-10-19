@@ -1945,7 +1945,7 @@ describe('Service replicas', () => {
         },
       ],
     })
-    const ingressJson = JSON.stringify({
+    let ingressJson = JSON.stringify({
       items: [
         { metadata: { name: 'parent-r1-api' }, spec: { rules: [{ host: 'api-ns.example.dev' }] } },
       ],
@@ -1983,7 +1983,11 @@ describe('Service replicas', () => {
     expect(manifest).toContain('path: /parent-r1(/|$)(.*)')
     expect(svc.listReplicas()[0]?.ingressApplied).toBe(true)
 
-    await svc.reconcileAll() // marked applied — later passes skip it
+    ingressJson = JSON.stringify({ items: [parseYaml(manifest)] })
+    const states = await svc.reconcileAll() // marked applied, later passes skip it
+    expect(
+      states.find((s) => s.repo.id === 'parent-r1')?.workloads.find((w) => w.type === 'api')?.url,
+    ).toBe('https://api-ns.example.dev/parent-r1/')
     expect(applied.length).toBe(afterFirst)
   })
 

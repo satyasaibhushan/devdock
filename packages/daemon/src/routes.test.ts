@@ -895,6 +895,7 @@ describe('stable sandbox link', () => {
     healthy: true,
     ribbon: 'awake',
     urls: ['https://slot1.example/'],
+    memberUrls: { 'svc-a:api': 'https://slot1.example/' },
     link: 'http://127.0.0.1:7717/s/SULF-1',
     markdown: '',
     expiresAt: 0,
@@ -943,6 +944,7 @@ describe('stable sandbox link', () => {
         healthy: false,
         ribbon: 'expired restorable',
         urls: [],
+        memberUrls: {},
       }),
     )
     const wake = vi.spyOn(svc, 'wakeSandbox').mockReturnValue({ operationId: 'op1' })
@@ -960,6 +962,7 @@ describe('stable sandbox link', () => {
           healthy: false,
           ribbon: 'expired restorable',
           urls: [],
+          memberUrls: {},
           evictionCandidate: 'SULF-9',
         }),
       )
@@ -973,6 +976,7 @@ describe('stable sandbox link', () => {
           snapshot: undefined,
           ribbon: 'expired',
           urls: [],
+          memberUrls: {},
         }),
       )
       const gone = await app.inject('/s/SULF-1')

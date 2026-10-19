@@ -12,6 +12,7 @@ export {
   type LifecycleStep,
 } from './lifecycle.js'
 export * from './exec.js'
+export { parseIngressUrls } from './ingressUrl.js'
 export { StateStore, type Grant, type ReplicaRecord } from './stateStore.js'
 export {
   nextReplicaId,

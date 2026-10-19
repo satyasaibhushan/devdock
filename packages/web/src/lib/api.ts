@@ -47,6 +47,7 @@ export interface Repo {
 
 /** One workload's reconciled view inside a (possibly multi-workload) repo. */
 export interface WorkloadState {
+  url?: string
   ownerInstanceId?: string
   ownershipKnown?: boolean
   instanceId?: string
@@ -681,6 +682,7 @@ export interface Sandbox {
 }
 export type SandboxRibbon = SandboxPower | 'building' | 'failed' | 'expired' | 'expired restorable'
 export interface SandboxView extends Sandbox {
+  memberUrls: Record<string, string>
   power: SandboxPower
   healthy: boolean
   ribbon: SandboxRibbon
