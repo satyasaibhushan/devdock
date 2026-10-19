@@ -10,7 +10,7 @@
   import ReplicaModal from './lib/ReplicaModal.svelte'
   import RepoList from './lib/RepoList.svelte'
   import SandboxDetail from './lib/SandboxDetail.svelte'
-  import SandboxList from './lib/SandboxList.svelte'
+  import SandboxGrid from './lib/SandboxGrid.svelte'
   import SandboxMemberList from './lib/SandboxMemberList.svelte'
   import StartupModal from './lib/StartupModal.svelte'
   import TerminalPanel from './lib/TerminalPanel.svelte'
@@ -52,7 +52,7 @@
   const pickedMember = $derived(selectedMember(ticketSandbox?.members ?? [], memberSelection))
   function selectMember(key: string) {
     memberSelection = key
-    if (selectedId === HOST_ID) selectedId = lastRepoId ?? repos[0]?.repo.id ?? null
+    leaveOverlay()
     const url = new URL(location.href)
     url.searchParams.set('member', key)
     history.replaceState(null, '', url)
@@ -61,8 +61,7 @@
     sandboxKey = key
     memberSelection = null
     addingMember = false
-    // Leaving "All terminals" lands on the last repo rather than an empty pane.
-    if (selectedId === HOST_ID) selectedId = lastRepoId ?? repos[0]?.repo.id ?? null
+    leaveOverlay()
     const url = new URL(location.href)
     url.searchParams.delete('member')
     if (key) url.searchParams.set('sandbox', key)
@@ -92,10 +91,18 @@
   // The repo shown before switching to "All terminals" or a ticket sandbox.
   let lastRepoId = $state<string | null>(null)
   $effect(() => {
-    if (selectedId && selectedId !== HOST_ID) lastRepoId = selectedId
+    if (selectedId && selectedId !== HOST_ID && selectedId !== GRID_ID) lastRepoId = selectedId
   })
-  // Sentinel selection for the host-machine terminal view (no repo attached).
+  // Sentinel selections for the host-machine terminal view and the sandbox
+  // card grid (no repo attached).
   const HOST_ID = '@host'
+  const GRID_ID = '@sandboxes'
+  const overlay = $derived(selectedId === HOST_ID || selectedId === GRID_ID)
+  // Leaving an overlay lands on the last repo rather than an empty pane.
+  function leaveOverlay() {
+    if (selectedId === HOST_ID || selectedId === GRID_ID)
+      selectedId = lastRepoId ?? repos[0]?.repo.id ?? null
+  }
   // The repo whose startup-script modal is open, or null when none.
   let customizingId = $state<string | null>(null)
   const customizing = $derived(repos.find((r) => r.repo.id === customizingId) ?? null)
@@ -399,14 +406,21 @@
 
 <main>
   <aside>
-    <SandboxList
-      {sandboxes}
-      selected={selectedId === HOST_ID ? undefined : sandboxKey}
-      {listState}
-      error={sandboxError}
-      onselect={selectSandbox}
-      onnew={() => (newSandbox = true)}
-    />
+    <div class="sbnav">
+      <button
+        class="hostbtn top"
+        class:selected={selectedId === GRID_ID}
+        title="Every sandbox as a snapshot card, with the namespace pool"
+        onclick={() => (selectedId = GRID_ID)}
+      >
+        <Icon name="box" size={13} />
+        <span>Sandboxes</span>
+        {#if ticketSandbox}<span class="ctx mono">{ticketSandbox.key}</span>{/if}
+      </button>
+      <button class="btn ghost icon sm" title="New sandbox" aria-label="New sandbox" onclick={() => (newSandbox = true)}>
+        <Icon name="plus" size={12} />
+      </button>
+    </div>
     {#if sandboxKey === null}
       <div class="repos">
         <RepoList
@@ -428,10 +442,10 @@
         {#if ticketSandbox}
           <SandboxMemberList
             members={ticketSandbox.members}
-            selectedKey={pickedMember && selectedId !== HOST_ID ? memberKey(pickedMember) : null}
+            selectedKey={pickedMember && !overlay ? memberKey(pickedMember) : null}
             onselect={selectMember}
             onadd={() => {
-              if (selectedId === HOST_ID) selectedId = lastRepoId ?? repos[0]?.repo.id ?? null
+              leaveOverlay()
               addingMember = true
             }}
           />
@@ -473,6 +487,18 @@
           {/key}
         </div>
       </div>
+    {:else if selectedId === GRID_ID}
+      {#key preferredEndpoint}
+        <SandboxGrid
+          {sandboxes}
+          instance={preferredEndpoint}
+          {listState}
+          error={sandboxError}
+          onopen={selectSandbox}
+          onnew={() => (newSandbox = true)}
+          onchanged={refreshSandboxes}
+        />
+      {/key}
     {:else if ticketSandbox}
       {#key `${preferredEndpoint}:${ticketSandbox.key}`}
         <SandboxDetail
@@ -812,6 +838,28 @@
   aside .repos {
     flex: 1;
     min-height: 0;
+  }
+  .sbnav {
+    display: flex;
+    align-items: center;
+    flex: none;
+    padding-right: 8px;
+    border-bottom: 1px solid var(--line);
+  }
+  .sbnav .hostbtn {
+    flex: 1;
+    min-width: 0;
+    border-top: 0;
+  }
+  .ctx {
+    margin-left: auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-size: 11.5px;
+    color: var(--accent);
+  }
+  .mono {
+    font-family: var(--mono);
   }
   .hostbtn {
     flex: none;

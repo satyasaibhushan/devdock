@@ -2,14 +2,17 @@ import { describe, expect, it } from 'vitest'
 import type { SandboxMember, SandboxView } from './api'
 import {
   applySandboxEvent,
+  cardAction,
+  cardSentence,
   expiryLabel,
   memberBuildState,
   memberKey,
   memberSource,
   memberStale,
   relativeTime,
-  sandboxHint,
   selectedMember,
+  showsCompare,
+  sourceLabel,
 } from './sandboxUi'
 
 const member = (over: Partial<SandboxMember> = {}): SandboxMember => ({
@@ -29,7 +32,12 @@ const view = (over: Partial<SandboxView> = {}): SandboxView => ({
   members: [member()],
   activity: [],
   power: 'awake',
+  healthy: true,
+  ribbon: 'awake',
   urls: ['https://a.example'],
+  link: 'http://127.0.0.1:7717/s/SULF-1',
+  markdown: '',
+  pool: [{ slot: 'sandbox-a', key: 'SULF-1' }],
   expiresAt: 1_000 + 3_600_000,
   allMerged: false,
   ...over,
@@ -79,23 +87,6 @@ describe('time labels', () => {
   })
 })
 
-describe('sandboxHint', () => {
-  it('ranks building over failed over stale, and says nothing when current', () => {
-    const stale = member({ headSha: 'a', deployedSha: 'b' })
-    expect(
-      sandboxHint({ slot: 'a', members: [stale, member({ build: { state: 'queued' } })] }),
-    ).toBe('building')
-    expect(
-      sandboxHint({ slot: 'a', members: [stale, member({ build: { state: 'failed' } })] }),
-    ).toBe('build failed')
-    expect(sandboxHint({ slot: 'a', members: [stale] })).toBe('stale')
-    expect(sandboxHint({ slot: undefined, members: [stale] })).toBeNull()
-    expect(
-      sandboxHint({ slot: 'a', members: [member({ headSha: 'a', deployedSha: 'a' })] }),
-    ).toBeNull()
-  })
-})
-
 describe('applySandboxEvent', () => {
   it('removes a deleted sandbox', () => {
     expect(applySandboxEvent([view(), view({ key: 'X' })], { key: 'X', deleted: true })).toEqual([
@@ -118,7 +109,62 @@ describe('applySandboxEvent', () => {
     const { power: _p, urls: _u, expiresAt: _e, allMerged: _m, ...record } = view({ key: 'NEW' })
     const list = applySandboxEvent([view()], record)
     expect(list.map((s) => s.key)).toEqual(['SULF-1', 'NEW'])
-    expect(list[1]).toMatchObject({ power: 'unknown', urls: [], expiresAt: 0 })
+    expect(list[1]).toMatchObject({
+      power: 'unknown',
+      ribbon: 'unknown',
+      link: 'http://127.0.0.1:7717/s/NEW',
+      urls: [],
+      expiresAt: 0,
+      pool: [{ slot: 'sandbox-a', key: 'SULF-1' }],
+    })
+  })
+})
+
+describe('snapshot cards', () => {
+  const saved = {
+    repo: 'acs-org',
+    workload: 'api',
+    sha: 'a'.repeat(40),
+    dirtyFiles: [],
+    image: 'i',
+  }
+  it('compares a snapshot row with its source head, dirty files first', () => {
+    expect(showsCompare(saved, member({ headSha: saved.sha }))).toEqual({
+      text: '= branch head',
+      tone: 'ok',
+    })
+    expect(showsCompare(saved, member({ headSha: 'b'.repeat(40) }))).toEqual({
+      text: 'behind branch head',
+      tone: 'warn',
+    })
+    expect(showsCompare({ ...saved, dirtyFiles: ['x'] }, member({ headSha: saved.sha }))).toEqual({
+      text: '+1 file',
+      tone: 'dirty',
+    })
+    expect(
+      showsCompare(
+        saved,
+        member({ headSha: saved.sha, source: { kind: 'worktree', path: '/w/app' } }),
+      ),
+    ).toEqual({ text: '', tone: 'none' })
+    expect(sourceLabel({ kind: 'worktree', path: '/w/app/' })).toBe('worktree app')
+  })
+  it('picks one primary action per ribbon', () => {
+    expect(cardAction(view())).toBe('open')
+    expect(cardAction(view({ urls: [] }))).toBe('logs')
+    expect(cardAction(view({ ribbon: 'asleep' }))).toBe('wake')
+    expect(cardAction(view({ ribbon: 'expired restorable' }))).toBe('restore')
+    expect(cardAction(view({ ribbon: 'expired restorable', evictionCandidate: 'X' }))).toBe('evict')
+    expect(cardAction(view({ ribbon: 'expired' }))).toBe(null)
+    expect(cardAction(view({ ribbon: 'failed' }))).toBe('logs')
+    expect(cardAction(view({ ribbon: 'building' }))).toBe('logs')
+  })
+  it('leads the sentence with the recorded error', () => {
+    expect(cardSentence(view({ ribbon: 'failed', error: 'Build failed' }), 0)).toBe('Build failed')
+    expect(
+      cardSentence(view({ ribbon: 'expired restorable', evictionCandidate: 'X' }), 0),
+    ).toContain('evicts X')
+    expect(cardSentence(view({ personal: true }), 0)).toBe('Personal namespace with 1 repo.')
   })
 })
 

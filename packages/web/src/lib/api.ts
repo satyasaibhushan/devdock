@@ -602,8 +602,10 @@ export function sendResize(ws: WebSocket, cols: number, rows: number): void {
 
 // ---- sandboxes ----
 // Ticket sandboxes: a namespace slot leased from a pool, a set of members (one
-// repo workload each, built from a PR or branch), woken and slept as a unit.
-// The personal sandbox is the kube context's own namespace, listed first.
+// repo workload each, built from a PR, branch or local worktree), woken and
+// slept as a unit. The personal sandbox is the kube context's own namespace,
+// listed first. A successful build records a snapshot: the images each member
+// showed, restorable after expiry without a rebuild.
 
 export interface SandboxMemberInput {
   repo: string
@@ -611,11 +613,15 @@ export interface SandboxMemberInput {
   source:
     | { kind: 'pr'; repoSlug: string; number: number; url: string }
     | { kind: 'branch'; ref: string }
+    | { kind: 'worktree'; path: string }
 }
 export interface SandboxMember extends SandboxMemberInput {
   mode: 'built' | 'dev'
   headSha?: string
   deployedSha?: string
+  /** Paths baked beyond deployedSha: a worktree's uncommitted changes. */
+  dirtyFiles?: string[]
+  image?: string
   build: {
     state: 'idle' | 'queued' | 'building' | 'failed'
     instanceId?: string
@@ -623,6 +629,18 @@ export interface SandboxMember extends SandboxMemberInput {
     error?: string
   }
   merged?: boolean
+}
+export interface SandboxSnapshotMember {
+  repo: string
+  workload: string
+  sha: string
+  dirtyFiles: string[]
+  image: string
+}
+export interface SandboxSnapshot {
+  at: number
+  actor: string
+  members: SandboxSnapshotMember[]
 }
 export interface SandboxActivity {
   at: number
@@ -641,13 +659,27 @@ export interface Sandbox {
   lastUsedAt: number
   members: SandboxMember[]
   activity: SandboxActivity[]
+  snapshot?: SandboxSnapshot
+  expiredAt?: number
+  /** Why the last operation failed, cleared when the next one starts. */
+  error?: string
 }
+export type SandboxRibbon = SandboxPower | 'building' | 'failed' | 'expired' | 'expired restorable'
 export interface SandboxView extends Sandbox {
   power: SandboxPower
+  healthy: boolean
+  ribbon: SandboxRibbon
   urls: string[]
+  /** The daemon's stable per-ticket link; it wakes or restores on visit. */
+  link: string
+  /** PR-body block describing what the sandbox shows. */
+  markdown: string
   expiresAt: number
   allMerged: boolean
   personal?: boolean
+  pool: { slot: string; key?: string }[]
+  /** Asleep sandbox a restore may evict; present only while the pool is full. */
+  evictionCandidate?: string
 }
 /** The `sandbox` WS event: a changed record, or a tombstone after delete. */
 export type SandboxEvent = Sandbox | { key: string; deleted: true }
@@ -718,12 +750,18 @@ export const buildSandbox = (
     ...input,
     actor: UI_ACTOR,
   })
-export const sandboxAction = (key: string, action: SandboxAction, instance: string) =>
+/** `evict` lets a restore into a full pool expire the daemon's eviction candidate. */
+export const sandboxAction = (
+  key: string,
+  action: SandboxAction,
+  instance: string,
+  options: { evict?: boolean } = {},
+) =>
   sandboxRequest<SandboxOperation>(
     action === 'delete' ? sandboxPath(key) : `${sandboxPath(key)}/${action}`,
     instance,
     action === 'delete' ? 'DELETE' : 'POST',
-    { actor: UI_ACTOR },
+    { ...options, actor: UI_ACTOR },
   )
 
 /** One page of a member's container logs. Pass the returned cursor back to

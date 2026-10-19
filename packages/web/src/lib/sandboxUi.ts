@@ -2,7 +2,13 @@
 // small status words the sidebar and detail show, and folding WS events into
 // the polled list between refreshes.
 
-import type { SandboxEvent, SandboxMember, SandboxMemberInput, SandboxView } from './api'
+import type {
+  SandboxEvent,
+  SandboxMember,
+  SandboxMemberInput,
+  SandboxSnapshotMember,
+  SandboxView,
+} from './api'
 
 /** The daemon's key rule; mirrored so the form can disable Create early. */
 export const SANDBOX_KEY = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/
@@ -32,8 +38,11 @@ export function memberSource(value: string): SandboxMemberInput['source'] {
 export const memberKey = (member: { repo: string; workload: string }) =>
   `${member.repo}:${member.workload}`
 
-export const sourceLabel = (source: SandboxMemberInput['source']) =>
-  source.kind === 'pr' ? `PR #${source.number}` : source.ref
+export function sourceLabel(source: SandboxMemberInput['source']): string {
+  if (source.kind === 'pr') return `PR #${source.number}`
+  if (source.kind === 'branch') return source.ref
+  return `worktree ${source.path.split('/').filter(Boolean).pop() ?? source.path}`
+}
 
 export const shortSha = (sha: string | undefined) => (sha ? sha.slice(0, 7) : '')
 
@@ -66,13 +75,77 @@ export function expiryLabel(sandbox: Pick<SandboxView, 'slot' | 'expiresAt'>, no
   return `expires in ${relativeTime(sandbox.expiresAt, now)}`
 }
 
-/** The one word the sidebar adds after the state, when something needs attention. */
-export function sandboxHint(sandbox: Pick<SandboxView, 'members' | 'slot'>): string | null {
-  if (sandbox.members.some((m) => m.build.state === 'building' || m.build.state === 'queued'))
-    return 'building'
-  if (sandbox.members.some((m) => m.build.state === 'failed')) return 'build failed'
-  if (sandbox.slot && sandbox.members.some(memberStale)) return 'stale'
-  return null
+/** What a snapshot row says next to its sha: dirty files beat head comparison,
+ *  and a worktree has no remote head to compare with. */
+export function showsCompare(
+  saved: SandboxSnapshotMember,
+  member: SandboxMember | undefined,
+): { text: string; tone: 'ok' | 'warn' | 'dirty' | 'none' } {
+  if (saved.dirtyFiles.length)
+    return {
+      text: `+${saved.dirtyFiles.length} file${saved.dirtyFiles.length === 1 ? '' : 's'}`,
+      tone: 'dirty',
+    }
+  if (!member?.headSha || member.source.kind === 'worktree') return { text: '', tone: 'none' }
+  const name = member.source.kind === 'pr' ? 'PR' : 'branch'
+  return saved.sha === member.headSha
+    ? { text: `= ${name} head`, tone: 'ok' }
+    : { text: `behind ${name} head`, tone: 'warn' }
+}
+
+/** The card's primary action; the one thing a visitor can do from the grid. */
+export type CardAction = 'open' | 'wake' | 'restore' | 'evict' | 'logs' | null
+export function cardAction(sandbox: SandboxView): CardAction {
+  if (sandbox.personal) return 'open'
+  switch (sandbox.ribbon) {
+    case 'awake':
+      return sandbox.urls.length ? 'open' : 'logs'
+    case 'asleep':
+    case 'partial':
+      return 'wake'
+    case 'expired restorable':
+      return sandbox.evictionCandidate ? 'evict' : 'restore'
+    case 'building':
+    case 'failed':
+      return 'logs'
+    default:
+      return null
+  }
+}
+
+/** The card's one sentence. */
+export function cardSentence(sandbox: SandboxView, now: number): string {
+  if (sandbox.personal) {
+    const repos = new Set(sandbox.members.map((m) => m.repo)).size
+    return `Personal namespace with ${repos} repo${repos === 1 ? '' : 's'}.`
+  }
+  if (sandbox.error) return sandbox.error
+  switch (sandbox.ribbon) {
+    case 'awake':
+      return sandbox.healthy ? 'Up and ready.' : 'Awake; pods are still reporting ready.'
+    case 'asleep':
+      return `Asleep; ${expiryLabel(sandbox, now)}. Wake takes a minute.`
+    case 'partial':
+      return 'Some workloads are awake.'
+    case 'building':
+      return 'Building; the snapshot updates when every member is deployed.'
+    case 'expired restorable':
+      return sandbox.evictionCandidate
+        ? `Pool full; restoring evicts ${sandbox.evictionCandidate}.`
+        : 'Expired; the recorded images restore without a rebuild.'
+    case 'expired':
+      return 'Expired without a retained snapshot; rebuild from its page.'
+    case 'failed':
+      return 'The last operation failed.'
+    default:
+      return 'Cluster state unavailable.'
+  }
+}
+
+/** The daemon's stable link for a key, on the same host as the links it already sent. */
+function stableLink(list: SandboxView[], key: string): string {
+  const origin = list.find((s) => s.link)?.link.replace(/\/s\/[^/]*$/, '')
+  return origin ? `${origin}/s/${encodeURIComponent(key)}` : ''
 }
 
 /** Fold a WS `sandbox` event into the last polled list. The event carries the
@@ -83,7 +156,23 @@ export function applySandboxEvent(list: SandboxView[], event: SandboxEvent): San
   const previous = list.find((s) => s.key === event.key)
   const allMerged = event.members.length > 0 && event.members.every((m) => m.merged === true)
   if (!previous) {
-    return [...list, { ...event, power: 'unknown', urls: [], expiresAt: 0, allMerged }]
+    const ribbon =
+      event.state === 'expired' ? 'expired' : event.state === 'failed' ? 'failed' : 'unknown'
+    return [
+      ...list,
+      {
+        ...event,
+        power: 'unknown',
+        healthy: false,
+        ribbon,
+        urls: [],
+        link: stableLink(list, event.key),
+        markdown: '',
+        pool: list[0]?.pool ?? [],
+        expiresAt: 0,
+        allMerged,
+      },
+    ]
   }
   const ttl = previous.expiresAt - previous.lastUsedAt
   const next: SandboxView = {

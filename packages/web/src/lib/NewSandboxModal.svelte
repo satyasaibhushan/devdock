@@ -136,7 +136,7 @@
           <input type="checkbox" bind:checked={c.checked} disabled={busy} />
           <span class="mono repo">{c.member.repo}</span>
           <span class="wl">{c.member.workload}</span>
-          <span class="src" title={c.member.source.kind === 'pr' ? c.member.source.url : c.member.source.ref}>
+          <span class="src" title={c.member.source.kind === 'pr' ? c.member.source.url : c.member.source.kind === 'branch' ? c.member.source.ref : c.member.source.path}>
             {sourceLabel(c.member.source)}
           </span>
           <span class="from">{c.discovered ? 'discovered' : 'manual'}</span>
