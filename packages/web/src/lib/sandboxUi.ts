@@ -41,6 +41,16 @@ export const shortSha = (sha: string | undefined) => (sha ? sha.slice(0, 7) : ''
 export const memberStale = (member: SandboxMember) =>
   !member.merged && (!member.deployedSha || member.deployedSha !== member.headSha)
 
+/** Build progress wins over freshness while a build is pending or failed. */
+export function memberBuildState(member: SandboxMember): string {
+  if (member.build.state !== 'idle') return member.build.state
+  return memberStale(member) ? 'stale' : 'ready'
+}
+
+export function selectedMember(members: SandboxMember[], key: string | null): SandboxMember | null {
+  return members.find((m) => memberKey(m) === key) ?? members[0] ?? null
+}
+
 /** Compact age or countdown: 45s, 22m, 3h, 2d. */
 export function relativeTime(at: number, now: number): string {
   const seconds = Math.max(0, Math.floor(Math.abs(at - now) / 1000))

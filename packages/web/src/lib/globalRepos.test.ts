@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest'
 import type { InstanceView, RepoState } from './api'
-import { globalRepos, instanceSymbol, ownerInstanceIds, retainOwners } from './globalRepos'
+import {
+  globalRepos,
+  instanceSymbol,
+  observationLogIssue,
+  ownerInstanceIds,
+  retainOwners,
+} from './globalRepos'
 
 function state(owner?: string, namespace = 'sai'): RepoState {
   return {
@@ -74,6 +80,38 @@ describe('global repo directory', () => {
       expect(workload).toMatchObject({ instanceId: 'box', unavailable: true, actions: [] })
     }
   })
+  it('uses fresh local observations when the owner is offline without allowing control', () => {
+    const local = state('box')
+    const pod = { name: 'accounts-api', phase: 'Running', ready: true, restartCount: 2 }
+    const active = local.workloads[0]
+    if (!active) throw new Error('Missing fixture workload')
+    active.pods = [pod]
+    active.status = 'RUNNING_EXTERNAL'
+    const stale = state('box')
+    const cached = stale.workloads[0]
+    if (!cached) throw new Error('Missing fixture workload')
+    cached.hasSession = true
+    const row = globalRepos([machine('mac', local), machine('box', stale, false)], 'box')[0]
+    expect(row?.workloads[0]).toMatchObject({
+      ownerInstanceId: 'box',
+      instanceId: 'box',
+      observationInstanceId: 'mac',
+      unavailable: true,
+      actions: [],
+      pods: [pod],
+      status: 'RUNNING_EXTERNAL',
+      hasSession: false,
+    })
+  })
+  it('does not use a different namespace or offline cache as a local observation', () => {
+    const row = globalRepos(
+      [machine('mac', state('box', 'other')), machine('box', state('box'), false)],
+      'box',
+    )[0]
+    expect(row?.workloads[0]?.observationInstanceId).toBeUndefined()
+    expect(row?.workloads[0]?.unavailable).toBe(true)
+  })
+
   it('uses the chosen machine only for unclaimed work', () => {
     const instances = [machine('mac', state()), machine('box', state())]
     expect(globalRepos(instances, 'box')[0]?.workloads[0]?.instanceId).toBe('box')
@@ -132,5 +170,21 @@ describe('machine symbols', () => {
 
   it('marks an unknown owner', () => {
     expect(instanceSymbol(undefined, [machine('mac')])).toBe('?')
+  })
+})
+
+describe('read-only observation logs', () => {
+  it('requires a local observer, a ready pod and usable Kubernetes auth', () => {
+    const instance = machine('mac')
+    const workload = state().workloads[0]
+    if (!workload) throw new Error('Missing fixture workload')
+    expect(observationLogIssue(workload, undefined)).toContain('No local observations')
+    expect(observationLogIssue(workload, instance)).toContain('No ready pod')
+    workload.pods = [{ name: 'pod', phase: 'Running', ready: true, restartCount: 0 }]
+    expect(observationLogIssue(workload, instance)).toBe('')
+    instance.auth = { oidc: true, phase: 'login_required', checkedAt: 0 }
+    expect(observationLogIssue(workload, instance)).toContain('Kubernetes authentication')
+    instance.auth.phase = 'ok'
+    expect(observationLogIssue(workload, instance)).toBe('')
   })
 })

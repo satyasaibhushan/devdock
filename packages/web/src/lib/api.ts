@@ -51,6 +51,8 @@ export interface WorkloadState {
   ownershipKnown?: boolean
   instanceId?: string
   unavailable?: boolean
+  /** Fresh local cluster observations when control through the owner is unavailable. */
+  observationInstanceId?: string
   type: string
   status: RepoStatus
   pods: PodInfo[]
@@ -168,6 +170,7 @@ export interface InstanceView {
   name: string
   local: boolean
   online: boolean
+  error?: string
   terminals?: boolean
   auth?: AuthState
   aws?: { configured: boolean; fresh: boolean }

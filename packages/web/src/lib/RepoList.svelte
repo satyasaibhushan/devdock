@@ -176,7 +176,7 @@
                 class="act {v}"
                 title="{VERB_LABEL[v]} {r.repo.id}"
                 aria-label="{VERB_LABEL[v]} {r.repo.id}"
-                disabled={busyId !== null}
+                disabled={busyId !== null || r.workloads.some((w) => w.unavailable)}
                 class:spin={busyId === r.repo.id && busyVerb === v}
                 onclick={(e) => {
                   e.stopPropagation()
@@ -195,7 +195,7 @@
                 class="act del"
                 title="delete replica {r.repo.id}"
                 aria-label="delete replica {r.repo.id}"
-                disabled={busyId !== null}
+                disabled={busyId !== null || r.workloads.some((w) => w.unavailable)}
                 onclick={(e) => {
                   e.stopPropagation()
                   onreplicadelete(r.repo.id)
@@ -206,7 +206,7 @@
                 class="act plus"
                 title="new replica of {r.repo.id}"
                 aria-label="new replica of {r.repo.id}"
-                disabled={busyId !== null}
+                disabled={busyId !== null || r.workloads.some((w) => w.unavailable)}
                 onclick={(e) => {
                   e.stopPropagation()
                   onreplicate(r.repo.id)
@@ -220,6 +220,7 @@
               }
               title="startup script for {r.repo.id}"
               aria-label="customize {r.repo.id}"
+              disabled={r.workloads.some((w) => w.unavailable)}
               onclick={(e) => {
                 e.stopPropagation()
                 oncustomize(r.repo.id)

@@ -69,13 +69,17 @@ export function globalRepos(instances: InstanceView[], preferred: string): RepoS
         : (candidates.find((c) => c.value.hasSession) ??
           candidates.find((c) => c.instance.id === preferred) ??
           candidates[0])
-      const value = source?.value ?? workload
       const unavailable =
         owners.length > 1 ||
         !source?.instance.online ||
         !candidates.some((c) => c.value.ownershipKnown === true)
+      const observation = unavailable
+        ? candidates.find((c) => c.instance.local && c.instance.online)
+        : undefined
+      const value = observation?.value ?? source?.value ?? workload
       return {
         ...value,
+        observationInstanceId: observation?.instance.id,
         ownerInstanceId: owner,
         instanceId: owner ?? source?.instance.id,
         unavailable,
@@ -120,4 +124,13 @@ export function workloadTarget(
 
 export function ownerInstanceIds(repo: RepoState): string[] {
   return [...new Set(repo.workloads.flatMap((w) => (w.ownerInstanceId ? [w.ownerInstanceId] : [])))]
+}
+
+export function observationLogIssue(workload: WorkloadState, observer?: InstanceView): string {
+  if (!observer) return 'No local observations or logs are available. Showing last known pod facts.'
+  if (observer.auth?.oidc && observer.auth.phase !== 'ok')
+    return 'Local pod logs are unavailable until Kubernetes authentication is ready.'
+  if (!workload.pods.some((pod) => pod.ready))
+    return 'No ready pod is available for local log streaming.'
+  return ''
 }

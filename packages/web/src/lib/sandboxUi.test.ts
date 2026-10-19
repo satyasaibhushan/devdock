@@ -3,10 +3,13 @@ import type { SandboxMember, SandboxView } from './api'
 import {
   applySandboxEvent,
   expiryLabel,
+  memberBuildState,
+  memberKey,
   memberSource,
   memberStale,
   relativeTime,
   sandboxHint,
+  selectedMember,
 } from './sandboxUi'
 
 const member = (over: Partial<SandboxMember> = {}): SandboxMember => ({
@@ -116,5 +119,34 @@ describe('applySandboxEvent', () => {
     const list = applySandboxEvent([view()], record)
     expect(list.map((s) => s.key)).toEqual(['SULF-1', 'NEW'])
     expect(list[1]).toMatchObject({ power: 'unknown', urls: [], expiresAt: 0 })
+  })
+})
+
+describe('memberBuildState', () => {
+  it('prioritizes build progress and failure over stale code', () => {
+    for (const state of ['queued', 'building', 'failed'] as const) {
+      expect(memberBuildState(member({ build: { state }, headSha: 'a' }))).toBe(state)
+    }
+  })
+  it('distinguishes undeployed, stale, current and merged members', () => {
+    expect(memberBuildState(member())).toBe('stale')
+    expect(memberBuildState(member({ headSha: 'a', deployedSha: 'b' }))).toBe('stale')
+    expect(memberBuildState(member({ headSha: 'a', deployedSha: 'a' }))).toBe('ready')
+    expect(memberBuildState(member({ merged: true }))).toBe('ready')
+  })
+})
+
+describe('selectedMember', () => {
+  it('selects a workload independently within the same repo', () => {
+    const api = member()
+    const worker = member({ workload: 'worker' })
+    expect(selectedMember([api, worker], memberKey(worker))).toBe(worker)
+  })
+  it('falls back after removal or an invalid URL selection and handles an empty sandbox', () => {
+    const first = member({ workload: '' })
+    expect(selectedMember([first], null)).toBe(first)
+    expect(selectedMember([first], 'removed:api')).toBe(first)
+    expect(selectedMember([first], memberKey(first))).toBe(first)
+    expect(selectedMember([], 'removed:api')).toBeNull()
   })
 })

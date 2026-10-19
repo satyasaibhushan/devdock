@@ -144,6 +144,43 @@ describe('daemon routes', () => {
     expect(denied.statusCode).toBe(403)
     await app.close()
   })
+  it.each([
+    [
+      '  SSH connection failed; check the host alias and socket\n',
+      'SSH connection failed; check the host alias and socket',
+    ],
+    ['Peer identity changed; relink explicitly', 'Peer identity changed; relink explicitly'],
+    ['request failed token=private-value https://user:password@peer', 'Peer unavailable'],
+  ])('reports a safe offline peer reason for %s', async (message, expected) => {
+    const { svc } = makeService()
+    const instances = new Instances(join(root, 'identity'))
+    vi.spyOn(instances, 'list').mockReturnValue([
+      {
+        id: 'peer',
+        name: 'box',
+        protocol: 1,
+        host: 'box',
+        endpoint: '127.0.0.1:8000',
+        terminals: false,
+      },
+    ])
+    vi.spyOn(instances, 'request').mockRejectedValue(new Error(message))
+    const app = buildApp(svc, undefined, instances)
+    try {
+      const response = await app.inject('/instances')
+      expect(response.statusCode).toBe(200)
+      expect(response.json()[1]).toMatchObject({
+        id: 'peer',
+        online: false,
+        error: expected,
+        repos: [],
+      })
+      expect(response.json()[0]).not.toHaveProperty('error')
+    } finally {
+      await app.close()
+    }
+  })
+
   it('GET /health', async () => {
     const { svc } = makeService()
     const app = buildApp(svc)
