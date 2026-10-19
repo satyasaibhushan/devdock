@@ -636,3 +636,127 @@ describe('daemon routes', () => {
     expect(bad.statusCode).toBe(400)
   })
 })
+
+it('serves sandbox reads on the development socket and validates actors on every write', async () => {
+  const { svc } = makeService()
+  const app = buildAgentApp(svc)
+  vi.spyOn(svc, 'listSandboxes').mockResolvedValue([])
+  vi.spyOn(svc, 'sandboxStatus').mockRejectedValue(new Error('unknown sandbox: missing'))
+  try {
+    expect((await app.inject({ method: 'GET', url: '/sandboxes' })).statusCode).toBe(200)
+    expect((await app.inject({ method: 'GET', url: '/sandboxes/controller' })).json()).toEqual({
+      holder: null,
+      isLeader: false,
+      lastPollAt: null,
+      lastError: null,
+    })
+    expect((await app.inject({ method: 'GET', url: '/sandboxes/missing' })).statusCode).toBe(404)
+    const writes = [
+      { method: 'POST' as const, url: '/sandboxes' },
+      { method: 'PATCH' as const, url: '/sandboxes/SULF-1' },
+      { method: 'DELETE' as const, url: '/sandboxes/SULF-1' },
+      ...['build', 'wake', 'sleep', 'expire', 'head'].map((a) => ({
+        method: 'POST' as const,
+        url: `/sandboxes/SULF-1/${a}`,
+      })),
+    ]
+    for (const route of writes) {
+      for (const payload of [{}, { actor: ' ' }, { actor: 42 }]) {
+        const response = await app.inject({ ...route, payload })
+        expect(response.statusCode).toBe(400)
+        expect(response.json()).toEqual({ error: 'actor required' })
+      }
+    }
+  } finally {
+    await app.close()
+  }
+})
+
+it('routes sandbox mutations and head updates to the core and forwards log/exec targets', async () => {
+  const { svc } = makeService()
+  const app = buildApp(svc)
+  const receipt = { operationId: 'op1' }
+  const create = vi.spyOn(svc, 'createSandbox').mockResolvedValue(receipt)
+  const update = vi.spyOn(svc, 'updateSandbox').mockReturnValue(receipt)
+  const build = vi.spyOn(svc, 'buildSandbox').mockReturnValue(receipt)
+  const head = vi.spyOn(svc, 'recordHead').mockResolvedValue()
+  const query = vi
+    .spyOn(svc, 'queryLogs')
+    .mockResolvedValue({ source: 'container', lines: [], cursor: '' })
+  const run = vi.spyOn(svc, 'runInWorkload').mockResolvedValue({
+    ok: true,
+    exitCode: 0,
+    stdout: 'slot',
+    stderr: '',
+    timedOut: false,
+    truncated: false,
+  })
+  try {
+    const body = { key: 'SULF-1', actor: 'you' }
+    expect((await app.inject({ method: 'POST', url: '/sandboxes', payload: body })).json()).toEqual(
+      receipt,
+    )
+    expect(create).toHaveBeenCalledWith(body)
+    await app.inject({
+      method: 'PATCH',
+      url: '/sandboxes/SULF-1',
+      payload: { actor: 'you', remove: [] },
+    })
+    expect(update).toHaveBeenCalledWith('SULF-1', { actor: 'you', remove: [] })
+    await app.inject({
+      method: 'POST',
+      url: '/sandboxes/SULF-1/build',
+      payload: { actor: 'you', force: true },
+    })
+    expect(build).toHaveBeenCalledWith('SULF-1', { actor: 'you', force: true })
+    for (const action of ['wake', 'sleep', 'expire', 'delete'] as const) {
+      const method = vi.spyOn(svc, `${action}Sandbox`).mockReturnValue(receipt)
+      const response = await app.inject({
+        method: action === 'delete' ? 'DELETE' : 'POST',
+        url: action === 'delete' ? '/sandboxes/SULF-1' : `/sandboxes/SULF-1/${action}`,
+        payload: { actor: 'you' },
+      })
+      expect(response.json()).toEqual(receipt)
+      expect(method).toHaveBeenCalledWith('SULF-1', 'you')
+    }
+    await app.inject({
+      method: 'POST',
+      url: '/sandboxes/SULF-1/head',
+      payload: { repo: 'svc-a', workload: 'api', sha: 'a'.repeat(40), actor: 'poller' },
+    })
+    expect(head).toHaveBeenCalledWith(
+      'SULF-1',
+      expect.objectContaining({ repo: 'svc-a' }),
+      'a'.repeat(40),
+      'poller',
+      undefined,
+    )
+    await app.inject('/repos/svc-a/logs/query?sandbox=SULF-1&workload=api')
+    expect(query).toHaveBeenCalledWith(
+      'svc-a',
+      expect.objectContaining({ sandbox: 'SULF-1', workload: 'api' }),
+    )
+    expect(
+      (
+        await app.inject({
+          method: 'POST',
+          url: '/repos/svc-a/exec?sandbox=SULF-1',
+          payload: { command: 'pwd' },
+        })
+      ).statusCode,
+    ).toBe(400)
+    const exec = await app.inject({
+      method: 'POST',
+      url: '/repos/svc-a/exec?sandbox=SULF-1&workload=api',
+      payload: { command: 'pwd', actor: 'you' },
+    })
+    expect(exec.json()).toEqual({ ok: true, code: 0, stdout: 'slot', stderr: '' })
+    expect(run).toHaveBeenCalledWith('svc-a', 'pwd', {
+      sandbox: 'SULF-1',
+      workload: 'api',
+      actor: 'you',
+    })
+  } finally {
+    await app.close()
+  }
+})

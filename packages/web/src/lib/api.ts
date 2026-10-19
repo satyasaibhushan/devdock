@@ -596,3 +596,156 @@ export const TERM_CTL = '\x01'
 export function sendResize(ws: WebSocket, cols: number, rows: number): void {
   ws.send(`${TERM_CTL}${JSON.stringify({ type: 'resize', cols, rows })}`)
 }
+
+// ---- sandboxes ----
+// Ticket sandboxes: a namespace slot leased from a pool, a set of members (one
+// repo workload each, built from a PR or branch), woken and slept as a unit.
+// The personal sandbox is the kube context's own namespace, listed first.
+
+export interface SandboxMemberInput {
+  repo: string
+  workload: string
+  source:
+    | { kind: 'pr'; repoSlug: string; number: number; url: string }
+    | { kind: 'branch'; ref: string }
+}
+export interface SandboxMember extends SandboxMemberInput {
+  mode: 'built' | 'dev'
+  headSha?: string
+  deployedSha?: string
+  build: {
+    state: 'idle' | 'queued' | 'building' | 'failed'
+    instanceId?: string
+    startedAt?: number
+    error?: string
+  }
+  merged?: boolean
+}
+export interface SandboxActivity {
+  at: number
+  actor: string
+  action: string
+  detail?: string
+}
+export type SandboxState = 'creating' | 'active' | 'expired' | 'failed'
+export type SandboxPower = 'awake' | 'asleep' | 'partial' | 'unknown'
+export interface Sandbox {
+  key: string
+  title?: string
+  slot?: string
+  state: SandboxState
+  createdAt: number
+  lastUsedAt: number
+  members: SandboxMember[]
+  activity: SandboxActivity[]
+}
+export interface SandboxView extends Sandbox {
+  power: SandboxPower
+  urls: string[]
+  expiresAt: number
+  allMerged: boolean
+  personal?: boolean
+}
+/** The `sandbox` WS event: a changed record, or a tombstone after delete. */
+export type SandboxEvent = Sandbox | { key: string; deleted: true }
+export interface SandboxControllerStatus {
+  holder: string | null
+  isLeader: boolean
+  lastPollAt: number | null
+  lastError: string | null
+}
+export interface SandboxOperation {
+  operationId: string
+}
+export type SandboxAction = 'wake' | 'sleep' | 'expire' | 'delete'
+
+/** Every UI mutation is attributed to the `ui` actor in the activity feed. */
+const UI_ACTOR = 'ui'
+
+async function sandboxRequest<T>(
+  path: string,
+  instance: string,
+  method = 'GET',
+  body?: object,
+): Promise<T> {
+  const response = await fetch(
+    path,
+    body
+      ? { method, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }
+      : { method },
+    instance,
+  )
+  if (!response.ok) {
+    const result = (await response.json().catch(() => null)) as { error?: string } | null
+    throw new Error(result?.error ?? `${method} ${path} → ${response.status}`)
+  }
+  return response.json()
+}
+const sandboxPath = (key: string) => `/sandboxes/${encodeURIComponent(key)}`
+
+export const fetchSandboxes = (instance: string) =>
+  sandboxRequest<SandboxView[]>('/sandboxes', instance)
+export const fetchSandbox = (key: string, instance: string) =>
+  sandboxRequest<SandboxView>(sandboxPath(key), instance)
+export const fetchSandboxController = (instance: string) =>
+  sandboxRequest<SandboxControllerStatus>('/sandboxes/controller', instance)
+/** Open PRs whose head branch mentions the ticket key, one proposed member each. */
+export const discoverSandbox = (key: string, instance: string) =>
+  sandboxRequest<SandboxMemberInput[]>(`${sandboxPath(key)}/discover`, instance)
+export const createSandbox = (
+  input: { key: string; title?: string; members: SandboxMemberInput[]; wake?: boolean },
+  instance: string,
+) => sandboxRequest<SandboxOperation>('/sandboxes', instance, 'POST', { ...input, actor: UI_ACTOR })
+export const updateSandbox = (
+  key: string,
+  input: { add?: SandboxMemberInput[]; remove?: { repo: string; workload: string }[] },
+  instance: string,
+) =>
+  sandboxRequest<SandboxOperation>(sandboxPath(key), instance, 'PATCH', {
+    ...input,
+    actor: UI_ACTOR,
+  })
+/** Build every stale member, or one repo's; `force` rebuilds even when current. */
+export const buildSandbox = (
+  key: string,
+  input: { repo?: string; force?: boolean },
+  instance: string,
+) =>
+  sandboxRequest<SandboxOperation>(`${sandboxPath(key)}/build`, instance, 'POST', {
+    ...input,
+    actor: UI_ACTOR,
+  })
+export const sandboxAction = (key: string, action: SandboxAction, instance: string) =>
+  sandboxRequest<SandboxOperation>(
+    action === 'delete' ? sandboxPath(key) : `${sandboxPath(key)}/${action}`,
+    instance,
+    action === 'delete' ? 'DELETE' : 'POST',
+    { actor: UI_ACTOR },
+  )
+
+/** One page of a member's container logs. Pass the returned cursor back to
+ *  read only what arrived since; omit it to start from the tail. */
+export interface SandboxLogPage {
+  lines: string[]
+  cursor: string
+  resync?: boolean
+}
+export const fetchSandboxLogs = (
+  key: string,
+  member: { repo: string; workload: string },
+  instance: string,
+  cursor?: string,
+  tail = 200,
+) => {
+  const params = new URLSearchParams({
+    sandbox: key,
+    workload: member.workload,
+    source: 'container',
+  })
+  if (cursor) params.set('cursor', cursor)
+  else params.set('tail', String(tail))
+  return sandboxRequest<SandboxLogPage>(
+    `/repos/${encodeURIComponent(member.repo)}/logs/query?${params}`,
+    instance,
+  )
+}

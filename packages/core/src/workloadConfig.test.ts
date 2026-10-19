@@ -3,9 +3,9 @@ import { mkdtempSync, readFileSync, readlinkSync, rmSync, writeFileSync } from '
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
+import type { Repo } from './types.js'
 import { prepareWorkloadConfig, workloadConfigPath } from './workloadConfig.js'
 import { scopeRepo } from './workloads.js'
-import type { Repo } from './types.js'
 
 const dirs: string[] = []
 afterEach(() => {

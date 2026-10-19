@@ -5,6 +5,7 @@
 import type { LogSource, RepoState, WorkflowAction } from '@devdock/core'
 import { z } from 'zod'
 import type { DaemonClient, MoveFollowUp, RepoVerb, VerbResult } from './client.js'
+import { sandboxTools } from './sandboxTools.js'
 
 export type Scope = 'ro' | 'rw'
 
@@ -77,6 +78,7 @@ const VERBS: Array<{ verb: RepoVerb; description: string }> = [
 /** All tool definitions, regardless of scope. */
 export function allTools(client: DaemonClient): ToolDef[] {
   return [
+    ...sandboxTools(client),
     {
       name: 'devdock_operation_start',
       scope: 'rw',
@@ -180,6 +182,7 @@ export function allTools(client: DaemonClient): ToolDef[] {
       inputSchema: {
         ...repoArg,
         ...workloadArg,
+        sandbox: z.string().optional(),
         source: z.enum(['auto', 'application', 'container', 'devdock']).optional(),
         cursor: z.string().optional().describe('cursor from a previous devdock_logs/devdock_wait'),
         tail: z.number().int().positive().max(2000).optional(),
@@ -188,6 +191,7 @@ export function allTools(client: DaemonClient): ToolDef[] {
       handler: async (a) => {
         const r = await client.queryLogs(a.repo as string, {
           workload: a.workload as string | undefined,
+          ...(a.sandbox !== undefined ? { sandbox: a.sandbox as string } : {}),
           source: a.source as LogSource | undefined,
           cursor: a.cursor as string | undefined,
           tail: a.tail as number | undefined,
@@ -412,6 +416,8 @@ export function allTools(client: DaemonClient): ToolDef[] {
       inputSchema: {
         ...repoArg,
         ...workloadArg,
+        sandbox: z.string().optional(),
+        actor: z.string().trim().min(1).optional(),
         command: z.string().min(1).describe('shell command to run'),
       },
       handler: async (a) =>
@@ -422,6 +428,7 @@ export function allTools(client: DaemonClient): ToolDef[] {
             a.repo as string,
             a.command as string,
             a.workload as string | undefined,
+            ...(a.sandbox !== undefined ? ([a.sandbox as string, a.actor as string] as const) : []),
           ),
         ),
     },

@@ -6,9 +6,11 @@
   import Icon from './lib/Icon.svelte'
   import LogViewer from './lib/LogViewer.svelte'
   import MoveModal from './lib/MoveModal.svelte'
-  import NamespacePicker from './lib/NamespacePicker.svelte'
+  import NewSandboxModal from './lib/NewSandboxModal.svelte'
   import ReplicaModal from './lib/ReplicaModal.svelte'
   import RepoList from './lib/RepoList.svelte'
+  import SandboxDetail from './lib/SandboxDetail.svelte'
+  import SandboxList from './lib/SandboxList.svelte'
   import StartupModal from './lib/StartupModal.svelte'
   import TerminalPanel from './lib/TerminalPanel.svelte'
   import WorkflowPanel from './lib/WorkflowPanel.svelte'
@@ -16,20 +18,43 @@
   import {
     type AuthState,
     type InstanceView,
-    type NamespaceInfo,
     type RepoState,
+    type SandboxControllerStatus,
+    type SandboxEvent,
+    type SandboxView,
     type Verb,
     adoptRepo,
     deleteReplica,
     fetchAuth,
-    fetchNamespace,
     fetchInstances,
+    fetchSandboxController,
+    fetchSandboxes,
     moveDeployment,
     openEvents,
-    switchNamespace,
     stopSession,
   } from './lib/api'
+  import { applySandboxEvent } from './lib/sandboxUi'
 
+  // Sandboxes come from the preferred machine. The personal one is the kube
+  // namespace itself; the repo list below it is its detail, so `sandboxKey`
+  // null means "personal" and the existing repo selection applies.
+  let sandboxes = $state<SandboxView[]>([])
+  let sandboxError = $state('')
+  let sandboxKey = $state<string | null>(new URLSearchParams(location.search).get('sandbox'))
+  let controller = $state<SandboxControllerStatus | null>(null)
+  let newSandbox = $state(false)
+  // The create operation id, so the new sandbox's detail shows progress at once.
+  let createdOperation = $state({ key: '', id: '' })
+  const ticketSandbox = $derived(sandboxes.find((s) => !s.personal && s.key === sandboxKey) ?? null)
+  function selectSandbox(key: string | null) {
+    sandboxKey = key
+    // Leaving "All terminals" lands on the last repo rather than an empty pane.
+    if (selectedId === HOST_ID) selectedId = lastRepoId ?? repos[0]?.repo.id ?? null
+    const url = new URL(location.href)
+    if (key) url.searchParams.set('sandbox', key)
+    else url.searchParams.delete('sandbox')
+    history.replaceState(null, '', url)
+  }
   let instances = $state<InstanceView[]>([])
   let preferred = $state(new URLSearchParams(location.search).get('instance') ?? '')
   const repos = $derived(globalRepos(instances, preferred))
@@ -46,10 +71,15 @@
     const url = new URL(location.href)
     url.searchParams.set('instance', id)
     history.replaceState(null, '', url)
-    auth = null; nsInfo = null
+    auth = null
     void refresh()
   }
   let selectedId = $state<string | null>(new URLSearchParams(location.search).get('repo'))
+  // The repo shown before switching to "All terminals" or a ticket sandbox.
+  let lastRepoId = $state<string | null>(null)
+  $effect(() => {
+    if (selectedId && selectedId !== HOST_ID) lastRepoId = selectedId
+  })
   // Sentinel selection for the host-machine terminal view (no repo attached).
   const HOST_ID = '@host'
   // The repo whose startup-script modal is open, or null when none.
@@ -69,9 +99,6 @@
   let busy = $state<{ id: string; verb: Verb } | null>(null)
   let activeOperation = $state<Operation | null>(null)
   let toast = $state<string | null>(null)
-  // The kube context's namespace + the selectable list (null until first fetch).
-  let nsInfo = $state<NamespaceInfo | null>(null)
-  let nsBusy = $state(false)
   // Kubernetes OIDC auth (null until first fetch / older daemon).
   let auth = $state<AuthState | null>(null)
   // The "move external session here" confirmation flow.
@@ -138,22 +165,12 @@
       instances = retainOwners(next, instances)
       if (!instances.some((i) => i.id === preferred)) preferred = instances.find((i) => i.local)?.id ?? instances[0]?.id ?? ''
       connected = true
+      await refreshSandboxes()
       if (!selectedId && repos.length) selectedId = repos[0]?.repo.id ?? null
     } catch {
       connected = false
     }
     loaded = true
-    // Polled alongside repos so a `kn` run in a terminal shows up here too.
-    // Skipped mid-switch so the poll can't flash the old namespace back.
-    if (!nsBusy) {
-      try {
-        const id = controlEndpoint
-        const next = await fetchNamespace(id)
-        if (id === controlEndpoint) nsInfo = next
-      } catch {
-        /* older daemon or offline — the picker just stays hidden */
-      }
-    }
     try {
       const id = controlEndpoint
       const next = await fetchAuth(id)
@@ -164,20 +181,24 @@
     refreshing = false
   }
 
-  // Switch the kube context's namespace (what `kn <ns>` does), then re-pull
-  // everything so statuses reflect the new namespace right away.
-  async function changeNamespace(ns: string) {
-    if (nsBusy) return
-    nsBusy = true
+  // Results are dropped if the preferred machine changed mid-flight so a slow
+  // answer from the old one cannot overwrite the new one's list.
+  async function refreshSandboxes() {
+    const endpoint = preferredEndpoint
     try {
-      nsInfo = await switchNamespace(ns, controlEndpoint)
-      await refresh()
+      const [next, status] = await Promise.all([
+        fetchSandboxes(endpoint),
+        fetchSandboxController(endpoint).catch(() => null),
+      ])
+      if (endpoint !== preferredEndpoint) return
+      sandboxes = next
+      controller = status
+      sandboxError = ''
+      // A deleted or never-existing sandbox falls back to the personal one.
+      if (sandboxKey && !next.some((s) => s.key === sandboxKey)) selectSandbox(null)
     } catch (e) {
-      toast = `namespace switch failed: ${e instanceof Error ? e.message : String(e)}`
-      setTimeout(() => (toast = null), 4000)
-      throw e // lets the picker snap its select back
-    } finally {
-      nsBusy = false
+      if (endpoint !== preferredEndpoint) return
+      sandboxError = e instanceof Error ? e.message : String(e)
     }
   }
 
@@ -185,7 +206,16 @@
     refresh()
     const poll = setInterval(refresh, 4000)
     const ws = openEvents()
-    ws.onmessage = () => refresh()
+    ws.onmessage = (message: MessageEvent<string>) => {
+      // Sandbox events carry the new view, so the sidebar moves before the poll.
+      try {
+        const event = JSON.parse(message.data) as { type?: string; sandbox?: SandboxEvent }
+        if (event.type === 'sandbox' && event.sandbox) sandboxes = applySandboxEvent(sandboxes, event.sandbox)
+      } catch {
+        /* status pings and older daemons: the refresh below covers them */
+      }
+      refresh()
+    }
     return () => {
       clearInterval(poll)
       ws.close()
@@ -227,7 +257,7 @@
   const ownerEndpoint = $derived(owner ? instanceEndpoint(owner) : '')
   const controlInstance = $derived(selectedId === HOST_ID ? preferredInstance : owner ?? preferredInstance)
   const controlEndpoint = $derived(controlInstance ? instanceEndpoint(controlInstance) : '')
-  $effect(() => { void controlEndpoint; auth = null; nsInfo = null; void refresh() })
+  $effect(() => { void controlEndpoint; auth = null; void refresh() })
   const vstatus = $derived(view?.status ?? selected?.status ?? 'STOPPED')
 
   // Memoized primitives for the stream children. `selected` is a fresh object
@@ -343,14 +373,6 @@
     {#if auth}
       {#key controlEndpoint}<AuthBanner {auth} instance={controlEndpoint} onchanged={(next) => (auth = next)} />{/key}
     {/if}
-    {#if nsInfo}
-      <NamespacePicker
-        current={nsInfo.current}
-        known={nsInfo.known}
-        busy={nsBusy}
-        onswitch={changeNamespace}
-      />
-    {/if}
     <span class="conn" class:on={connected} title={connected ? 'The local daemon is answering' : 'The local daemon is not answering; retrying every 4s'}>
       <span class="cdot"></span>
       {connected ? 'daemon connected' : 'daemon offline'}
@@ -360,21 +382,33 @@
 
 <main>
   <aside>
-    <div class="repos">
-      <RepoList
-        {repos}
-        {selectedId}
-        {instances}
-        listState={listState}
-        busyId={busy?.id ?? null}
-        busyVerb={busy?.verb ?? null}
-        onselect={(id) => (selectedId = id)}
-        onaction={(id, verb) => act(verb, id)}
-        oncustomize={(id) => (customizingId = id)}
-        onreplicate={(id) => (replicatingId = id)}
-        onreplicadelete={(id) => (deletingReplicaId = id)}
-      />
-    </div>
+    <SandboxList
+      {sandboxes}
+      selected={selectedId === HOST_ID ? undefined : sandboxKey}
+      {listState}
+      error={sandboxError}
+      onselect={selectSandbox}
+      onnew={() => (newSandbox = true)}
+    />
+    {#if sandboxKey === null}
+      <div class="repos">
+        <RepoList
+          {repos}
+          {selectedId}
+          {instances}
+          listState={listState}
+          busyId={busy?.id ?? null}
+          busyVerb={busy?.verb ?? null}
+          onselect={(id) => (selectedId = id)}
+          onaction={(id, verb) => act(verb, id)}
+          oncustomize={(id) => (customizingId = id)}
+          onreplicate={(id) => (replicatingId = id)}
+          onreplicadelete={(id) => (deletingReplicaId = id)}
+        />
+      </div>
+    {:else}
+      <div class="repos"></div>
+    {/if}
     <button
       class="hostbtn"
       class:selected={selectedId === HOST_ID}
@@ -410,6 +444,24 @@
           {/key}
         </div>
       </div>
+    {:else if ticketSandbox}
+      {#key `${preferredEndpoint}:${ticketSandbox.key}`}
+        <SandboxDetail
+          sandbox={ticketSandbox}
+          repos={preferredInstance?.repos ?? []}
+          instance={preferredEndpoint}
+          {instances}
+          {controller}
+          initialOperationId={createdOperation.key === ticketSandbox.key ? createdOperation.id : ''}
+          onchanged={refreshSandboxes}
+        />
+      {/key}
+    {:else if sandboxKey !== null}
+      {#if listState === 'offline'}
+        <div class="placeholder warn"><Icon name="unplug" size={18} /><p>The daemon is offline. Retrying every few seconds.</p></div>
+      {:else}
+        <div class="placeholder"><span class="spin"></span><p>Loading {sandboxKey}…</p></div>
+      {/if}
     {:else if selected}
       <div class="head">
         <div class="title">
@@ -611,6 +663,20 @@
 
 {#if toast}<div class="toast" role="alert"><Icon name="alert" size={14} /><span>{toast}</span></div>{/if}
 
+{#if newSandbox}
+  <NewSandboxModal
+    repos={preferredInstance?.repos ?? []}
+    instance={preferredEndpoint}
+    onclose={() => (newSandbox = false)}
+    oncreated={(key, id) => {
+      createdOperation = { key, id }
+      newSandbox = false
+      selectSandbox(key)
+      void refreshSandboxes()
+    }}
+  />
+{/if}
+
 <style>
   /* ---- header ---- */
   .topbar {
@@ -698,6 +764,11 @@
   aside .repos {
     flex: 1;
     min-height: 0;
+  }
+  /* The sandbox block keeps the repo list usable when many tickets are open. */
+  aside :global(.panel:first-child) {
+    flex: none;
+    max-height: 45%;
   }
   .hostbtn {
     flex: none;

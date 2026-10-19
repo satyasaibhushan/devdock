@@ -98,6 +98,20 @@ body {
   background: transparent;
   box-shadow: inset 0 0 0 1.5px var(--deployed);
 }
+/* Sandbox power: every member's deployment scaled up, none, or a mix. */
+.dot.awake {
+  background: var(--ok);
+}
+.dot.asleep {
+  background: var(--stopped);
+}
+.dot.partial {
+  background: var(--warn);
+}
+.dot.unknown {
+  background: transparent;
+  box-shadow: inset 0 0 0 1.5px var(--muted);
+}
 
 /* Controls. Components opt in with these classes so buttons, selects and
    inputs share one size and one hover/focus language. */
@@ -267,6 +281,19 @@ button:disabled {
 .badge.DEPLOYED {
   color: var(--deployed);
   background: color-mix(in srgb, var(--deployed) 14%, transparent);
+}
+/* Sandbox lifecycle states. `active` keeps the neutral default. */
+.badge.creating {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+.badge.expired {
+  color: var(--deployed);
+  background: color-mix(in srgb, var(--deployed) 14%, transparent);
+}
+.badge.failed {
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
 }
 
 /* Modal shell shared by every dialog. */

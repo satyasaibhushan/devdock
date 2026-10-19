@@ -25,6 +25,7 @@ export default defineConfig({
       '/instances': upstreamWs,
       '/operations': upstream,
       '/replicas': upstream,
+      '/sandboxes': upstream,
     },
   },
 })
