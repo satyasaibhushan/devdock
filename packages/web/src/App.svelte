@@ -765,11 +765,6 @@
     flex: 1;
     min-height: 0;
   }
-  /* The sandbox block keeps the repo list usable when many tickets are open. */
-  aside :global(.panel:first-child) {
-    flex: none;
-    max-height: 45%;
-  }
   .hostbtn {
     flex: none;
     display: flex;
