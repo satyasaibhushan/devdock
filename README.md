@@ -6,7 +6,7 @@ Built for two users sharing the same brain: a human at a menu bar, and an AI age
 
 [![devdock dashboard: a running repo with logs and its dev terminal, then sandboxes waking, restoring and sleeping](docs/demo/poster.png)](docs/demo/demo.mp4)
 
-The recording is the real web dashboard served by a demo daemon with fictional repos, machines and sandboxes ([mp4](docs/demo/demo.mp4), [webm](docs/demo/demo.webm)). No cluster is involved.
+The recording is the real web dashboard served by a demo daemon with fictional repos, machines and sandboxes ([mp4](docs/demo/demo.mp4), [webm](docs/demo/demo.webm)). No cluster is involved. [`docs/index.html`](docs/index.html) is the product page built around the same recording.
 
 ## The problem
 
