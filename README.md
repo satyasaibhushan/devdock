@@ -4,6 +4,10 @@ A global control plane for [DevSpace](https://www.devspace.sh/) sessions — **s
 
 Built for two users sharing the same brain: a human at a menu bar, and an AI agent over MCP.
 
+[![devdock dashboard: a running repo with logs and its dev terminal, then sandboxes waking, restoring and sleeping](docs/demo/poster.png)](docs/demo/demo.mp4)
+
+The recording is the real web dashboard served by a demo daemon with fictional repos, machines and sandboxes ([mp4](docs/demo/demo.mp4), [webm](docs/demo/demo.webm)). No cluster is involved.
+
 ## The problem
 
 Working with DevSpace means walking each repo by hand: `cd` in, run `devspace dev`, leave a terminal hostage to its foreground sync, repeat for every service — and remember to `devspace purge` when you're done (you don't). Idle syncs quietly eat your laptop.
@@ -25,7 +29,7 @@ devdock makes that a single pane of control. It's not a Kubernetes IDE and not a
 Three thin layers over `devspace` + `kubectl` + `tmux`:
 
 - **Clients** — a menu-bar GUI + web view (you: glance + click), an MCP server (agent: call + read), and a CLI. All call the *same* core service layer.
-- **Control daemon** — the only brain. Headless, always-on (launchd). Scans `~/Code/**/.devspace/*/devspace.yaml`, reconciles desired vs. actual cluster state, supervises subprocesses, brokers PTYs and log tails over websockets, watches for crashes, and persists state in SQLite.
+- **Control daemon** — the only brain. Headless, always-on (launchd). Scans `~/Code/**/.devspace/*/devspace.yaml`, reconciles desired vs. actual cluster state, supervises subprocesses, brokers PTYs and log tails over websockets, watches for crashes, and persists state in a JSON file under `~/.devdock`.
 - **Execution** — each `devspace dev` runs inside its own named `tmux` session (`devdock-<repo>`), so it survives daemon restarts and the daemon never blocks on it.
 
 ### Two key design decisions
@@ -39,11 +43,39 @@ The core service layer has **zero transport knowledge**. The human GUI and the a
 
 ## Stack
 
-TypeScript end-to-end — Fastify (HTTP/WS), node-pty ↔ xterm.js for terminals, Tauri for the menu-bar tray, SQLite for state, and an MCP server for the agent.
+TypeScript end-to-end in a pnpm workspace: a Fastify daemon (HTTP and WebSocket), node-pty to xterm.js for terminals, a Svelte 5 dashboard, a Tauri menu-bar tray, an MCP server for agents, and a JSON state file. It drives `devspace`, `kubectl`, `helm` and `tmux`.
+
+## Setup
+
+Needs Node 20+, pnpm, and `devspace`, `kubectl` and `tmux` on the PATH with a working kube context.
+
+```sh
+pnpm install
+pnpm build
+pnpm dev                                   # daemon on http://127.0.0.1:7717, serves the dashboard
+packages/daemon/launchd/install.sh         # or packages/daemon/systemd/install.sh, always-on
+```
+
+The daemon scans `DEVDOCK_ROOTS` (default `~/Code`) for `.devspace/*/devspace.yaml`.
+
+## Demo
+
+`packages/daemon/demo/fixtureDaemon.ts` serves the built dashboard and answers its API with fictional state. Sandbox ribbons and lifecycle buttons come from the same core functions the real daemon uses. Wake, sleep and restore run scripted progress instead of touching a cluster.
+
+```sh
+pnpm install && pnpm --filter @devdock/web build
+pnpm --filter @devdock/daemon exec tsx demo/fixtureDaemon.ts    # http://127.0.0.1:7799
+```
+
+To record `docs/demo/poster.png`, `demo.webm` and `demo.mp4` again (Playwright and an ffmpeg with libvpx-vp9 and libx264):
+
+```sh
+PLAYWRIGHT=/path/to/node_modules/playwright FFMPEG=ffmpeg node docs/demo/capture.mjs
+```
 
 ## Status
 
-Design spec. See [`devdock.html`](devdock.html) for the full architecture document.
+In daily use on my own machines. There is no packaged release; it installs from a checkout. Ticket sandboxes run as slots inside one personal namespace. [`devdock.html`](devdock.html) is the original architecture spec and [`docs/sandboxes.html`](docs/sandboxes.html) covers sandboxes.
 
 ## Restricted development connection
 
