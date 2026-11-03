@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import {
+  chmodSync,
   cpSync,
   existsSync,
   lstatSync,
@@ -8,6 +9,7 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'node:fs'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
@@ -1274,6 +1276,7 @@ echo "SANDBOX_ARCH=$architecture"`,
       ['ls-files', '-co', '--exclude-standard', '-z'],
       source,
     )
+    const dirs = new Set<string>()
     for (const file of new Set(listed.split('\0').filter(Boolean))) {
       const target = resolve(destination, file)
       if (isAbsolute(file) || relative(destination, target).startsWith('..'))
@@ -1288,7 +1291,13 @@ echo "SANDBOX_ARCH=$architecture"`,
         throw new Error(`Unsupported worktree entry: ${file}`)
       mkdirSync(dirname(target), { recursive: true })
       cpSync(from, target, { dereference: false })
+      for (let dir = dirname(file); dir !== '.' && !dirs.has(dir); dir = dirname(dir)) dirs.add(dir)
     }
+    // The daemon's 0077 umask made every copied directory owner-only; images
+    // keep those modes, so the app user could not read them (composer failed
+    // on database/seeds). Give each directory its source's mode.
+    for (const dir of dirs)
+      chmodSync(join(destination, dir), statSync(join(source, dir)).mode & 0o7777)
     const changed = await this.checked('git', ['diff', 'HEAD', '--name-only', '-z'], source)
     const untracked = await this.checked(
       'git',

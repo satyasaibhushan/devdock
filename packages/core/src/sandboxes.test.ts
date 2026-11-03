@@ -1,11 +1,13 @@
 import { execFileSync } from 'node:child_process'
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -775,6 +777,7 @@ describe('snapshots', () => {
     writeFileSync(join(wt, 'src', 'b.ts'), 'untracked\n')
     writeFileSync(join(wt, 'debug.log'), 'ignored\n')
     rmSync(join(wt, 'src', 'gone.ts'))
+    chmodSync(join(wt, 'src'), 0o751) // copied directories keep their source mode
     const mocked = f.runner.getMockImplementation()
     f.runner.mockImplementation(async (cmd, args, options) =>
       cmd === 'git' && options?.cwd === wt
@@ -789,6 +792,7 @@ describe('snapshots', () => {
         seen.b = existsSync(join(repo.root, 'src', 'b.ts'))
         seen.log = existsSync(join(repo.root, 'debug.log'))
         seen.gone = existsSync(join(repo.root, 'src', 'gone.ts'))
+        seen.srcMode = (statSync(join(repo.root, 'src')).mode & 0o777).toString(8)
       }
       return f.sandboxResult(repo, action)
     })
@@ -803,6 +807,7 @@ describe('snapshots', () => {
       b: true,
       log: false,
       gone: false,
+      srcMode: '751',
     })
     expect(existsSync(seen.root as string)).toBe(false)
     expect(readdirSync(wt).filter((n) => n.startsWith('.devdock'))).toEqual([])
