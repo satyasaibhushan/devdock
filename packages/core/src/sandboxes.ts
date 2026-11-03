@@ -195,6 +195,28 @@ export function sandboxMarkdown(
 /** DevSpace prints its errors on stdout; stderr holds only the login shell's
  *  noise and `fatal exit status N`. Keep the tail of both so a failed sandbox
  *  build says what failed. */
+const ROUTE_HASH_ANNOTATION = 'devdock.dev/route-hash'
+const ROUTE_APPLY_CONCURRENCY = 8
+
+type RouteIngress = { metadata: { name: string; annotations?: Record<string, string> } }
+
+/** Stable hash of what a generated route says, excluding the hash itself. */
+export function routeHash(ingress: RouteIngress): string {
+  const { [ROUTE_HASH_ANNOTATION]: _, ...annotations } = ingress.metadata.annotations ?? {}
+  const body = { ...ingress, metadata: { ...ingress.metadata, annotations } }
+  return createHash('sha256').update(JSON.stringify(body)).digest('hex').slice(0, 16)
+}
+
+export function withRouteHash<T extends RouteIngress>(ingress: T): T {
+  return {
+    ...ingress,
+    metadata: {
+      ...ingress.metadata,
+      annotations: { ...ingress.metadata.annotations, [ROUTE_HASH_ANNOTATION]: routeHash(ingress) },
+    },
+  }
+}
+
 export function devspaceFailure(r: { stdout: string; stderr: string }, fallback: string): string {
   const noise = /cannot set terminal process group|no job control in this shell/
   const lines = `${r.stdout}\n${r.stderr}`
@@ -1437,34 +1459,68 @@ echo "SANDBOX_ARCH=$architecture"`,
     )
   }
   private async deleteRouting(slot: string): Promise<void> {
-    for (const ingress of await this.ingresses()) {
-      const name = ingress.metadata?.name
-      if (name?.startsWith(`devdock-${slot}-route-`))
-        await this.checked('kubectl', [
-          'delete',
-          'ingress',
-          guardSandboxName(name, slot),
-          '-n',
-          await this.namespace(),
-          '--ignore-not-found',
-        ])
-    }
+    const names = (await this.ingresses())
+      .map((ingress) => ingress.metadata?.name)
+      .filter((name): name is string => !!name?.startsWith(`devdock-${slot}-route-`))
+    await this.deleteIngresses(names, slot)
   }
+  /** One call for any number of ingresses; each kubectl start costs a token check. */
+  private async deleteIngresses(names: string[], slot: string): Promise<void> {
+    if (!names.length) return
+    await this.checked('kubectl', [
+      'delete',
+      'ingress',
+      ...names.map((name) => guardSandboxName(name, slot)),
+      '-n',
+      await this.namespace(),
+      '--ignore-not-found',
+    ])
+  }
+  /** Every Ingress write costs ~4.6s in the cluster's admission webhook, and a
+   *  slot carries one route per fallback host (~60). Rewriting them all on each
+   *  build took minutes, so routes carry a content hash: unchanged ones are left
+   *  alone, stale or changed ones are removed first (a moved host/path must not
+   *  collide with its old route), and the rest are applied concurrently. */
   private async applyRouting(s: Sandbox): Promise<void> {
     const slot = s.slot as string
     const routing = await this.routing(s)
-    await this.deleteRouting(slot)
-    if (!routing.hosts.size) return
+    const prefix = `devdock-${slot}-route-`
+    const desired = routing.hosts.size
+      ? [routing.tls, ...routing.fallback].map((ingress) => withRouteHash(ingress))
+      : []
+    const wanted = new Map(desired.map((i) => [i.metadata.name, routeHash(i)]))
+    const current = new Map<string, string | undefined>()
+    for (const ingress of await this.ingresses()) {
+      const name = ingress.metadata?.name
+      if (name && (name.startsWith(prefix) || wanted.has(name)))
+        current.set(name, ingress.metadata?.annotations?.[ROUTE_HASH_ANNOTATION])
+    }
+    const changed = desired.filter(
+      (i) => current.get(i.metadata.name) !== wanted.get(i.metadata.name),
+    )
+    const changedNames = new Set(changed.map((i) => i.metadata.name))
+    const stale = [...current.keys()].filter(
+      (name) => name.startsWith(prefix) && (!wanted.has(name) || changedNames.has(name)),
+    )
+    await this.deleteIngresses(stale, slot)
+    if (!changed.length) return
     const dir = mkdtempSync(
       join(dirname(this.repo(s.members[0] as SandboxMember).path), '.devdock-routing-'),
     )
     try {
-      for (const ingress of [routing.tls, ...routing.fallback]) {
-        guardSandboxName(ingress.metadata.name, slot)
-        const path = join(dir, `${ingress.metadata.name}.json`)
-        writeFileSync(path, JSON.stringify(ingress))
-        await this.checked('kubectl', ['apply', '-n', await this.namespace(), '-f', path])
+      const namespace = await this.namespace()
+      const queue = [...changed]
+      const worker = async () => {
+        for (let ingress = queue.shift(); ingress; ingress = queue.shift()) {
+          guardSandboxName(ingress.metadata.name, slot)
+          const path = join(dir, `${ingress.metadata.name}.json`)
+          writeFileSync(path, JSON.stringify(ingress))
+          await this.checked('kubectl', ['apply', '-n', namespace, '-f', path])
+        }
       }
+      await Promise.all(
+        Array.from({ length: Math.min(ROUTE_APPLY_CONCURRENCY, queue.length) }, worker),
+      )
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }

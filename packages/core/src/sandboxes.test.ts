@@ -1294,3 +1294,65 @@ describe('sandbox failure detail', () => {
     expect(devspaceFailure({ stdout: '', stderr: '' }, 'fallback')).toBe('fallback')
   })
 })
+
+it('rewrites only stale or changed fallback routes on a rebuild', async () => {
+  const f = fixture()
+  const base = JSON.parse(
+    (await f.runner('kubectl', ['get', 'ingresses', '-n', 'personal', '-o', 'json'])).stdout,
+  ).items as unknown[]
+  // A personal service the sandbox does not run gets a fallback route on its host.
+  base.push({
+    metadata: { name: 'other-api' },
+    spec: {
+      rules: [
+        {
+          host: 'api-personal-candidate.vmock.dev',
+          http: {
+            paths: [
+              { path: '/other', backend: { service: { name: 'other-api', port: { number: 80 } } } },
+            ],
+          },
+        },
+      ],
+    },
+  })
+  f.setIngresses(base)
+  await f.done(
+    await f.core.create({
+      key: 'SULF-1',
+      members: [input, { ...input, workload: 'ui' }],
+      actor: 'you',
+    }),
+  )
+  const first = [...f.applied]
+  const route = first.find((i) => i.metadata.name.startsWith('devdock-sb1-route-'))
+  expect(route).toBeDefined()
+  const deletes = () =>
+    f.runner.mock.calls
+      .filter(([cmd, args]) => cmd === 'kubectl' && args[0] === 'delete' && args[1] === 'ingress')
+      .map(([, args]) => args.filter((a) => a.startsWith('devdock-')))
+
+  // Unchanged: nothing is deleted or written.
+  f.setIngresses([...base, ...first])
+  f.applied.length = 0
+  f.runner.mockClear()
+  await f.done(f.core.build('SULF-1', { actor: 'you' }))
+  expect(f.applied).toEqual([])
+  expect(deletes()).toEqual([])
+
+  // One route edited out of band and one left over: both go, the edited one returns.
+  const edited = {
+    ...route,
+    metadata: {
+      ...(route as { metadata: object }).metadata,
+      annotations: { 'devdock.dev/route-hash': 'x' },
+    },
+  }
+  const others = first.filter((i) => i !== route)
+  f.setIngresses([...base, ...others, edited, { metadata: { name: 'devdock-sb1-route-99' } }])
+  f.applied.length = 0
+  f.runner.mockClear()
+  await f.done(f.core.build('SULF-1', { actor: 'you' }))
+  expect(deletes()).toEqual([[route?.metadata.name, 'devdock-sb1-route-99']])
+  expect(f.applied.map((i) => i.metadata.name)).toEqual([route?.metadata.name])
+})
