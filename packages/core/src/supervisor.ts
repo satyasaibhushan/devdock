@@ -332,6 +332,7 @@ export class Supervisor {
       const pane = await this.runner('tmux', [
         'capture-pane',
         '-p',
+        '-J',
         '-t',
         exactPane(repo.session),
         '-S',

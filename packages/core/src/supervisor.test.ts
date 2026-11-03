@@ -18,6 +18,7 @@ it('requires a shell acknowledgement rather than echoed keystrokes', async () =>
   const result = await new Supervisor(runner).execVerified(repo, 'pnpm test')
   expect(result.code).toBe(0)
   expect(captures).toBe(2)
+  expect(runner).toHaveBeenCalledWith('tmux', expect.arrayContaining(['capture-pane', '-p', '-J']))
   expect(result.stdout).toContain('exit status are not verified')
   expect(result.stdout).not.toContain(sent)
 })
