@@ -1479,6 +1479,43 @@ async function reconciledService(runner: ReturnType<typeof execRunner>) {
 }
 
 describe('Service.runInWorkload', () => {
+  it.each([true, false])(
+    'never execs into a terminating pod (replacement: %s)',
+    async (replacement) => {
+      const ready = {
+        metadata: { name: 'svc-a-app-devspace-1' },
+        status: { phase: 'Running', containerStatuses: [{ ready: true, restartCount: 0 }] },
+      }
+      const runner = execRunner(
+        () => ({ code: 0, stdout: 'ok', stderr: '' }),
+        JSON.stringify({
+          items: [
+            {
+              ...ready,
+              metadata: {
+                name: 'svc-a-app-devspace-terminating',
+                deletionTimestamp: '2026-11-03T13:06:33Z',
+              },
+            },
+            ...(replacement ? [ready] : []),
+          ],
+        }),
+      )
+      const svc = await reconciledService(runner)
+      const result = await svc.runInWorkload('svc-a', 'true')
+      if (replacement) {
+        expect(result.ok).toBe(true)
+        expect(result.pod).toBe('svc-a-app-devspace-1')
+      } else {
+        expect(result.ok).toBe(false)
+        expect(result.infraError).toBeDefined()
+        expect(
+          runner.mock.calls.some(([cmd, args]) => cmd === 'kubectl' && args[0] === 'exec'),
+        ).toBe(false)
+      }
+    },
+  )
+
   it('execs into the ready dev pod and reports the real exit code', async () => {
     const runner = execRunner(() => ({ code: 0, stdout: '3 passed\n', stderr: '' }))
     const svc = await reconciledService(runner)

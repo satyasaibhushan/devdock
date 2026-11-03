@@ -635,6 +635,7 @@ describe('daemon routes', () => {
         ].join('\n'),
       )
     }
+    let acknowledgement = ''
     const runner = vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
       if (cmd === 'git' && args.includes('for-each-ref'))
         return { code: 0, stdout: 'main\t1700000000\nfeature-x\t1690000000\n', stderr: '' }
