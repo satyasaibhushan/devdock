@@ -103,6 +103,7 @@ imports:
     expect(doc.imports[0].git).toBe('git@github.com:vmockinc/guidelines.git')
     expect(doc.name).toBe('web')
     expect(doc.profiles.map((p: { name: string }) => p.name)).toEqual(['devdock'])
+    expect(doc.functions.docker_login_to_ecr).toContain('ecr-login.stamp')
     prepareWorkloadConfig(repo) // regenerating its own file is fine
     expect(devdockConfigPath(repo)).toBe(alias)
     expect(devspaceCommand(repo, 'deploy')).toContain(
@@ -133,7 +134,7 @@ imports:
       (p: { path: string }) => p.path === 'images.app.buildKit',
     )
     expect(build.value.args).toContain(
-      '--cache-from=type=registry,ref=${AWS_ECR_DEVSPACE_REPO}:ns-web-cache',
+      '--cache-from=type=registry,ref=${AWS_ECR_DEVSPACE_REPO}:ns-web',
     )
   })
   it('never replaces a file it did not generate', () => {
