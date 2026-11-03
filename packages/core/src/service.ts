@@ -35,7 +35,7 @@ import {
   Sandboxes,
   requireActor,
 } from './sandboxes.js'
-import { startProgress } from './startProgress.js'
+import { devSessionReady, initialSyncDone, startProgress } from './startProgress.js'
 import { type ReplicaRecord, StateStore } from './stateStore.js'
 import { type SessionState, type StreamRunner, Supervisor, verbLabel } from './supervisor.js'
 import { type RunOutcome, type TermInfo, type TermKind, TermRegistry } from './termRegistry.js'
@@ -598,6 +598,7 @@ export class Service {
       let ready = false
       const logPath = this.devLogPath(this.scoped(op.repo, workload).key)
       let logOffset = existsSync(logPath) ? statSync(logPath).size : 0
+      let synced = false
       while (
         !this.stopped &&
         this.operations.get(op.id).state === 'active' &&
@@ -608,15 +609,12 @@ export class Service {
         if (selected && !selected.unreachable) {
           const slice = readFileSlice(logPath, logOffset)
           if (slice) logOffset = slice.nextOffset
+          if (slice && initialSyncDone(slice.lines)) synced = true
           for (const message of startProgress(selected.pods, slice?.lines ?? [])) {
             if (!this.operations.get(op.id).logs.some((l) => l.message === message))
               this.operations.update(op.id, {}, message)
           }
-          if (
-            selected.hasSession &&
-            selected.pods.length > 0 &&
-            selected.pods.every((p) => p.ready)
-          ) {
+          if (selected.hasSession && devSessionReady(selected.pods, synced)) {
             ready = true
             break
           }

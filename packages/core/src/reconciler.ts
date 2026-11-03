@@ -234,8 +234,11 @@ export class Reconciler {
     const ws: WorkloadState = {
       type,
       ...(url ? { url } : {}),
+      // A deploy-only Helm pod (no session, no DevSpace pod) is DEPLOYED for
+      // backends too; reporting it as external made `start` unavailable after
+      // `build`, so purge → deploy → dev could only run as one restart.
       status: deriveStatus(pods, hasSession, deployments.length > 0, sessionDead, {
-        deployedWhenRunning: repo.codeArea === 'frontend',
+        deployedWhenRunning: true,
       }),
       pods,
       deployments,
