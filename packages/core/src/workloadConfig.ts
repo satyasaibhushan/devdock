@@ -116,6 +116,8 @@ interface OverlayPlan {
   text: string
   imp: GuidelinesImport
   patches: Patch[]
+  /** The template mints an ECR pull secret on every config load. */
+  pullSecrets: boolean
 }
 
 function overlayPlan(repo: Repo): OverlayPlan | undefined {
@@ -134,7 +136,73 @@ function overlayPlan(repo: Repo): OverlayPlan | undefined {
     const from = `--cache-from=type=registry,ref=\${AWS_ECR_DEVSPACE_REPO}:${seed}`
     return { ...patch, value: { ...value, args: [...value.args, from] } }
   })
-  return { text, imp, patches }
+  const repoDoc = (parseYamlSafe(text) ?? {}) as ConfigShape
+  const template = parseYamlSafe(
+    readOptional(join(guidelinesCacheDir(imp.git, imp.branch), imp.subPath, 'devspace.yaml')),
+  ) as ConfigShape | undefined
+  patches.push(...localChartPatches(template, repoDoc))
+  if (imp.template === 'ui') patches.push(...noSyncWaitPatches(repoDoc))
+  const pullSecrets = template?.pullSecrets !== undefined || repoDoc.pullSecrets !== undefined
+  return { text, imp, patches, pullSecrets }
+}
+
+type ConfigShape = {
+  pullSecrets?: unknown
+  deployments?: Record<string, { helm?: { chart?: { git?: unknown } } }>
+  dev?: Record<string, { sync?: unknown[] }>
+}
+
+function parseYamlSafe(text: string | undefined): unknown {
+  if (text === undefined) return undefined
+  try {
+    return parseYaml(text)
+  } catch {
+    return undefined
+  }
+}
+
+function readOptional(path: string): string | undefined {
+  try {
+    return readFileSync(path, 'utf8')
+  } catch {
+    return undefined
+  }
+}
+
+/** DevSpace also git-pulls the helm-charts repo for every Helm step (~0.9s,
+ *  three per cycle). The templates already read values files from DevSpace's
+ *  local checkout (DEVSPACE_SERVICE_DEPENDENCY_PATH); use its chart too. Only
+ *  for template deployments the repo does not redefine. */
+function localChartPatches(template: ConfigShape | undefined, repo: ConfigShape): Patch[] {
+  const chart = helmChartsDir()
+  if (!existsSync(join(chart, 'service', 'Chart.yaml'))) return []
+  refreshGuidelines(chart)
+  return Object.entries(template?.deployments ?? {})
+    .filter(([name, d]) => typeof d?.helm?.chart?.git === 'string' && !repo.deployments?.[name])
+    .map(([name]) => ({
+      op: 'replace',
+      path: `deployments.${name}.helm.chart`,
+      value: { name: '${DEVSPACE_SERVICE_DEPENDENCY_PATH}' },
+    }))
+}
+
+/** The dev shell, and with it the UI's startup command, waited for the initial
+ *  sync (~3.5s). The image already holds the deployed files, so Vite can start
+ *  on them while the sync finishes and reloads what it changes. */
+function noSyncWaitPatches(repo: ConfigShape): Patch[] {
+  const sync = repo.dev?.common?.sync
+  if (!Array.isArray(sync)) return []
+  return sync.map((_, i) => ({
+    op: 'add',
+    path: `dev.common.sync[${i}].waitInitialSync`,
+    value: false,
+  }))
+}
+
+function helmChartsDir(): string {
+  const root =
+    process.env.DEVDOCK_DEVSPACE_DEPENDENCIES ?? join(homedir(), '.devspace', 'dependencies')
+  return join(root, 'gitssh-git-github-com-vmockinc-helm-charts-master')
 }
 
 function cacheSeed(configText: string): string | undefined {
@@ -151,6 +219,35 @@ function cacheSeed(configText: string): string | undefined {
 /** Whether devdock runs this repo through its generated overlay. */
 export function isTuned(repo: Repo): boolean {
   return overlayPlan(repo) !== undefined
+}
+
+export const CACHED_PULL_SECRET_PROFILE = 'devdock-cached-pull-secret'
+/** ECR tokens last 12h; `deploy` refreshes the namespace's pull secret, and
+ *  `dev`/`purge` within six hours of that reuse it instead of minting a token
+ *  while loading the config (~0.6s per verb). */
+const PULL_SECRET_REUSE_MS = 6 * 3600_000
+
+function pullSecretStamp(repo: Repo): string {
+  const ns = (repo.namespace || '_context').replace(/[^A-Za-z0-9_.-]/g, '_')
+  const root = process.env.DEVDOCK_STATE_DIR ?? join(homedir(), '.devdock')
+  return join(root, 'pull-secret', `${ns}.stamp`)
+}
+
+/** Record that a successful deploy refreshed this namespace's pull secret. */
+export function markPullSecretRefreshed(repo: Repo): void {
+  const stamp = pullSecretStamp(repo)
+  mkdirSync(dirname(stamp), { recursive: true })
+  writeFileSync(stamp, '')
+}
+
+/** Whether `dev`/`purge` may skip the pull secret for this repo now. */
+export function canReusePullSecret(repo: Repo): boolean {
+  if (!overlayPlan(repo)?.pullSecrets) return false
+  try {
+    return Date.now() - statSync(pullSecretStamp(repo)).mtimeMs < PULL_SECRET_REUSE_MS
+  } catch {
+    return false
+  }
 }
 
 /** Whether the overlay carries a `devdock` profile to activate. */
@@ -241,6 +338,14 @@ function writeOverlay(alias: string, target: string, plan: OverlayPlan): void {
   const envRewrite = portableEnvRewrite(local)
   if (envRewrite && !doc.hasIn(['functions', 'prepare_local_env']))
     doc.setIn(['functions', 'prepare_local_env'], envRewrite)
+  if (plan.pullSecrets) {
+    const cached = doc.createNode({
+      name: CACHED_PULL_SECRET_PROFILE,
+      patches: [{ op: 'replace', path: 'pullSecrets', value: {} }],
+    })
+    if (isSeq(doc.get('profiles'))) doc.addIn(['profiles'], cached)
+    else doc.set('profiles', doc.createNode([cached]))
+  }
   if (plan.patches.length > 0) {
     const profile = doc.createNode({ name: DEVDOCK_PROFILE, patches: plan.patches })
     if (isSeq(doc.get('profiles'))) doc.addIn(['profiles'], profile)

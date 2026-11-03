@@ -20,6 +20,9 @@ import { PtyBroker } from './ptyBroker.js'
 import { Service } from './service.js'
 import { StateStore } from './stateStore.js'
 
+// Keep pull-secret stamps out of the real ~/.devdock.
+process.env.DEVDOCK_STATE_DIR = mkdtempSync(join(tmpdir(), 'devdock-state-'))
+
 let root: string
 let stateFile: string
 beforeEach(() => {

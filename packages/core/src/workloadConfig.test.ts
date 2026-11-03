@@ -18,10 +18,14 @@ import type { Repo } from './types.js'
 import {
   devdockConfigPath,
   guidelinesTemplate,
+  markPullSecretRefreshed,
   prepareWorkloadConfig,
   workloadConfigPath,
 } from './workloadConfig.js'
 import { scopeRepo } from './workloads.js'
+
+// Keep pull-secret stamps out of the real ~/.devdock.
+process.env.DEVDOCK_STATE_DIR = mkdtempSync(join(tmpdir(), 'devdock-state-'))
 
 const dirs: string[] = []
 const deps = mkdtempSync(join(tmpdir(), 'devdock-deps-'))
@@ -155,5 +159,75 @@ imports:
     const repo = fixture()
     expect(devdockConfigPath(repo)).toBeUndefined()
     expect(devspaceCommand(repo, 'deploy')).not.toContain('DEVSPACE_CONFIG')
+  })
+})
+
+describe('overlay speedups', () => {
+  const template = `version: v2beta1
+pullSecrets:
+  ecr-secret:
+    registry: r
+deployments:
+  default:
+    helm:
+      chart:
+        git: git+ssh://git@github.com/vmockinc/helm-charts
+  web:
+    helm:
+      chart:
+        git: git+ssh://git@github.com/vmockinc/helm-charts
+`
+  function uiRepo(extra = ''): Repo {
+    const repo = fixture()
+    writeFileSync(
+      repo.configPath,
+      `version: v2beta1\nname: web\nimports:\n  - git: git@github.com:vmockinc/guidelines.git\n    branch: master\n    subPath: ./devspace/ui\n${extra}`,
+    )
+    const local = join(deps, 'git-github-com-vmockinc-guidelines-git-master', 'devspace', 'ui')
+    mkdirSync(local, { recursive: true })
+    writeFileSync(join(local, 'devspace.yaml'), template)
+    const charts = join(deps, 'gitssh-git-github-com-vmockinc-helm-charts-master', 'service')
+    mkdirSync(charts, { recursive: true })
+    writeFileSync(join(charts, 'Chart.yaml'), 'name: service\n')
+    return repo
+  }
+  const profile = (repo: Repo, name: string) =>
+    parseYaml(readFileSync(workloadConfigPath(repo), 'utf8')).profiles.find(
+      (p: { name: string }) => p.name === name,
+    )
+
+  it('uses the local chart for template deployments the repo does not redefine', () => {
+    const repo = uiRepo('deployments:\n  web:\n    helm:\n      chart:\n        name: ./own\n')
+    prepareWorkloadConfig(repo)
+    const paths = profile(repo, 'devdock').patches.map((p: { path: string }) => p.path)
+    expect(paths).toContain('deployments.default.helm.chart')
+    expect(paths).not.toContain('deployments.web.helm.chart')
+  })
+  it('lets the UI shell open before the initial sync finishes', () => {
+    const repo = uiRepo(
+      'dev:\n  common:\n    sync:\n      - path: ./:/app\n      - path: ../x:/x\n',
+    )
+    prepareWorkloadConfig(repo)
+    expect(profile(repo, 'devdock').patches).toEqual(
+      expect.arrayContaining([
+        { op: 'add', path: 'dev.common.sync[0].waitInitialSync', value: false },
+        { op: 'add', path: 'dev.common.sync[1].waitInitialSync', value: false },
+      ]),
+    )
+  })
+  it('reuses the pull secret for dev and purge only after a recent deploy', () => {
+    const repo = { ...uiRepo(), namespace: 'team' }
+    prepareWorkloadConfig(repo)
+    expect(profile(repo, 'devdock-cached-pull-secret').patches).toEqual([
+      { op: 'replace', path: 'pullSecrets', value: {} },
+    ])
+    expect(devspaceCommand(repo, 'dev')).not.toContain('devdock-cached-pull-secret')
+    markPullSecretRefreshed(repo)
+    expect(devspaceCommand(repo, 'dev')).toContain('-p devdock-cached-pull-secret')
+    expect(devspaceCommand(repo, 'purge')).toContain('-p devdock-cached-pull-secret')
+    expect(devspaceCommand(repo, 'deploy')).not.toContain('devdock-cached-pull-secret')
+    expect(devspaceCommand({ ...repo, namespace: 'other' }, 'dev')).not.toContain(
+      'devdock-cached-pull-secret',
+    )
   })
 })

@@ -53,6 +53,7 @@ import {
   loadWorkflowConfig,
   verifyEndpoint,
 } from './workflow.js'
+import { markPullSecretRefreshed } from './workloadConfig.js'
 import {
   assembleState,
   resolveWorkload,
@@ -994,6 +995,7 @@ export class Service {
     const r = await this.narrate(key, verbLabel(repo, 'deploy'), (onLine) =>
       this.supervisor.build(repo, onLine),
     )
+    if (r.code === 0) markPullSecretRefreshed(repo)
     await this.reconcileOne(id)
     const hint =
       r.code === 0

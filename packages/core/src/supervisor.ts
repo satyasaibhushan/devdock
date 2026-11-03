@@ -5,7 +5,9 @@ import { randomUUID } from 'node:crypto'
 import { type RunResult, loginShell, loginShellArgs, run, runStream } from './exec.js'
 import type { Repo } from './types.js'
 import {
+  CACHED_PULL_SECRET_PROFILE,
   DEVDOCK_PROFILE,
+  canReusePullSecret,
   devdockConfigPath,
   hasDevdockProfile,
   prepareWorkloadConfig,
@@ -71,6 +73,8 @@ export function exactPane(session: string): string {
 }
 
 const TUNED_VERBS = new Set(['dev', 'deploy', 'purge'])
+/** `deploy` always refreshes the pull secret; these may reuse a recent one. */
+const PULL_SECRET_REUSE_VERBS = new Set(['dev', 'purge'])
 
 /** Build the shell command that runs `devspace <verb>` the way the user's
  *  `./devspace` wrapper does: cd into the service dir, every `question:` var
@@ -86,7 +90,11 @@ export function devspaceCommand(repo: Repo, verb: string): string {
   const config = overlay ? `DEVSPACE_CONFIG=${shellQuote(overlay)} ` : ''
   // Only the plain lifecycle verbs take the tuning; sandbox verbs bring their
   // own profiles (`persistent` already replaces the same image build block).
-  const profile = TUNED_VERBS.has(verb) && hasDevdockProfile(repo) ? ` -p ${DEVDOCK_PROFILE}` : ''
+  const profile =
+    (TUNED_VERBS.has(verb) && hasDevdockProfile(repo) ? ` -p ${DEVDOCK_PROFILE}` : '') +
+    (PULL_SECRET_REUSE_VERBS.has(verb) && canReusePullSecret(repo)
+      ? ` -p ${CACHED_PULL_SECRET_PROFILE}`
+      : '')
   const cmd = `cd ${shellQuote(repo.path)} && ${config}devspace ${verb}${profile}${extra ? ` ${extra}` : ''}`
   return repo.root ? `export DEVSPACE_BINARY_DIR=${shellQuote(repo.root)} && ${cmd}` : cmd
 }
