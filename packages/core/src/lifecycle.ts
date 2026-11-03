@@ -1,7 +1,7 @@
 import type { RepoStatus } from './types.js'
 
 export type LifecycleAction = 'build' | 'build_start' | 'start' | 'restart' | 'destroy'
-export type LifecycleStep = 'purge' | 'deploy' | 'dev'
+export type LifecycleStep = 'purge' | 'reset' | 'deploy' | 'dev'
 
 const ACTIONS: Record<RepoStatus, readonly LifecycleAction[]> = {
   STOPPED: ['build', 'build_start'],
@@ -17,7 +17,7 @@ const PLANS: Record<LifecycleAction, readonly LifecycleStep[]> = {
   build: ['deploy'],
   build_start: ['deploy', 'dev'],
   start: ['dev'],
-  restart: ['purge', 'deploy', 'dev'],
+  restart: ['reset', 'deploy', 'dev'],
   destroy: ['purge'],
 }
 

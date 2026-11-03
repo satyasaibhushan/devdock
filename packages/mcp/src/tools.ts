@@ -62,7 +62,8 @@ const VERBS: Array<{ verb: RepoVerb; description: string }> = [
   { verb: 'destroy', description: 'Purge a deployed workload and stop its dev session.' },
   {
     verb: 'restart',
-    description: 'Recycle a workload from any state: stop, then build, then start.',
+    description:
+      'Recycle a workload from any state without purging: drop the dev session, redeploy, then start dev.',
   },
   {
     verb: 'adopt',

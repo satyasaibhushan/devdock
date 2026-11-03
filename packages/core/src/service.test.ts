@@ -1263,19 +1263,44 @@ describe('Service', () => {
     expect(new StateStore(stateFile).getPendingStartup('svc-a')).toBeUndefined()
   })
 
-  it('restart recycles the workload: kill → build → start', async () => {
+  it('restart redeploys without purging: deploy then dev', async () => {
     const runner = cannedRunner('{"items":[]}', false)
     const { spawner } = fakeStreamSpawner()
     const svc = new Service({ roots: [root], stateFile }, { runner, streamSpawner: spawner })
     svc.rescan()
     await svc.restart('svc-a')
-    // purge then deploy run through the login shell; dev starts a tmux session.
     const shellCmds = runner.mock.calls
       .filter((c) => c[0] === loginShell)
       .map((c) => (c[1] as string[])[1] ?? '')
-    expect(shellCmds.some((c) => c.includes('devspace purge'))).toBe(true)
+    // No purge: it would only flip the Ingress to the UAT proxy and back.
+    expect(shellCmds.some((c) => c.includes('devspace purge'))).toBe(false)
+    expect(shellCmds.some((c) => c.includes('devspace reset pods'))).toBe(false)
     expect(shellCmds.some((c) => c.includes('devspace deploy'))).toBe(true)
     expect(runner).toHaveBeenCalledWith('tmux', expect.arrayContaining(['new-session']))
+  })
+
+  it('restart drops an existing replacement pod first so dev pulls the new image', async () => {
+    const devPod = JSON.stringify({
+      items: [
+        {
+          metadata: { name: 'svc-a-devspace-1' },
+          status: { phase: 'Running', containerStatuses: [{ ready: true, restartCount: 0 }] },
+        },
+      ],
+    })
+    const runner = cannedRunner(devPod, true)
+    const { spawner } = fakeStreamSpawner()
+    const svc = new Service({ roots: [root], stateFile }, { runner, streamSpawner: spawner })
+    svc.rescan()
+    await svc.restart('svc-a')
+    const shellCmds = runner.mock.calls
+      .filter((c) => c[0] === loginShell)
+      .map((c) => (c[1] as string[])[1] ?? '')
+    const reset = shellCmds.findIndex((c) => c.includes('devspace reset pods'))
+    const deploy = shellCmds.findIndex((c) => c.includes('devspace deploy'))
+    expect(reset).toBeGreaterThanOrEqual(0)
+    expect(deploy).toBeGreaterThan(reset)
+    expect(shellCmds.some((c) => c.includes('devspace purge'))).toBe(false)
   })
 
   it('namespaceInfo unions the context namespace, remembered ones, and repo-declared ones', async () => {

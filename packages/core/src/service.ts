@@ -1095,9 +1095,15 @@ export class Service {
   /** Clear a crashed dev session: drop the replaced dev pod and release the
    *  session lock without purge or rebuild (image/deployment stay as deployed). */
   async clear(id: string, workload?: string): Promise<RunResult> {
-    const { repo, key } = this.scoped(id, workload)
     if (this.operations.active(id, this.scoped(id, workload).type ?? ''))
       return { code: 2, stdout: '', stderr: 'A workflow operation is active' }
+    return this.resetSession(id, workload)
+  }
+
+  /** Drop the dev session and its replaced pod, restoring the deployment as
+   *  deployed (`devspace reset pods`). No purge: the Ingress is not rewritten. */
+  private async resetSession(id: string, workload?: string): Promise<RunResult> {
+    const { repo, key } = this.scoped(id, workload)
     const denied = await this.ensureAuth(key)
     if (denied) return denied
     await this.claimOwnership(repo)
@@ -1115,9 +1121,15 @@ export class Service {
     return r
   }
 
-  /** Recycle the workload from any state: kill → build → start (purge, then
-   *  deploy, then dev). Available in every state as a one-click "start fresh".
-   *  Stops early if a step fails so a broken purge/deploy doesn't cascade.
+  /** Recycle the workload from any state: reset → build → start (drop the dev
+   *  session and its pod, then deploy, then dev). Available in every state as a
+   *  one-click "start fresh". Stops early if a step fails.
+   *
+   *  No purge: purging only pointed the Ingress at the UAT proxy for deploy to
+   *  point it straight back, two ~4.6s Ingress writes plus the purge itself.
+   *  The rebuilt image keeps its tag, so it reaches the session through the
+   *  fresh replacement pod `dev` creates (the chart pulls Always); the reset
+   *  makes sure no earlier replacement is reused.
    *
    *  The whole sequence is held under a RESTARTING status override so the row
    *  shows one stable "restarting" state instead of flickering STOPPED → DEPLOYED
@@ -1127,8 +1139,12 @@ export class Service {
     this.transitions.set(key, 'RESTARTING')
     await this.reconcileOne(id) // reflect RESTARTING immediately
     try {
-      const killed = await this.stop(id, workload)
-      if (killed.code !== 0) return killed
+      const state = this.states.get(id) ?? (await this.reconcileOne(id))
+      const current = state.workloads.find((w) => w.type === (this.scoped(id, workload).type ?? ''))
+      if (current?.hasSession || current?.pods.some((p) => p.name.includes('-devspace'))) {
+        const reset = await this.resetSession(id, workload)
+        if (reset.code !== 0) return reset
+      }
       const built = await this.build(id, workload)
       if (built.code !== 0) return built
       return await this.start(id, workload)
