@@ -1,6 +1,7 @@
 import { execFileSync } from 'node:child_process'
 import {
   lstatSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   readlinkSync,
@@ -23,6 +24,8 @@ import {
 import { scopeRepo } from './workloads.js'
 
 const dirs: string[] = []
+const deps = mkdtempSync(join(tmpdir(), 'devdock-deps-'))
+process.env.DEVDOCK_DEVSPACE_DEPENDENCIES = deps
 afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
 })
@@ -88,7 +91,7 @@ imports:
     expect(guidelinesTemplate(uiConfig.replace('vmockinc', 'someone'))).toBeUndefined()
     expect(guidelinesTemplate('name: x')).toBeUndefined()
   })
-  it('writes an importing overlay with the devdock profile, replacing its old alias', () => {
+  it('writes the repo config with the devdock profile, replacing its old alias', () => {
     const repo = fixture()
     writeFileSync(repo.configPath, uiConfig)
     const alias = workloadConfigPath(repo)
@@ -96,14 +99,30 @@ imports:
     prepareWorkloadConfig(repo)
     expect(lstatSync(alias).isSymbolicLink()).toBe(false)
     const doc = parseYaml(readFileSync(alias, 'utf8'))
-    expect(doc.imports).toEqual([{ path: './devspace.yaml' }])
-    expect(doc.profiles[0].name).toBe('devdock')
+    // No local checkout of the guidelines: DevSpace keeps fetching it.
+    expect(doc.imports[0].git).toBe('git@github.com:vmockinc/guidelines.git')
+    expect(doc.name).toBe('web')
+    expect(doc.profiles.map((p: { name: string }) => p.name)).toEqual(['devdock'])
     prepareWorkloadConfig(repo) // regenerating its own file is fine
     expect(devdockConfigPath(repo)).toBe(alias)
     expect(devspaceCommand(repo, 'deploy')).toContain(
       `DEVSPACE_CONFIG='${alias}' devspace deploy -p devdock`,
     )
     expect(devspaceCommand(repo, 'deploy -p persistent -p sandbox')).not.toContain('-p devdock')
+  })
+  it('reads the guidelines from the local checkout when there is one', () => {
+    const repo = fixture()
+    writeFileSync(repo.configPath, uiConfig.replace('/ui', '/non-ui'))
+    const local = join(deps, 'git-github-com-vmockinc-guidelines-git-master', 'devspace', 'non-ui')
+    mkdirSync(local, { recursive: true })
+    writeFileSync(join(local, 'devspace.yaml'), 'version: v2beta1\n')
+    prepareWorkloadConfig(repo)
+    const doc = parseYaml(readFileSync(workloadConfigPath(repo), 'utf8'))
+    expect(doc.imports).toEqual([{ path: local }])
+    // non-ui has no image tuning yet, so there is no profile to activate.
+    expect(doc.profiles).toBeUndefined()
+    expect(devspaceCommand(repo, 'dev')).not.toContain('-p devdock')
+    expect(devspaceCommand(repo, 'dev')).toContain('DEVSPACE_CONFIG=')
   })
   it('seeds an own-image replica build from the parent cache', () => {
     const repo = fixture()
