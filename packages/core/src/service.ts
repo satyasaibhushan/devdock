@@ -53,7 +53,7 @@ import {
   loadWorkflowConfig,
   verifyEndpoint,
 } from './workflow.js'
-import { markPullSecretRefreshed } from './workloadConfig.js'
+import { canReusePullSecret, markPullSecretRefreshed } from './workloadConfig.js'
 import {
   assembleState,
   resolveWorkload,
@@ -936,7 +936,12 @@ export class Service {
       return { code: 2, stdout: '', stderr: 'Machine prerequisites did not pass' }
     if (cancelled()) return cancellation
     this.operationStage(id, workload, 'starting')
-    const denied = (await this.ensureAuth(key)) ?? (await this.ensureAwsCreds(key))
+    // `dev` needs AWS only to mint the pull-secret token; with a fresh secret in
+    // the namespace it runs without it, so an expired AWS sign-in does not
+    // block reattaching or starting a session.
+    const denied =
+      (await this.ensureAuth(key)) ??
+      (canReusePullSecret(scopedRepo) ? null : await this.ensureAwsCreds(key))
     if (denied) return denied
     let repo = scopedRepo
     // First start of an un-namespaced repo: run it against the kube context's
