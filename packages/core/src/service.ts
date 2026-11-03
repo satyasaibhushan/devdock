@@ -35,12 +35,7 @@ import {
   Sandboxes,
   requireActor,
 } from './sandboxes.js'
-import {
-  devSessionPods,
-  devSessionReady,
-  initialSyncDone,
-  startProgress,
-} from './startProgress.js'
+import { devSessionPods, devSessionReady, initialSyncDone, startProgress } from './startProgress.js'
 import { type ReplicaRecord, StateStore } from './stateStore.js'
 import { type SessionState, type StreamRunner, Supervisor, verbLabel } from './supervisor.js'
 import { type RunOutcome, type TermInfo, type TermKind, TermRegistry } from './termRegistry.js'
