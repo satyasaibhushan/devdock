@@ -259,6 +259,8 @@ export class Service {
   private readonly pausedSessions = new Set<string>()
   private readonly sessionGenerations = new Map<string, number>()
   private readonly readyPodGenerations = new Map<string, string>()
+  /** Node of each workload's most recent DevSpace pod (in-memory). */
+  private readonly lastDevNodes = new Map<string, string>()
   /** When a pending startup command first saw its session pods ready. */
   private readonly startupReadySince = new Map<string, number>()
   /** Fast re-checks for a pending startup between the 5s reconcile ticks. */
@@ -955,7 +957,10 @@ export class Service {
     writeFileSync(pipeFile, '') // fresh run, fresh file — old output doesn't linger
     this.logGens.set(key, (this.logGens.get(key) ?? 0) + 1) // invalidate old f: cursors
     hub.push(`$ ${verbLabel(repo, 'dev')}`)
-    const r = await this.supervisor.start(repo, pipeFile)
+    const r = await this.supervisor.start(
+      { ...repo, preferNodes: this.imageNodes(id, workload) },
+      pipeFile,
+    )
     if (cancelled()) {
       await this.supervisor.stopSession(repo)
       return cancellation
@@ -979,6 +984,16 @@ export class Service {
     }
     await this.reconcileOne(id)
     return warning ? { ...r, stdout: `${warning}\n${r.stdout}` } : r
+  }
+
+  /** Nodes that hold this workload's current image: where its pods run now
+   *  (after a deploy, the pod that just pulled it) and where its last dev pod ran. */
+  private imageNodes(id: string, workload?: string): string[] {
+    const { key, type } = this.scoped(id, workload)
+    const pods = this.states.get(id)?.workloads.find((w) => w.type === (type ?? ''))?.pods ?? []
+    const nodes = pods.flatMap((p) => (p.node ? [p.node] : []))
+    const last = this.lastDevNodes.get(key)
+    return [...new Set(last ? [...nodes, last] : nodes)]
   }
 
   async build(id: string, workload?: string): Promise<RunResult> {
@@ -2052,6 +2067,8 @@ export class Service {
       // Only the session's own pods count: after a deploy the Helm pod is ready
       // first, and its swap for the DevSpace pod is not a restart of the app.
       const sessionPods = devSessionPods(ws.pods)
+      const devNode = ws.pods.find((p) => p.name.includes('-devspace') && p.node)?.node
+      if (devNode) this.lastDevNodes.set(key, devNode)
       const readyGeneration = sessionPods
         .filter((pod) => pod.ready)
         .map((pod) => `${pod.name}:${pod.restartCount}`)

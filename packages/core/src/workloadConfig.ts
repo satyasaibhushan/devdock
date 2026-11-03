@@ -142,6 +142,7 @@ function overlayPlan(repo: Repo): OverlayPlan | undefined {
   ) as ConfigShape | undefined
   patches.push(...localChartPatches(template, repoDoc))
   if (imp.template === 'ui') patches.push(...noSyncWaitPatches(repoDoc))
+  patches.push(...preferNodePatches(repo.preferNodes, repoDoc, template))
   const pullSecrets = template?.pullSecrets !== undefined || repoDoc.pullSecrets !== undefined
   return { text, imp, patches, pullSecrets }
 }
@@ -149,7 +150,7 @@ function overlayPlan(repo: Repo): OverlayPlan | undefined {
 type ConfigShape = {
   pullSecrets?: unknown
   deployments?: Record<string, { helm?: { chart?: { git?: unknown } } }>
-  dev?: Record<string, { sync?: unknown[] }>
+  dev?: Record<string, { sync?: unknown[]; patches?: unknown[] }>
 }
 
 function parseYamlSafe(text: string | undefined): unknown {
@@ -197,6 +198,40 @@ function noSyncWaitPatches(repo: ConfigShape): Patch[] {
     path: `dev.common.sync[${i}].waitInitialSync`,
     value: false,
   }))
+}
+
+/** Softly prefer nodes that already pulled the image: a dev pod on a fresh node
+ *  paid a 25-40s pull. Appends to the dev target's pod patches, creating the
+ *  list when neither the repo nor the template has one. */
+function preferNodePatches(
+  nodes: string[] | undefined,
+  repo: ConfigShape,
+  template: ConfigShape | undefined,
+): Patch[] {
+  if (!nodes?.length) return []
+  const affinity = {
+    op: 'add',
+    path: 'spec.affinity',
+    value: {
+      nodeAffinity: {
+        preferredDuringSchedulingIgnoredDuringExecution: [
+          {
+            weight: 100,
+            preference: {
+              matchExpressions: [
+                { key: 'kubernetes.io/hostname', operator: 'In', values: [...new Set(nodes)] },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  }
+  const common = repo.dev?.common ?? template?.dev?.common
+  if (!common) return []
+  return Array.isArray(common.patches)
+    ? [{ op: 'add', path: 'dev.common.patches', value: affinity }]
+    : [{ op: 'add', path: 'dev.common.patches', value: [affinity] }]
 }
 
 function helmChartsDir(): string {

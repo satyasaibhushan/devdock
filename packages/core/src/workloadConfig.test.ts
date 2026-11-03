@@ -215,6 +215,37 @@ deployments:
       ]),
     )
   })
+  it('softly prefers nodes that already hold the image', () => {
+    const affinity = (repo: Repo) =>
+      profile(repo, 'devdock').patches.find(
+        (p: { path: string }) => p.path === 'dev.common.patches',
+      )
+    // The repo already patches its dev pod: append to that list.
+    const withList = {
+      ...uiRepo(
+        'dev:\n  common:\n    patches:\n      - op: replace\n        path: spec.nodeSelector\n        value: {}\n',
+      ),
+      preferNodes: ['node-a', 'node-a', 'node-b'],
+    }
+    prepareWorkloadConfig(withList)
+    const appended = affinity(withList)
+    expect(Array.isArray(appended.value)).toBe(false)
+    expect(
+      appended.value.value.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution[0]
+        .preference.matchExpressions[0].values,
+    ).toEqual(['node-a', 'node-b'])
+    // No list anywhere: create it.
+    const withoutList = {
+      ...uiRepo('dev:\n  common:\n    workingDir: /app\n'),
+      preferNodes: ['node-a'],
+    }
+    prepareWorkloadConfig(withoutList)
+    expect(Array.isArray(affinity(withoutList).value)).toBe(true)
+    // Nothing known: no preference.
+    const none = uiRepo('dev:\n  common:\n    workingDir: /app\n')
+    prepareWorkloadConfig(none)
+    expect(affinity(none)).toBeUndefined()
+  })
   it('reuses the pull secret for dev and purge only after a recent deploy', () => {
     const repo = { ...uiRepo(), namespace: 'team' }
     prepareWorkloadConfig(repo)

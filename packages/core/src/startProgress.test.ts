@@ -37,6 +37,7 @@ describe('dev start milestones', () => {
       }),
     )
     expect(startProgress(pods, [])).toEqual(['Pod scheduled', 'Image pulled'])
+    expect(pods.map((p) => p.node)).toEqual(['node', 'node'])
     expect(
       startProgress(
         pods.map((p) => ({ ...p, ready: true })),

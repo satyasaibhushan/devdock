@@ -135,6 +135,7 @@ export function parsePods(json: string): PodInfo[] {
       containers.every((c) => typeof c.imageID === 'string' && c.imageID.length > 0)
     pods.push({
       ...(scheduled !== undefined ? { scheduled } : {}),
+      ...(spec?.nodeName ? { node: spec.nodeName } : {}),
       ...(imagePulled ? { imagePulled: true } : {}),
       name: meta?.name ?? '<unknown>',
       phase: typeof status.phase === 'string' ? status.phase : 'Unknown',
