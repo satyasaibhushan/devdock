@@ -1,6 +1,7 @@
 // supervisor — start/build/kill a repo's workload via tmux + devspace (spec §7).
 // Each `devspace dev` runs inside its own named tmux session so it survives
 // daemon restarts and the daemon never blocks on it (spec §5).
+import { randomUUID } from 'node:crypto'
 import { type RunResult, loginShell, loginShellArgs, run, runStream } from './exec.js'
 import type { Repo } from './types.js'
 import { prepareWorkloadConfig, workloadConfigPath } from './workloadConfig.js'
@@ -318,6 +319,43 @@ export class Supervisor {
   /** Run a one-off command inside the repo's dev session via `tmux send-keys`. */
   exec(repo: Repo, command: string): Promise<RunResult> {
     return this.runner('tmux', ['send-keys', '-t', exactPane(repo.session), command, 'Enter'])
+  }
+
+  /** A tmux success only proves keystrokes were sent. Require a separate
+   * shell-produced line, not the echoed command, before acknowledging submission.
+   * This still does not claim that the command finished or exited successfully. */
+  async execVerified(repo: Repo, command: string): Promise<RunResult> {
+    const marker = `DEVDOCK_ACK_${randomUUID().replaceAll('-', '')}`
+    const sent = await this.exec(repo, `printf '\\n${marker}\\n'; ${command}`)
+    if (sent.code !== 0) return sent
+    for (let attempt = 0; attempt < 20; attempt++) {
+      const pane = await this.runner('tmux', [
+        'capture-pane',
+        '-p',
+        '-J',
+        '-t',
+        exactPane(repo.session),
+        '-S',
+        '-100',
+      ])
+      if (pane.code !== 0)
+        return { code: 1, stdout: '', stderr: 'Cannot verify the dev session shell' }
+      if (pane.stdout.split(/\r?\n/).some((line) => line.trim() === marker)) {
+        return {
+          code: 0,
+          stdout:
+            'Shell acknowledged submission. Execution and exit status are not verified; use devdock_run for that.',
+          stderr: '',
+        }
+      }
+      if (attempt < 19) await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+    return {
+      code: 1,
+      stdout: '',
+      stderr:
+        'No shell acknowledgement. The command may still run; inspect application logs before retrying.',
+    }
   }
 
   /** PID(s) of the external `devspace dev` session holding this workload's lock —

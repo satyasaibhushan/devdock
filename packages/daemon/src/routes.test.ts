@@ -17,7 +17,13 @@ beforeEach(() => {
 afterEach(() => rmSync(root, { recursive: true, force: true }))
 
 function makeService(start = vi.fn(), instanceId?: string) {
+  let acknowledgement = ''
   const runner = vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
+    if (cmd === 'tmux' && args[0] === 'send-keys') {
+      acknowledgement = args.join(' ').match(/DEVDOCK_ACK_[a-f0-9]+/)?.[0] ?? ''
+    }
+    if (cmd === 'tmux' && args[0] === 'capture-pane')
+      return { code: 0, stdout: acknowledgement, stderr: '' }
     if (cmd === 'tmux' && args[0] === 'has-session') return { code: 1, stdout: '', stderr: '' }
     if (cmd === 'tmux' && args[0] === 'new-session') {
       start()
@@ -632,6 +638,11 @@ describe('daemon routes', () => {
     const runner = vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
       if (cmd === 'git' && args.includes('for-each-ref'))
         return { code: 0, stdout: 'main\t1700000000\nfeature-x\t1690000000\n', stderr: '' }
+      if (cmd === 'tmux' && args[0] === 'send-keys') {
+        acknowledgement = args.join(' ').match(/DEVDOCK_ACK_[a-f0-9]+/)?.[0] ?? ''
+      }
+      if (cmd === 'tmux' && args[0] === 'capture-pane')
+        return { code: 0, stdout: acknowledgement, stderr: '' }
       if (cmd === 'tmux' && args[0] === 'has-session') return { code: 1, stdout: '', stderr: '' }
       if (cmd === 'kubectl') return { code: 0, stdout: '{"items":[]}', stderr: '' }
       // The isolation check reads the resolved config; these have no dev targets.

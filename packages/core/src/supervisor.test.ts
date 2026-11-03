@@ -5,6 +5,39 @@ import { Supervisor, devspaceArgs, devspaceCommand, shellQuote, verbLabel } from
 import type { Repo } from './types.js'
 import { scopeRepo } from './workloads.js'
 
+it('requires a shell acknowledgement rather than echoed keystrokes', async () => {
+  let sent = ''
+  let captures = 0
+  const runner = vi.fn(async (_cmd: string, args: string[]) => {
+    if (args[0] === 'send-keys') sent = args[3]
+    const marker = /DEVDOCK_ACK_[a-f0-9]+/.exec(sent)?.[0]
+    const stdout =
+      args[0] === 'capture-pane' ? (++captures === 1 ? sent : `${sent}\n${marker}\n`) : ''
+    return { code: 0, stdout, stderr: '' }
+  })
+  const result = await new Supervisor(runner).execVerified(repo, 'pnpm test')
+  expect(result.code).toBe(0)
+  expect(captures).toBe(2)
+  expect(runner).toHaveBeenCalledWith('tmux', expect.arrayContaining(['capture-pane', '-p', '-J']))
+  expect(result.stdout).toContain('exit status are not verified')
+  expect(result.stdout).not.toContain(sent)
+})
+
+it('fails when the shell never acknowledges, without returning pane contents', async () => {
+  vi.useFakeTimers()
+  try {
+    const runner = vi.fn(async () => ({ code: 0, stdout: 'private pane text', stderr: '' }))
+    const pending = new Supervisor(runner).execVerified(repo, 'pnpm test')
+    await vi.runAllTimersAsync()
+    const result = await pending
+    expect(result.code).toBe(1)
+    expect(result.stderr).toContain('may still run')
+    expect(JSON.stringify(result)).not.toContain('private pane text')
+  } finally {
+    vi.useRealTimers()
+  }
+})
+
 const repo: Repo = {
   id: 'svc-a',
   name: 'svc-a',

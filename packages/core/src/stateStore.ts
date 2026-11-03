@@ -27,6 +27,8 @@ export interface Grant {
  *  is the source of truth for materializing the replica's Repo on rescan
  *  (scanning the worktree would re-register the parent's own configs). */
 export interface ReplicaRecord {
+  /** Caller identity for safe retries after a transport timeout. */
+  requestId?: string
   /** Repo id, `<parentId>-rN`. */
   id: string
   parentId: string
