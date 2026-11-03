@@ -1436,6 +1436,7 @@ export class Service {
             // Default: the parent's tag — code arrives via sync, so the
             // replica runs on the parent's base image.
             imageTag: ownTag ?? `${namespace ?? ''}-${member.name}`,
+            ...(ownTag ? { cacheSeed: `${namespace ?? ''}-${member.name}` } : {}),
           })
           const dir = join(wt, '.devspace', `${id}-${type}`)
           mkdirSync(dir, { recursive: true })
@@ -1457,6 +1458,7 @@ export class Service {
         const generated = generateReplicaConfig(readFileSync(parent.configPath, 'utf8'), {
           replicaId: id,
           imageTag: ownTag ?? parentTag,
+          ...(ownTag ? { cacheSeed: parentTag } : {}),
         })
         mkdirSync(wt, { recursive: true })
         const configPath = join(wt, 'devspace.yaml')

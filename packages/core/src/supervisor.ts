@@ -4,7 +4,12 @@
 import { randomUUID } from 'node:crypto'
 import { type RunResult, loginShell, loginShellArgs, run, runStream } from './exec.js'
 import type { Repo } from './types.js'
-import { prepareWorkloadConfig, workloadConfigPath } from './workloadConfig.js'
+import {
+  DEVDOCK_PROFILE,
+  devdockConfigPath,
+  isTuned,
+  prepareWorkloadConfig,
+} from './workloadConfig.js'
 
 /** Injectable command runner — defaults to the real `run`; swapped in tests. */
 export type Runner = (cmd: string, args: string[], opts?: { cwd?: string }) => Promise<RunResult>
@@ -65,6 +70,8 @@ export function exactPane(session: string): string {
   return `=${session}:`
 }
 
+const TUNED_VERBS = new Set(['dev', 'deploy', 'purge'])
+
 /** Build the shell command that runs `devspace <verb>` the way the user's
  *  `./devspace` wrapper does: cd into the service dir, every `question:` var
  *  pre-answered, and — for multi-service repos — DEVSPACE_BINARY_DIR exported to
@@ -75,10 +82,12 @@ export function devspaceCommand(repo: Repo, verb: string): string {
   const extra = devspaceArgs(repo)
     .map((a) => (a.startsWith('-') ? a : shellQuote(a)))
     .join(' ')
-  const config = repo.devspaceTemplateName
-    ? `DEVSPACE_CONFIG=${shellQuote(workloadConfigPath(repo))} `
-    : ''
-  const cmd = `cd ${shellQuote(repo.path)} && ${config}devspace ${verb}${extra ? ` ${extra}` : ''}`
+  const overlay = devdockConfigPath(repo)
+  const config = overlay ? `DEVSPACE_CONFIG=${shellQuote(overlay)} ` : ''
+  // Only the plain lifecycle verbs take the tuning; sandbox verbs bring their
+  // own profiles (`persistent` already replaces the same image build block).
+  const profile = TUNED_VERBS.has(verb) && isTuned(repo) ? ` -p ${DEVDOCK_PROFILE}` : ''
+  const cmd = `cd ${shellQuote(repo.path)} && ${config}devspace ${verb}${profile}${extra ? ` ${extra}` : ''}`
   return repo.root ? `export DEVSPACE_BINARY_DIR=${shellQuote(repo.root)} && ${cmd}` : cmd
 }
 
