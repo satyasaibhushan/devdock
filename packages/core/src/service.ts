@@ -35,7 +35,12 @@ import {
   Sandboxes,
   requireActor,
 } from './sandboxes.js'
-import { devSessionReady, initialSyncDone, startProgress } from './startProgress.js'
+import {
+  devSessionPods,
+  devSessionReady,
+  initialSyncDone,
+  startProgress,
+} from './startProgress.js'
 import { type ReplicaRecord, StateStore } from './stateStore.js'
 import { type SessionState, type StreamRunner, Supervisor, verbLabel } from './supervisor.js'
 import { type RunOutcome, type TermInfo, type TermKind, TermRegistry } from './termRegistry.js'
@@ -67,6 +72,7 @@ export interface ServiceOptions {
  *  `devspace dev` opens its in-container terminal a beat after the pod is up, so
  *  the keystrokes land at the shell prompt rather than mid-deploy output. */
 const STARTUP_RUN_DELAY_MS = 2500
+const STARTUP_NO_SYNC_GRACE_MS = 30_000
 /** How long the "live session but no attributed pods" condition must hold —
  *  continuously, across reconcile passes that could actually see the cluster —
  *  before the session is retired as stale. A single empty/failed kubectl read
@@ -251,6 +257,8 @@ export class Service {
   private readonly pausedSessions = new Set<string>()
   private readonly sessionGenerations = new Map<string, number>()
   private readonly readyPodGenerations = new Map<string, string>()
+  /** When a pending startup command first saw its session pods ready. */
+  private readonly startupReadySince = new Map<string, number>()
   private readonly replicaRequests = new Map<string, Promise<ReplicaRecord>>()
   private timer?: NodeJS.Timeout
   private authTimer?: NodeJS.Timeout
@@ -1867,6 +1875,20 @@ export class Service {
 
   /** Run the queued startup command in the dev session after a short grace, so
    *  the keystrokes land at the in-container shell `devspace dev` opens. */
+  /** DevSpace opens the session's shell only after the initial sync, so typing
+   *  the startup command earlier lands in deploy output. Configs without a sync
+   *  never log one; give those a fixed grace after their pods are ready. */
+  private devShellOpen(key: string): boolean {
+    const since = this.startupReadySince.get(key) ?? Date.now()
+    this.startupReadySince.set(key, since)
+    if (Date.now() - since >= STARTUP_NO_SYNC_GRACE_MS) return true
+    const path = this.devLogPath(key)
+    const size = existsSync(path) ? statSync(path).size : 0
+    // Only the tail can hold a fresh sync line; the log is truncated per start.
+    const slice = readFileSlice(path, Math.max(0, size - 256 * 1024))
+    return slice !== undefined && initialSyncDone(slice.lines)
+  }
+
   private scheduleStartup(scoped: Repo, key: string, command: string): void {
     const sessionGeneration = this.sessionGenerations.get(key)
     const podGeneration = this.readyPodGenerations.get(key)
@@ -1986,7 +2008,10 @@ export class Service {
       // A live DevSpace session can survive a replacement pod or container.
       // The old app process cannot: re-arm its configured command once for
       // the new ready generation, without restarting or deploying the parent.
-      const readyGeneration = ws.pods
+      // Only the session's own pods count: after a deploy the Helm pod is ready
+      // first, and its swap for the DevSpace pod is not a restart of the app.
+      const sessionPods = devSessionPods(ws.pods)
+      const readyGeneration = sessionPods
         .filter((pod) => pod.ready)
         .map((pod) => `${pod.name}:${pod.restartCount}`)
         .sort()
@@ -2009,10 +2034,13 @@ export class Service {
       // Once the dev session's pod is up, fire any queued startup command into
       // the session (the initial dev pod) — one shot per start.
       const pending = this.store.getPendingStartup(key)
-      if (ws.status === 'RUNNING_MANAGED' && ws.pods.some((pod) => pod.ready) && pending) {
-        this.store.setPendingStartup(key, undefined)
-        this.scheduleStartup(scoped, key, pending)
-      }
+      if (ws.status === 'RUNNING_MANAGED' && sessionPods.some((pod) => pod.ready) && pending) {
+        if (this.devShellOpen(key)) {
+          this.startupReadySince.delete(key)
+          this.store.setPendingStartup(key, undefined)
+          this.scheduleStartup(scoped, key, pending)
+        }
+      } else this.startupReadySince.delete(key)
       if (exists) {
         // The session is present (alive or a dead/crashed shell). Keep its pane
         // mirrored to the on-disk dev log — a forensic record of the session

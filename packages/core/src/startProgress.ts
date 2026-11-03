@@ -12,9 +12,20 @@ export function initialSyncDone(lines: string[]): boolean {
  *  come from the replacement (`*-devspace`) pod. A config that never replaces
  *  its pod has no such pod; then the observed initial sync is the signal. */
 export function devSessionReady(pods: PodInfo[], synced: boolean): boolean {
-  const dev = pods.filter((p) => p.name.includes('-devspace'))
+  const dev = pods.filter(isDevPod)
   if (dev.length > 0) return dev.every((p) => p.ready)
   return synced && pods.length > 0 && pods.every((p) => p.ready)
+}
+
+/** The pods a dev session runs in: the DevSpace replacements when there are
+ *  any, otherwise (a config that never replaces) all of the workload's pods. */
+export function devSessionPods(pods: PodInfo[]): PodInfo[] {
+  const dev = pods.filter(isDevPod)
+  return dev.length > 0 ? dev : pods
+}
+
+function isDevPod(pod: PodInfo): boolean {
+  return pod.name.includes('-devspace')
 }
 
 export function startProgress(pods: PodInfo[], lines: string[]): string[] {

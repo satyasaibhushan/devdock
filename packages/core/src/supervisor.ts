@@ -97,7 +97,8 @@ export function devspaceCommand(repo: Repo, verb: string): string {
  *  show `./devspace`; plain repos call `devspace` directly. */
 export function verbLabel(repo: Repo, verb: string): string {
   const bin = repo.root ? './devspace' : 'devspace'
-  return [bin, verb, ...devspaceArgs(repo)].join(' ')
+  const profile = TUNED_VERBS.has(verb) && isTuned(repo) ? ['-p', DEVDOCK_PROFILE] : []
+  return [bin, verb, ...profile, ...devspaceArgs(repo)].join(' ')
 }
 
 export class Supervisor {
