@@ -35,7 +35,13 @@ import {
   Sandboxes,
   requireActor,
 } from './sandboxes.js'
-import { devSessionPods, devSessionReady, initialSyncDone, startProgress } from './startProgress.js'
+import {
+  devSessionPods,
+  devSessionReady,
+  initialSyncDone,
+  shellOpened,
+  startProgress,
+} from './startProgress.js'
 import { type ReplicaRecord, StateStore } from './stateStore.js'
 import { type SessionState, type StreamRunner, Supervisor, verbLabel } from './supervisor.js'
 import { type RunOutcome, type TermInfo, type TermKind, TermRegistry } from './termRegistry.js'
@@ -63,10 +69,10 @@ export interface ServiceOptions {
   instanceId?: string
 }
 
-/** Grace after the dev pod reports ready before sending the startup command —
- *  `devspace dev` opens its in-container terminal a beat after the pod is up, so
- *  the keystrokes land at the shell prompt rather than mid-deploy output. */
-const STARTUP_RUN_DELAY_MS = 2500
+/** Grace after DevSpace reports the shell open before sending the startup
+ *  command, so the keystrokes land at its prompt rather than in its banner. */
+const STARTUP_RUN_DELAY_MS = 1000
+const SHELL_WATCH_MS = 500
 const STARTUP_NO_SYNC_GRACE_MS = 30_000
 /** How long the "live session but no attributed pods" condition must hold —
  *  continuously, across reconcile passes that could actually see the cluster —
@@ -254,6 +260,8 @@ export class Service {
   private readonly readyPodGenerations = new Map<string, string>()
   /** When a pending startup command first saw its session pods ready. */
   private readonly startupReadySince = new Map<string, number>()
+  /** Fast re-checks for a pending startup between the 5s reconcile ticks. */
+  private readonly shellWatches = new Map<string, NodeJS.Timeout>()
   private readonly replicaRequests = new Map<string, Promise<ReplicaRecord>>()
   private timer?: NodeJS.Timeout
   private authTimer?: NodeJS.Timeout
@@ -1870,6 +1878,26 @@ export class Service {
 
   /** Run the queued startup command in the dev session after a short grace, so
    *  the keystrokes land at the in-container shell `devspace dev` opens. */
+  /** The shell opens a couple of seconds after the pod is ready; poll for it
+   *  instead of waiting up to a full reconcile tick. Bounded by the no-sync grace. */
+  private watchShell(id: string, key: string): void {
+    if (this.shellWatches.has(key)) return
+    const timer = setInterval(() => {
+      if (this.stopped || !this.store.getPendingStartup(key)) return this.stopShellWatch(key)
+      if (this.devShellOpen(key)) {
+        this.stopShellWatch(key)
+        void this.reconcileOne(id).catch(() => undefined)
+      }
+    }, SHELL_WATCH_MS)
+    timer.unref?.()
+    this.shellWatches.set(key, timer)
+  }
+
+  private stopShellWatch(key: string): void {
+    clearInterval(this.shellWatches.get(key))
+    this.shellWatches.delete(key)
+  }
+
   /** DevSpace opens the session's shell only after the initial sync, so typing
    *  the startup command earlier lands in deploy output. Configs without a sync
    *  never log one; give those a fixed grace after their pods are ready. */
@@ -1881,7 +1909,7 @@ export class Service {
     const size = existsSync(path) ? statSync(path).size : 0
     // Only the tail can hold a fresh sync line; the log is truncated per start.
     const slice = readFileSlice(path, Math.max(0, size - 256 * 1024))
-    return slice !== undefined && initialSyncDone(slice.lines)
+    return slice !== undefined && shellOpened(slice.lines)
   }
 
   private scheduleStartup(scoped: Repo, key: string, command: string): void {
@@ -2031,11 +2059,15 @@ export class Service {
       const pending = this.store.getPendingStartup(key)
       if (ws.status === 'RUNNING_MANAGED' && sessionPods.some((pod) => pod.ready) && pending) {
         if (this.devShellOpen(key)) {
+          this.stopShellWatch(key)
           this.startupReadySince.delete(key)
           this.store.setPendingStartup(key, undefined)
           this.scheduleStartup(scoped, key, pending)
-        }
-      } else this.startupReadySince.delete(key)
+        } else this.watchShell(id, key)
+      } else {
+        this.startupReadySince.delete(key)
+        this.stopShellWatch(key)
+      }
       if (exists) {
         // The session is present (alive or a dead/crashed shell). Keep its pane
         // mirrored to the on-disk dev log — a forensic record of the session

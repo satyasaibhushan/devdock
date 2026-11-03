@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { parsePods } from './reconciler.js'
-import { devSessionReady, initialSyncDone, startProgress } from './startProgress.js'
+import { devSessionReady, initialSyncDone, shellOpened, startProgress } from './startProgress.js'
 
 describe('dev start milestones', () => {
   it.each([
@@ -65,5 +65,16 @@ describe('dev session readiness', () => {
     expect(devSessionReady([pod('app', true)], true)).toBe(true)
     expect(devSessionReady([pod('app', false)], true)).toBe(false)
     expect(devSessionReady([], true)).toBe(false)
+  })
+})
+
+describe('dev shell detection', () => {
+  it('recognizes the DevSpace terminal attach line only', () => {
+    expect(
+      shellOpened([
+        '\u001b[36mdev:common term \u001b[0m Opening shell to web:web-devspace-1 (pod:container)',
+      ]),
+    ).toBe(true)
+    expect(shellOpened(['dev:common sync  Initial sync completed'])).toBe(false)
   })
 })

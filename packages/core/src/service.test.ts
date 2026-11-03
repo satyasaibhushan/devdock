@@ -1001,7 +1001,7 @@ describe('Service', () => {
     before.rescan()
     before.setStartupCommand('svc-a', 'pnpm run dev')
     await before.start('svc-a')
-    writeFileSync(join(root, 'logs', 'svc-a.dev.log'), 'Initial sync completed\n') // shell is open
+    writeFileSync(join(root, 'logs', 'svc-a.dev.log'), 'term  Opening shell to svc-a\n') // shell is open
 
     // …the daemon restarts inside the deploy window (fresh Service, same store),
     // and the pod only becomes ready on the new process's watch.
@@ -1079,7 +1079,7 @@ describe('Service', () => {
       svc.rescan()
       svc.setStartupCommand('svc-a', 'python main.py')
       mkdirSync(join(root, 'logs'), { recursive: true })
-      writeFileSync(join(root, 'logs', 'svc-a.dev.log'), 'Initial sync completed\n') // shell is open
+      writeFileSync(join(root, 'logs', 'svc-a.dev.log'), 'term  Opening shell to svc-a\n') // shell is open
       vi.useFakeTimers()
       try {
         await svc.reconcileAll()
@@ -1133,7 +1133,10 @@ describe('Service', () => {
       await after.reconcileAll()
       await vi.advanceTimersByTimeAsync(3000)
       expect(runner).not.toHaveBeenCalledWith('tmux', expect.arrayContaining(['send-keys']))
-      writeFileSync(join(root, 'logs', 'svc-a.dev.log'), 'info Initial sync completed\n')
+      writeFileSync(
+        join(root, 'logs', 'svc-a.dev.log'),
+        'term  Opening shell to svc-a:app (pod:container)\n',
+      )
       await after.reconcileAll()
       await vi.advanceTimersByTimeAsync(3000)
       expect(runner).toHaveBeenCalledWith('tmux', [
@@ -1156,7 +1159,7 @@ describe('Service', () => {
     before.rescan()
     before.setStartupCommand('svc-a', 'pnpm run dev')
     await before.start('svc-a')
-    writeFileSync(join(root, 'logs', 'svc-a.dev.log'), 'Initial sync completed\n') // shell is open
+    writeFileSync(join(root, 'logs', 'svc-a.dev.log'), 'term  Opening shell to svc-a\n') // shell is open
 
     let ready = false
     const runner = vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {

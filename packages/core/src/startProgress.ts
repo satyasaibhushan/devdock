@@ -28,6 +28,12 @@ function isDevPod(pod: PodInfo): boolean {
   return pod.name.includes('-devspace')
 }
 
+/** DevSpace's terminal line once the session shell is attached (it opens only
+ *  after the initial sync). */
+export function shellOpened(lines: string[]): boolean {
+  return lines.some((line) => /\bOpening shell to\b/.test(cleanLine(line)))
+}
+
 export function startProgress(pods: PodInfo[], lines: string[]): string[] {
   // Ignore the old Helm pods while DevSpace is creating its replacement.
   const dev = pods.filter((p) => p.name.includes('-devspace'))
