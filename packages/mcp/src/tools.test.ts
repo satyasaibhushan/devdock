@@ -452,8 +452,8 @@ describe('tool handlers', () => {
     const t = allTools(fakeClient({ replicaCreate })).find(
       (x) => x.name === 'devdock_replica_create',
     )
-    const out = await t?.handler({ repo: 'svc-a', branch: 'feature-x' })
-    expect(replicaCreate).toHaveBeenCalledWith('svc-a', 'feature-x', undefined)
+    const out = await t?.handler({ repo: 'svc-a', branch: 'feature-x', requestId: 'retry-1' })
+    expect(replicaCreate).toHaveBeenCalledWith('svc-a', 'feature-x', undefined, 'retry-1')
     expect(out).toContain('created svc-a-r1 from feature-x')
     expect(out).toContain('devdock_wait')
   })
@@ -472,7 +472,7 @@ describe('tool handlers', () => {
       (x) => x.name === 'devdock_replica_create',
     )
     const out = await t?.handler({ repo: 'svc-a', branch: 'feature-x', ownImage: true })
-    expect(replicaCreate).toHaveBeenCalledWith('svc-a', 'feature-x', true)
+    expect(replicaCreate).toHaveBeenCalledWith('svc-a', 'feature-x', true, undefined)
     expect(out).toContain('building its own image')
   })
 

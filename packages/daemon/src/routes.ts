@@ -364,30 +364,34 @@ export function buildApp(
     }
   })
 
-  app.post<{ Params: { id: string }; Body: { branch?: string; ownImage?: boolean } }>(
-    '/repos/:id/replicas',
-    async (req, reply) => {
-      const branch = req.body?.branch
-      if (typeof branch !== 'string' || !branch.trim()) {
-        return reply.code(400).send({ error: 'branch required' })
-      }
-      try {
-        return reply.code(201).send(
-          await service.createReplica(req.params.id, branch, {
-            ownImage: req.body?.ownImage === true,
-          }),
-        )
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err)
-        const code = message.includes('unknown repo')
-          ? 404
-          : message.includes('replica of a replica')
+  app.post<{
+    Params: { id: string }
+    Body: { branch?: string; ownImage?: boolean; requestId?: string }
+  }>('/repos/:id/replicas', async (req, reply) => {
+    const branch = req.body?.branch
+    if (typeof branch !== 'string' || !branch.trim()) {
+      return reply.code(400).send({ error: 'branch required' })
+    }
+    try {
+      return reply.code(201).send(
+        await service.createReplica(req.params.id, branch, {
+          ownImage: req.body?.ownImage === true,
+          requestId: req.body?.requestId,
+        }),
+      )
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      const code = message.includes('unknown repo')
+        ? 404
+        : message.includes('replica request id already belongs')
+          ? 409
+          : message.includes('replica of a replica') ||
+              message.includes('invalid replica request id')
             ? 400
             : 500
-        return reply.code(code).send({ error: message })
-      }
-    },
-  )
+      return reply.code(code).send({ error: message })
+    }
+  })
 
   app.get('/replicas', async () => service.listReplicas())
 

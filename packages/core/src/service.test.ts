@@ -945,7 +945,8 @@ describe('Service', () => {
     const unsub = svc.subscribeLogs('svc-a', (l) => seen.push(l))
     await svc.build('svc-a')
     expect(seen[0]).toBe('$ devspace deploy -n ns')
-    expect(seen.at(-1)).toBe('✓ devspace deploy -n ns')
+    expect(seen).toContain('✓ devspace deploy -n ns')
+    expect(seen.at(-1)).toContain('callers with pooled connections may need a restart')
     unsub()
 
     await svc.stop('svc-a')
@@ -1039,6 +1040,68 @@ describe('Service', () => {
       vi.useRealTimers()
     }
   })
+
+  it.each(['replacement', 'container restart'])(
+    'replays startup once after %s, without deploying the parent',
+    async (change) => {
+      let name = 'svc-a-app-1'
+      let restarts = 0
+      let ready = true
+      const base = cannedRunner('{"items":[]}', true)
+      const runner = vi.fn(async (cmd: string, args: string[]) => {
+        if (cmd === 'kubectl' && args[0] === 'get' && args[1] === 'pods') {
+          return {
+            code: 0,
+            stderr: '',
+            stdout: JSON.stringify({
+              items: [
+                {
+                  metadata: { name },
+                  status: {
+                    phase: 'Running',
+                    containerStatuses: [{ ready, restartCount: restarts }],
+                  },
+                },
+              ],
+            }),
+          }
+        }
+        return base(cmd, args)
+      })
+      const svc = new Service(
+        { roots: [root], stateFile },
+        {
+          runner,
+          streamSpawner: fakeStreamSpawner().spawner,
+        },
+      )
+      svc.rescan()
+      svc.setStartupCommand('svc-a', 'python main.py')
+      vi.useFakeTimers()
+      try {
+        await svc.reconcileAll()
+        await vi.advanceTimersByTimeAsync(3000)
+        expect(runner).not.toHaveBeenCalledWith('tmux', expect.arrayContaining(['send-keys']))
+        ready = false
+        if (change === 'replacement') name = 'svc-a-app-2'
+        else restarts++
+        await svc.reconcileAll()
+        await vi.advanceTimersByTimeAsync(3000)
+        expect(runner).not.toHaveBeenCalledWith('tmux', expect.arrayContaining(['send-keys']))
+        ready = true
+        await svc.reconcileAll()
+        await vi.advanceTimersByTimeAsync(3000)
+        await svc.reconcileAll()
+        await vi.advanceTimersByTimeAsync(3000)
+        expect(
+          runner.mock.calls.filter(([cmd, args]) => cmd === 'tmux' && args[0] === 'send-keys'),
+        ).toHaveLength(1)
+        expect(runner.mock.calls.some(([cmd]) => cmd === loginShell)).toBe(false)
+      } finally {
+        vi.useRealTimers()
+      }
+    },
+  )
 
   it('waits for pod readiness before startup injection and log tailing', async () => {
     const before = new Service(
@@ -1613,6 +1676,29 @@ describe('Service replicas', () => {
     svc.rescan()
     return { svc, runner }
   }
+
+  it('reuses a replica request across concurrent retries and daemon restarts', async () => {
+    makeParent()
+    const { svc, runner } = newService()
+    const [first, retry] = await Promise.all([
+      svc.createReplica('parent', 'feature-x', { requestId: 'retry-1' }),
+      svc.createReplica('parent', 'feature-x', { requestId: 'retry-1' }),
+    ])
+    expect(retry.id).toBe(first.id)
+    expect(
+      runner.mock.calls.filter(([cmd, args]) => cmd === 'git' && args.includes('add')),
+    ).toHaveLength(1)
+    const restarted = newService().svc
+    expect(
+      (await restarted.createReplica('parent', 'feature-x', { requestId: 'retry-1' })).id,
+    ).toBe(first.id)
+    await expect(
+      restarted.createReplica('parent', 'different', { requestId: 'retry-1' }),
+    ).rejects.toThrow('different options')
+    await expect(
+      restarted.createReplica('parent', 'feature-x', { requestId: '../invalid' }),
+    ).rejects.toThrow('invalid replica request')
+  })
 
   it('creates a replica: detached worktree, generated configs, inherited startup', async () => {
     makeParent()

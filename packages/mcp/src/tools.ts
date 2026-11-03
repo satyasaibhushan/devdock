@@ -351,6 +351,11 @@ export function allTools(client: DaemonClient): ToolDef[] {
       inputSchema: {
         ...repoArg,
         branch: z.string().min(1).describe('local branch to pin the replica to'),
+        requestId: z
+          .string()
+          .regex(/^[A-Za-z0-9_-]{1,128}$/)
+          .optional()
+          .describe('Reuse this request id on retries after timeouts to return the same replica'),
         ownImage: z
           .boolean()
           .optional()
@@ -363,6 +368,7 @@ export function allTools(client: DaemonClient): ToolDef[] {
           a.repo as string,
           a.branch as string,
           a.ownImage as boolean | undefined,
+          a.requestId as string | undefined,
         )
         const how = r.ownImage ? 'building its own image, then deploying' : 'deploying'
         return `created ${r.id} from ${r.branch} — ${how} in the background; poll devdock_wait ${r.id}`

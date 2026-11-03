@@ -126,7 +126,12 @@ export interface DaemonClient {
   awsLogin(): Promise<AuthState>
   authClear(): Promise<AuthState>
   branches(id: string): Promise<BranchInfo[]>
-  replicaCreate(id: string, branch: string, ownImage?: boolean): Promise<ReplicaRecord>
+  replicaCreate(
+    id: string,
+    branch: string,
+    ownImage?: boolean,
+    requestId?: string,
+  ): Promise<ReplicaRecord>
   replicaList(): Promise<ReplicaRecord[]>
   replicaDelete(id: string): Promise<void>
   termList(): Promise<TermInfo[]>
@@ -318,8 +323,8 @@ export function daemonClient(send: DaemonTransport, prefix = ''): DaemonClient {
     awsLogin: () => post<AuthState>('/auth/aws/login'),
     authClear: () => post<AuthState>('/auth/clear'),
     branches: (i) => request<BranchInfo[]>(`/repos/${id(i)}/branches`),
-    replicaCreate: (i, branch, ownImage) =>
-      post<ReplicaRecord>(`/repos/${id(i)}/replicas`, { branch, ownImage }),
+    replicaCreate: (i, branch, ownImage, requestId) =>
+      post<ReplicaRecord>(`/repos/${id(i)}/replicas`, { branch, ownImage, requestId }),
     replicaList: () => request<ReplicaRecord[]>('/replicas'),
     replicaDelete: async (i) => {
       await request(`/replicas/${id(i)}`, { method: 'DELETE' })

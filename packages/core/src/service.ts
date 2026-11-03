@@ -8,6 +8,7 @@ import { basename, dirname, join } from 'node:path'
 import { AuthManager, type AuthState } from './auth.js'
 import { type AwsCredential, AwsCreds } from './awsCreds.js'
 import { CrashWatch } from './crashWatch.js'
+import { environmentWarning } from './environmentWarning.js'
 import { type RunResult, run, runStream, spawnStream } from './exec.js'
 import { type LifecycleAction, lifecyclePlan } from './lifecycle.js'
 import { decodeCursor, encodeCursor, readFileSlice } from './logQuery.js'
@@ -249,6 +250,8 @@ export class Service {
   private readonly reconnects = new Map<string, { attempts: number; lastAt: number }>()
   private readonly pausedSessions = new Set<string>()
   private readonly sessionGenerations = new Map<string, number>()
+  private readonly readyPodGenerations = new Map<string, string>()
+  private readonly replicaRequests = new Map<string, Promise<ReplicaRecord>>()
   private timer?: NodeJS.Timeout
   private authTimer?: NodeJS.Timeout
   private gcTimer?: NodeJS.Timeout
@@ -909,6 +912,8 @@ export class Service {
 
   async start(id: string, workload?: string, automatic = false): Promise<RunResult> {
     const { base, repo: scopedRepo, type, key } = this.scoped(id, workload)
+    const warning = environmentWarning(scopedRepo)
+    if (warning) this.hubFor(key).push(`! ${warning}`)
     if (!automatic) this.pausedSessions.delete(key)
     const generation = this.sessionGenerations.get(key) ?? 0
     const cancelled = () =>
@@ -963,11 +968,13 @@ export class Service {
       hub.push(`✗ devspace dev failed to start (exit ${r.code})`)
     }
     await this.reconcileOne(id)
-    return r
+    return warning ? { ...r, stdout: `${warning}\n${r.stdout}` } : r
   }
 
   async build(id: string, workload?: string): Promise<RunResult> {
     const { repo, key } = this.scoped(id, workload)
+    const warning = environmentWarning(repo)
+    if (warning) this.hubFor(key).push(`! ${warning}`)
     const checks = await this.prerequisites(id, 'build', workload)
     if (checks.some((c) => c.status !== 'passed'))
       return { code: 2, stdout: '', stderr: 'Machine prerequisites did not pass' }
@@ -979,7 +986,12 @@ export class Service {
       this.supervisor.build(repo, onLine),
     )
     await this.reconcileOne(id)
-    return r
+    const hint =
+      r.code === 0
+        ? 'After redeploying a dependency, callers with pooled connections may need a restart if they still reach the previous target.'
+        : undefined
+    if (hint) this.hubFor(key).push(`! ${hint}`)
+    return { ...r, stdout: [warning, hint, r.stdout].filter(Boolean).join('\n') }
   }
 
   /** Stop synchronization and forwarding only. Keep Kubernetes workloads and ownership. */
@@ -1242,7 +1254,7 @@ export class Service {
    *  callers that need the output should use a registered terminal instead. */
   async exec(id: string, command: string, workload?: string): Promise<RunResult> {
     await this.claimOwnership(this.scoped(id, workload).repo)
-    return this.supervisor.exec(this.scoped(id, workload).repo, command)
+    return this.supervisor.execVerified(this.scoped(id, workload).repo, command)
   }
 
   /** The configured startup command for a repo's selected/default pod type. */
@@ -1317,7 +1329,41 @@ export class Service {
   async createReplica(
     parentId: string,
     branch: string,
-    opts: { ownImage?: boolean } = {},
+    opts: { ownImage?: boolean; requestId?: string } = {},
+  ): Promise<ReplicaRecord> {
+    const requestId = opts.requestId
+    if (requestId === undefined) return this.createReplicaOnce(parentId, branch, opts)
+    if (typeof requestId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(requestId))
+      throw new Error('invalid replica request id')
+    const key = `${parentId}:${requestId}`
+    const existing = this.store
+      .listReplicas()
+      .find((record) => record.parentId === parentId && record.requestId === requestId)
+    if (existing) {
+      if (existing.branch !== branch.trim() || !!existing.ownImage !== !!opts.ownImage)
+        throw new Error('replica request id already belongs to different options')
+      return existing
+    }
+    const active = this.replicaRequests.get(key)
+    if (active) {
+      const record = await active
+      if (record.branch !== branch.trim() || !!record.ownImage !== !!opts.ownImage)
+        throw new Error('replica request id already belongs to different options')
+      return record
+    }
+    const pending = this.createReplicaOnce(parentId, branch, opts)
+    this.replicaRequests.set(key, pending)
+    try {
+      return await pending
+    } finally {
+      this.replicaRequests.delete(key)
+    }
+  }
+
+  private async createReplicaOnce(
+    parentId: string,
+    branch: string,
+    opts: { ownImage?: boolean; requestId?: string },
   ): Promise<ReplicaRecord> {
     const parent = this.repoOrThrow(parentId)
     if (parent.parentId) throw new Error('cannot create a replica of a replica')
@@ -1422,6 +1468,7 @@ export class Service {
       assertParentConfigsUnchanged()
       this.store.copyStartup(parentId, id) // inherit `python main.py` etc.
       const record: ReplicaRecord = {
+        ...(opts.requestId ? { requestId: opts.requestId } : {}),
         id,
         parentId,
         branch: trimmedBranch,
@@ -1821,7 +1868,15 @@ export class Service {
   /** Run the queued startup command in the dev session after a short grace, so
    *  the keystrokes land at the in-container shell `devspace dev` opens. */
   private scheduleStartup(scoped: Repo, key: string, command: string): void {
+    const sessionGeneration = this.sessionGenerations.get(key)
+    const podGeneration = this.readyPodGenerations.get(key)
     setTimeout(() => {
+      if (
+        this.pausedSessions.has(key) ||
+        this.sessionGenerations.get(key) !== sessionGeneration ||
+        this.readyPodGenerations.get(key) !== podGeneration
+      )
+        return
       const hub = this.hubFor(key)
       hub.push(`$ ${command}  (startup)`)
       void this.supervisor.exec(scoped, command).then((r) => {
@@ -1927,6 +1982,29 @@ export class Service {
         if (r && Date.now() - r.lastAt >= RECONNECT_RESET_MS) this.reconnects.delete(key)
       }
       workloads.push(ws)
+
+      // A live DevSpace session can survive a replacement pod or container.
+      // The old app process cannot: re-arm its configured command once for
+      // the new ready generation, without restarting or deploying the parent.
+      const readyGeneration = ws.pods
+        .filter((pod) => pod.ready)
+        .map((pod) => `${pod.name}:${pod.restartCount}`)
+        .sort()
+        .join(',')
+      if (ws.status === 'RUNNING_MANAGED' && readyGeneration) {
+        const previousGeneration = this.readyPodGenerations.get(key)
+        this.readyPodGenerations.set(key, readyGeneration)
+        if (
+          previousGeneration !== undefined &&
+          previousGeneration !== readyGeneration &&
+          !this.store.getPendingStartup(key)
+        ) {
+          const startup = this.store.getStartup(id, startupPodType(repo, type))
+          if (startup) this.store.setPendingStartup(key, startup)
+        }
+      } else if (!exists) {
+        this.readyPodGenerations.delete(key)
+      }
 
       // Once the dev session's pod is up, fire any queued startup command into
       // the session (the initial dev pod) — one shot per start.
