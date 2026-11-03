@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { Operations } from './operations.js'
-import { type SandboxMemberInput, Sandboxes, isExpired } from './sandboxes.js'
+import { type SandboxMemberInput, Sandboxes, devspaceFailure, isExpired } from './sandboxes.js'
 import { Service } from './service.js'
 import { StateStore } from './stateStore.js'
 import { Supervisor } from './supervisor.js'
@@ -1273,4 +1273,19 @@ it('maps personal member URLs by their unsuffixed deployment names', async () =>
     'app:ui': 'https://dashboard.example/',
   })
   expect(view?.urls).toEqual(['https://api.example/app', 'https://dashboard.example/'])
+})
+
+describe('sandbox failure detail', () => {
+  it('keeps DevSpace stdout errors and drops login-shell noise', () => {
+    expect(
+      devspaceFailure(
+        {
+          stdout: 'info Using namespace x\n\u001b[1;31mfatal\u001b[0m build failed: no space left',
+          stderr: 'bash: no job control in this shell\nfatal exit status 1\n',
+        },
+        'fallback',
+      ),
+    ).toBe('info Using namespace x\nfatal build failed: no space left\nfatal exit status 1')
+    expect(devspaceFailure({ stdout: '', stderr: '' }, 'fallback')).toBe('fallback')
+  })
 })

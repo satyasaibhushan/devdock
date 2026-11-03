@@ -14,6 +14,7 @@ import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { parse, parseDocument } from 'yaml'
 import type { RunResult } from './exec.js'
 import { parseIngressUrls } from './ingressUrl.js'
+import { cleanLine } from './logTailer.js'
 import type { Operations } from './operations.js'
 import { replicaCheckoutPath } from './replicas.js'
 import {
@@ -189,6 +190,18 @@ export function sandboxMarkdown(
     '```',
   ].join('\n')
 }
+/** DevSpace prints its errors on stdout; stderr holds only the login shell's
+ *  noise and `fatal exit status N`. Keep the tail of both so a failed sandbox
+ *  build says what failed. */
+export function devspaceFailure(r: { stdout: string; stderr: string }, fallback: string): string {
+  const noise = /cannot set terminal process group|no job control in this shell/
+  const lines = `${r.stdout}\n${r.stderr}`
+    .split(/\r?\n/)
+    .map(cleanLine)
+    .filter((line) => line.trim() && !noise.test(line))
+  return lines.slice(-12).join('\n') || fallback
+}
+
 export function requireActor(actor: string): void {
   if (typeof actor !== 'string' || !actor.trim()) throw new Error('actor required')
 }
@@ -877,7 +890,7 @@ export class Sandboxes {
       })
       const repo = await this.config(s, m, path)
       const sync = await this.deps.supervisor.sandbox(repo, 'sync')
-      if (sync.code !== 0) throw new Error(sync.stderr || 'Sandbox env sync failed')
+      if (sync.code !== 0) throw new Error(devspaceFailure(sync, 'Sandbox env sync failed'))
       await this.rewriteEnv(s, repo)
       // ECR lifecycle rules can prune a tag inside the snapshot TTL; deploying it would only
       // leave pods in ImagePullBackOff.
@@ -890,7 +903,7 @@ export class Sandboxes {
       this.recordedImage(repo, m, saved.image)
       // Recorded images are content-addressed in ECR, so skip-build redeploys exactly what was seen.
       const deployed = await this.deps.supervisor.sandbox(repo, 'deploy', true, true)
-      if (deployed.code !== 0) throw new Error(deployed.stderr || 'Sandbox restore failed')
+      if (deployed.code !== 0) throw new Error(devspaceFailure(deployed, 'Sandbox restore failed'))
       m.deployedSha = saved.sha
       m.dirtyFiles = [...saved.dirtyFiles]
       m.branch = saved.branch
@@ -1167,7 +1180,7 @@ echo "SANDBOX_ARCH=$architecture"`,
             const pr = branch ? await this.pr(source) : undefined
             const repo = await this.config(s, m, buildPath)
             const sync = await this.deps.supervisor.sandbox(repo, 'sync')
-            if (sync.code !== 0) throw new Error(sync.stderr || 'Sandbox env sync failed')
+            if (sync.code !== 0) throw new Error(devspaceFailure(sync, 'Sandbox env sync failed'))
             await this.rewriteEnv(s, repo)
             const image = await this.prepareImage(repo, m)
             await this.imageBuilds.deploy(
@@ -1181,7 +1194,8 @@ echo "SANDBOX_ARCH=$architecture"`,
               async (skip) => {
                 await this.owned(s)
                 const deployed = await this.deps.supervisor.sandbox(repo, 'deploy', awake, skip)
-                if (deployed.code !== 0) throw new Error(deployed.stderr || 'Sandbox deploy failed')
+                if (deployed.code !== 0)
+                  throw new Error(devspaceFailure(deployed, 'Sandbox deploy failed'))
               },
             )
             m.image = image
@@ -1300,7 +1314,8 @@ echo "SANDBOX_ARCH=$architecture"`,
   }
   private async prepareImage(repo: Repo, member: SandboxMember): Promise<string> {
     const printed = await this.deps.supervisor.sandbox(repo, 'print')
-    if (printed.code !== 0) throw new Error(printed.stderr || 'Cannot resolve sandbox build config')
+    if (printed.code !== 0)
+      throw new Error(devspaceFailure(printed, 'Cannot resolve sandbox build config'))
     const effective = parse(printed.stdout) as { images?: Record<string, SandboxImage> }
     if (!effective?.images?.app || Object.keys(effective.images).length !== 1)
       throw new Error('Sandbox requires exactly one app image')
