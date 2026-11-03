@@ -116,10 +116,17 @@ imports:
     writeFileSync(repo.configPath, uiConfig.replace('/ui', '/non-ui'))
     const local = join(deps, 'git-github-com-vmockinc-guidelines-git-master', 'devspace', 'non-ui')
     mkdirSync(local, { recursive: true })
-    writeFileSync(join(local, 'devspace.yaml'), 'version: v2beta1\n')
+    writeFileSync(
+      join(local, 'devspace.yaml'),
+      `version: v2beta1\nfunctions:\n  prepare_local_env: |-\n    file="$1"\n    sed -i '' -r "s~a~b~" $file\n`,
+    )
     prepareWorkloadConfig(repo)
     const doc = parseYaml(readFileSync(workloadConfigPath(repo), 'utf8'))
     expect(doc.imports).toEqual([{ path: local }])
+    // GNU-safe copy of the template's env rewrite (sandbox builds run sync-env).
+    expect(doc.functions.prepare_local_env).toBe(
+      'file="$1"\nsed -i.devdock-bak -r "s~a~b~" $file\nrm -f "$1.devdock-bak"',
+    )
     // non-ui has no image tuning yet, so there is no profile to activate.
     expect(doc.profiles).toBeUndefined()
     expect(devspaceCommand(repo, 'dev')).not.toContain('-p devdock')

@@ -238,6 +238,9 @@ function writeOverlay(alias: string, target: string, plan: OverlayPlan): void {
   }
   if (!doc.hasIn(['functions', 'docker_login_to_ecr']))
     doc.setIn(['functions', 'docker_login_to_ecr'], ECR_LOGIN)
+  const envRewrite = portableEnvRewrite(local)
+  if (envRewrite && !doc.hasIn(['functions', 'prepare_local_env']))
+    doc.setIn(['functions', 'prepare_local_env'], envRewrite)
   if (plan.patches.length > 0) {
     const profile = doc.createNode({ name: DEVDOCK_PROFILE, patches: plan.patches })
     if (isSeq(doc.get('profiles'))) doc.addIn(['profiles'], profile)
@@ -247,6 +250,23 @@ function writeOverlay(alias: string, target: string, plan: OverlayPlan): void {
   writeFileSync(tmp, GENERATED + doc.toString())
   if (isLink(alias)) unlinkSync(alias)
   renameSync(tmp, alias)
+}
+
+/** The guidelines' env rewrite uses BSD `sed -i ''`, which GNU sed reads as a
+ *  file name, so `sync-env` (and with it every sandbox build) fails on Linux.
+ *  `-i.<suffix>` means the same on both seds; the backups are removed after. */
+function portableEnvRewrite(templateDir: string): string | undefined {
+  let body: unknown
+  try {
+    const template = parseYaml(readFileSync(join(templateDir, 'devspace.yaml'), 'utf8')) as {
+      functions?: Record<string, unknown>
+    } | null
+    body = template?.functions?.prepare_local_env
+  } catch {
+    return undefined
+  }
+  if (typeof body !== 'string' || !body.includes("sed -i '' ")) return undefined
+  return `${body.replaceAll("sed -i '' ", 'sed -i.devdock-bak ')}\nrm -f "$1.devdock-bak"`
 }
 
 const refreshing = new Map<string, number>()
