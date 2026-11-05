@@ -211,20 +211,50 @@ export function allTools(client: DaemonClient): ToolDef[] {
     {
       name: 'devdock_wait',
       description:
-        'Block until a condition holds (or timeout): contains= a NEW log line with the substring appears (watching starts now unless a cursor is given), status= the workload reaches it (e.g. RUNNING_MANAGED), ready= a pod is ready. Conditions are OR’d. Use after devdock_run/restart to know when the app actually reloaded — no polling needed.',
+        'Wait for readiness instead of running sleep: ready=pod Ready, http={path,status}=HTTP status on the workload ingress path (default 200), contains=new log marker, or status=workload status. Conditions are ORed. Returns immediately if an operation failed or the target needs a lifecycle action. Pass operationId to follow a specific operation. Log watching starts now unless a cursor is given. All probes share timeoutMs.',
       scope: 'ro',
       inputSchema: {
         ...repoArg,
         ...workloadArg,
+        operationId: z.string().optional().describe('durable operation this wait depends on'),
+        http: z
+          .object({
+            path: z
+              .string()
+              .startsWith('/')
+              .describe('path appended to the workload ingress prefix'),
+            status: z.number().int().min(100).max(599).optional(),
+          })
+          .optional(),
         contains: z.string().optional().describe('log substring to wait for'),
         source: z.enum(['auto', 'application', 'container', 'devdock']).optional(),
         cursor: z.string().optional().describe('watch from this cursor instead of from now'),
-        status: z.string().optional().describe('workload status to wait for'),
+        status: z
+          .enum([
+            'STOPPED',
+            'DEPLOYED',
+            'RUNNING_MANAGED',
+            'RUNNING_EXTERNAL',
+            'BUILDING',
+            'RESTARTING',
+            'CRASHED',
+            'stopped',
+            'deployed',
+            'running_managed',
+            'running_external',
+            'building',
+            'restarting',
+            'crashed',
+          ])
+          .optional()
+          .describe('workload status to wait for'),
         ready: z.boolean().optional().describe('wait for a ready pod'),
         timeoutMs: z.number().int().positive().max(120_000).optional(),
       },
       handler: async (a) => {
         const r = await client.wait(a.repo as string, {
+          operationId: a.operationId as string | undefined,
+          http: a.http as { path: string; status?: number } | undefined,
           workload: a.workload as string | undefined,
           contains: a.contains as string | undefined,
           source: a.source as LogSource | undefined,
@@ -239,7 +269,9 @@ export function allTools(client: DaemonClient): ToolDef[] {
         if (r.matched) {
           return `matched: ${r.reason}${r.line ? ` — ${r.line}` : ''}${tail}`
         }
-        return `timeout: condition not met within the window${tail}`
+        if (r.reason === 'timeout')
+          return `timeout: condition not met within the window${r.error ? `: ${r.error}` : ''}${tail}`
+        return `${r.reason}:${r.operationId ? ` operation=${r.operationId}` : ''} ${r.error ?? 'condition cannot be reached'}${tail}`
       },
     },
     {

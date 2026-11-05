@@ -394,6 +394,29 @@ describe('tool handlers', () => {
     expect(out).toContain('status=CRASHED')
   })
 
+  it('wait forwards HTTP readiness and renders operation failures distinctly', async () => {
+    const wait = vi.fn(async () => ({
+      matched: false,
+      reason: 'operation_failed' as const,
+      operationId: 'op',
+      error: 'Image pull denied',
+      status: 'STOPPED' as const,
+      elapsedMs: 2,
+    }))
+    const tool = allTools(fakeClient({ wait })).find((t) => t.name === 'devdock_wait')
+    const output = await tool?.handler({
+      repo: 'svc-a',
+      operationId: 'op',
+      http: { path: '/health' },
+    })
+    expect(wait).toHaveBeenCalledWith(
+      'svc-a',
+      expect.objectContaining({ operationId: 'op', http: { path: '/health' } }),
+    )
+    expect(output).toContain('operation_failed: operation=op Image pull denied')
+    expect(output).not.toContain('timeout:')
+  })
+
   it('verbs pass the workload through and report ok', async () => {
     const verb = vi.fn(async () => ok)
     const t = allTools(fakeClient({ verb })).find((x) => x.name === 'devdock_restart')

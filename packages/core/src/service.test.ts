@@ -2221,6 +2221,126 @@ describe('Service replicas', () => {
 })
 
 describe('Service.wait', () => {
+  it('returns when the operation fails during a wait', async () => {
+    const svc = new Service(
+      { roots: [root], stateFile },
+      {
+        runner: cannedRunner('{"items":[]}', false),
+      },
+    )
+    svc.rescan()
+    await svc.reconcileOne('svc-a')
+    let fail: (value: { code: number; stdout: string; stderr: string }) => void = () => {}
+    const lifecycle = vi.spyOn(svc, 'lifecycle').mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          fail = resolve
+        }),
+    )
+    const op = await svc.beginOperation('svc-a', 'build_start')
+    await vi.waitFor(() => expect(lifecycle).toHaveBeenCalled())
+    const waiting = svc.wait('svc-a', {
+      ready: true,
+      operationId: op.id,
+      timeoutMs: 1000,
+      pollMs: 10,
+    })
+    await vi.waitFor(() => expect(svc.getOperation(op.id).state).toBe('active'))
+    fail({ code: 1, stdout: '', stderr: 'Build failed' })
+    expect(await waiting).toMatchObject({
+      reason: 'operation_failed',
+      operationId: op.id,
+      error: 'Build failed',
+    })
+  })
+
+  it('rejects invalid statuses, deadlines, and HTTP paths', async () => {
+    const svc = await reconciledService(execRunner(() => ({ code: 0, stdout: '', stderr: '' })))
+    for (const opts of [
+      { status: 'RUNING_MANAGED' },
+      { ready: true, timeoutMs: -1 },
+      { http: { path: '//another-host/path' } },
+      { http: { path: '/ready', status: 999 } },
+    ])
+      await expect(svc.wait('svc-a', opts)).rejects.toThrow('invalid wait')
+  })
+
+  it('returns immediately when a stopped workload has no operation to start it', async () => {
+    const svc = new Service(
+      { roots: [root], stateFile },
+      {
+        runner: cannedRunner('{"items":[]}', false),
+      },
+    )
+    svc.rescan()
+    await svc.reconcileOne('svc-a')
+    const result = await svc.wait('svc-a', {
+      status: 'RUNNING_MANAGED',
+      timeoutMs: 100,
+      pollMs: 10,
+    })
+    expect(result).toMatchObject({ matched: false, reason: 'unreachable', status: 'STOPPED' })
+    expect(result.elapsedMs).toBeLessThan(100)
+  })
+
+  it('returns the failed operation id and error instead of timing out', async () => {
+    const receipts = new Operations(`${stateFile}.operations`)
+    const op = receipts.create('svc-a', '', 'ns', 'start')
+    receipts.update(op.id, { state: 'failed' }, 'Image pull denied')
+    const svc = new Service(
+      { roots: [root], stateFile },
+      {
+        runner: cannedRunner('{"items":[]}', false),
+      },
+    )
+    svc.rescan()
+    await svc.reconcileOne('svc-a')
+    expect(await svc.wait('svc-a', { ready: true, timeoutMs: 100, pollMs: 10 })).toMatchObject({
+      matched: false,
+      reason: 'operation_failed',
+      status: 'STOPPED',
+      operationId: op.id,
+      error: 'Image pull denied',
+    })
+  })
+
+  it('retries HTTP readiness until the expected status arrives on the workload path', async () => {
+    const svc = await reconciledService(execRunner(() => ({ code: 0, stdout: '', stderr: '' })))
+    const workload = svc.get('svc-a')?.workloads[0]
+    if (workload) workload.url = 'https://example.test/svc-a/'
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(new Response('', { status: 503 }))
+      .mockResolvedValue(new Response(null, { status: 204 }))
+    vi.stubGlobal('fetch', fetch)
+    const result = await svc.wait('svc-a', {
+      http: { path: '/health', status: 204 },
+      timeoutMs: 200,
+      pollMs: 10,
+    })
+    expect(result).toMatchObject({ matched: true, reason: 'http', httpStatus: 204 })
+    expect(fetch).toHaveBeenCalledTimes(2)
+    expect(String(fetch.mock.calls[0]?.[0])).toBe('https://example.test/svc-a/health')
+  })
+
+  it('bounds HTTP requests and retries by the wait deadline', async () => {
+    const svc = await reconciledService(execRunner(() => ({ code: 0, stdout: '', stderr: '' })))
+    const workload = svc.get('svc-a')?.workloads[0]
+    if (workload) workload.url = 'https://example.test/svc-a/'
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async (_url, init) =>
+          new Promise((_resolve, reject) => {
+            init.signal.addEventListener('abort', () => reject(new Error('aborted')))
+          }),
+      ),
+    )
+    const result = await svc.wait('svc-a', { http: { path: '/health' }, timeoutMs: 60, pollMs: 10 })
+    expect(result.reason).toBe('timeout')
+    expect(result.elapsedMs).toBeLessThan(200)
+  })
+
   const writePipe = (content: string, append = false) => {
     mkdirSync(join(root, 'logs'), { recursive: true })
     const f = join(root, 'logs', 'svc-a.dev.log')
@@ -2250,6 +2370,20 @@ describe('Service.wait', () => {
     const r = await svc.wait('svc-a', { contains: 'Uvicorn running', timeoutMs: 100, pollMs: 20 })
     expect(r.matched).toBe(false)
     expect(r.reason).toBe('timeout')
+  })
+
+  it('keeps OR log readiness usable when there is no HTTP ingress', async () => {
+    const svc = await reconciledService(execRunner(() => ({ code: 0, stdout: '', stderr: '' })))
+    writePipe('')
+    setTimeout(() => writePipe('app reloaded\n', true), 20)
+    expect(
+      await svc.wait('svc-a', {
+        http: { path: '/health' },
+        contains: 'app reloaded',
+        timeoutMs: 500,
+        pollMs: 10,
+      }),
+    ).toMatchObject({ matched: true, reason: 'contains' })
   })
 
   it('matches on status and ready from the reconciled state', async () => {

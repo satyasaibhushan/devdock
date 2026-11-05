@@ -14,6 +14,7 @@ import {
 import { request } from 'node:http'
 import { hostname, tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { daemonRequestTimeoutMs } from '@devdock/mcp/client'
 import { WebSocket } from 'ws'
 
 export interface InstanceIdentity {
@@ -511,7 +512,13 @@ export class Instances {
     return socket
   }
   async request(id: string, method: string, path: string, body?: unknown): Promise<PeerResponse> {
-    return socketRequest(await this.socket(id, path), method, path, body)
+    return socketRequest(
+      await this.socket(id, path),
+      method,
+      path,
+      body,
+      daemonRequestTimeoutMs(path, body),
+    )
   }
   async stream(id: string, path: string): Promise<WebSocket> {
     return new WebSocket(`ws+unix://${await this.socket(id, path)}:${path}`, {

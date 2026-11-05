@@ -46,6 +46,7 @@ import { type ReplicaRecord, StateStore } from './stateStore.js'
 import { type SessionState, type StreamRunner, Supervisor, verbLabel } from './supervisor.js'
 import { type RunOutcome, type TermInfo, type TermKind, TermRegistry } from './termRegistry.js'
 import type { Repo, RepoState, RepoStatus, TermMode } from './types.js'
+import { WAIT_STATUSES, waitBlocked } from './wait.js'
 import {
   type CheckResult,
   type WorkflowAction,
@@ -110,6 +111,8 @@ const NAMESPACE_RE = /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/
 export type LogSource = 'auto' | 'application' | 'container' | 'devdock'
 
 export interface LogQueryOptions {
+  /** Internal command budget, used by bounded waits. */
+  timeoutMs?: number
   sandbox?: string
   workload?: string
   source?: LogSource
@@ -148,6 +151,10 @@ export interface WorkloadRunResult {
 }
 
 export interface WaitOptions {
+  /** Bind the wait to a durable operation, including one already failed. */
+  operationId?: string
+  /** GET the workload ingress URL with this path appended, preserving its prefix. */
+  http?: { path: string; status?: number }
   workload?: string
   /** Match: a log line containing this substring appears. */
   contains?: string
@@ -167,7 +174,10 @@ export interface WaitOptions {
 
 export interface WaitResult {
   matched: boolean
-  reason: 'contains' | 'status' | 'ready' | 'timeout'
+  reason: 'contains' | 'status' | 'ready' | 'http' | 'timeout' | 'operation_failed' | 'unreachable'
+  error?: string
+  operationId?: string
+  httpStatus?: number
   /** The log line that matched (reason=contains). */
   line?: string
   /** The workload's status at resolution time. */
@@ -623,12 +633,22 @@ export class Service {
         if (selected && !selected.unreachable) {
           const slice = readFileSlice(logPath, logOffset)
           if (slice) logOffset = slice.nextOffset
+          for (const line of slice?.lines ?? []) this.operations.observeLine(op.id, line)
           if (slice && initialSyncDone(slice.lines)) synced = true
           for (const message of startProgress(selected.pods, slice?.lines ?? [])) {
-            if (!this.operations.get(op.id).logs.some((l) => l.message === message))
+            if (!this.operations.get(op.id).logs.some((l) => l.message === message)) {
+              if (message === 'Pod scheduled') this.operations.phase(op.id, 'imagePull', 'start')
+              if (message === 'Image pulled') this.operations.phase(op.id, 'imagePull', 'end')
+              if (message === 'Containers ready') {
+                this.operations.phase(op.id, 'rollout', 'end')
+                this.operations.phase(op.id, 'ready', 'start')
+              }
               this.operations.update(op.id, {}, message)
+            }
           }
           if (selected.hasSession && devSessionReady(selected.pods, synced)) {
+            this.operations.phase(op.id, 'rollout', 'end')
+            this.operations.phase(op.id, 'ready', 'end')
             ready = true
             break
           }
@@ -971,6 +991,8 @@ export class Service {
       return cancellation
     }
     if (r.code === 0) {
+      const op = this.operations.active(id, type ?? '')
+      if (op) this.operations.phase(op.id, 'rollout', 'start')
       if (pin) {
         this.store.setSessionNamespace(key, pin)
         this.store.rememberNamespace(pin)
@@ -1012,9 +1034,17 @@ export class Service {
     const denied = (await this.ensureAuth(key)) ?? (await this.ensureAwsCreds(key))
     if (denied) return denied
     await this.claimOwnership(repo)
+    const op = this.operations.active(id, this.scoped(id, workload).type ?? '')
     const r = await this.narrate(key, verbLabel(repo, 'deploy'), (onLine) =>
-      this.supervisor.build(repo, onLine),
+      this.supervisor.build(repo, (line) => {
+        if (op) this.operations.observeLine(op.id, line)
+        onLine(line)
+      }),
     )
+    if (op) {
+      this.operations.phase(op.id, 'build', 'end')
+      this.operations.phase(op.id, 'helm', 'end')
+    }
     if (r.code === 0) markPullSecretRefreshed(repo)
     await this.reconcileOne(id)
     const hint =
@@ -2467,7 +2497,7 @@ export class Service {
       const args = ['logs', pod.name, ...ns]
       if (cursor?.kind === 'container') args.push(`--since-time=${cursor.sinceTime}`)
       else args.push('--tail', String(tail))
-      const r = await this.runner('kubectl', args, { timeoutMs: 30_000 })
+      const r = await this.runner('kubectl', args, { timeoutMs: opts.timeoutMs ?? 30_000 })
       if (r.code !== 0) throw new Error(`kubectl logs failed: ${r.stderr.trim() || r.code}`)
       return {
         source,
@@ -2498,86 +2528,131 @@ export class Service {
     }
   }
 
-  /** Block until a condition holds or the timeout passes — the daemon does the
-   *  polling internally so callers (agents) make ONE call instead of a poll
-   *  loop. Conditions are OR'd: `contains` (a new log line with the substring),
-   *  `status` (workload reaches it), `ready` (a pod is ready). Without a
-   *  cursor, `contains` watches from NOW — old lines never match. */
+  /** Conditions are OR'd. Poll locally until matched, blocked, or the deadline.
+   * Without a cursor, log watching starts at this call's first observation. */
   async wait(id: string, opts: WaitOptions): Promise<WaitResult> {
-    if (!opts.contains && !opts.status && !opts.ready) {
-      throw new Error('wait needs at least one condition: contains, status, or ready')
-    }
+    if (!opts.contains && !opts.status && !opts.ready && !opts.http)
+      throw new Error('wait needs at least one condition: contains, status, ready, or http')
+    const wantStatus = opts.status?.toUpperCase()
+    if (wantStatus && !WAIT_STATUSES.includes(wantStatus as RepoStatus))
+      throw new Error('invalid wait status')
+    if (opts.timeoutMs !== undefined && (!Number.isFinite(opts.timeoutMs) || opts.timeoutMs <= 0))
+      throw new Error('invalid wait timeoutMs')
+    if (
+      opts.http &&
+      (typeof opts.http.path !== 'string' ||
+        !opts.http.path.startsWith('/') ||
+        opts.http.path.startsWith('//') ||
+        /[?#\\]/.test(opts.http.path) ||
+        (opts.http.status !== undefined &&
+          (!Number.isInteger(opts.http.status) ||
+            opts.http.status < 100 ||
+            opts.http.status > 599)))
+    )
+      throw new Error('invalid wait http condition')
     const started = Date.now()
     const timeoutMs = Math.min(opts.timeoutMs ?? WAIT_TIMEOUT_DEFAULT_MS, WAIT_TIMEOUT_MAX_MS)
-    const pollMs = opts.pollMs ?? WAIT_POLL_MS
-    const { type } = this.scoped(id, opts.workload)
-    const wantStatus = opts.status?.toUpperCase()
-
+    const remaining = () => Math.max(0, timeoutMs - (Date.now() - started))
+    const { type, key, repo } = this.scoped(id, opts.workload)
+    const namespace = repo.namespace
+    const relevant = (op: Operation) =>
+      op.repo === id && op.workload === (type ?? '') && (!namespace || op.namespace === namespace)
+    if (opts.operationId && !relevant(this.operations.get(opts.operationId)))
+      throw new Error('invalid wait operation: workload or namespace mismatch')
     let cursor = opts.cursor
-    if (opts.contains && !cursor) {
-      // Capture the current end of the log first — matching starts from now.
-      cursor = (await this.queryLogs(id, { workload: opts.workload, source: opts.source, tail: 0 }))
-        .cursor
-    }
-
-    const currentStatus = (): RepoStatus | undefined => {
-      const state = this.states.get(id)
-      if (!state) return undefined
-      return (type ? state.workloads.find((w) => w.type === type)?.status : state.status) as
-        | RepoStatus
-        | undefined
-    }
-
+    let watching = !!cursor
+    let httpStatus: number | undefined
+    let lastError: string | undefined
+    const result = (
+      matched: boolean,
+      reason: WaitResult['reason'],
+      status?: RepoStatus,
+    ): WaitResult => ({
+      matched,
+      reason,
+      status,
+      elapsedMs: Date.now() - started,
+      cursor,
+      httpStatus,
+    })
     for (;;) {
-      const state = this.states.get(id)
-      const ws = type ? state?.workloads.find((w) => w.type === type) : state
-      if (wantStatus && ws?.status === wantStatus) {
-        return {
-          matched: true,
-          reason: 'status',
-          status: ws.status as RepoStatus,
-          elapsedMs: Date.now() - started,
-          cursor,
-        }
-      }
-      if (opts.ready && ws?.pods.some((p) => p.ready)) {
-        return {
-          matched: true,
-          reason: 'ready',
-          status: ws.status as RepoStatus,
-          elapsedMs: Date.now() - started,
-          cursor,
-        }
-      }
-      if (opts.contains) {
-        const q = await this.queryLogs(id, {
-          workload: opts.workload,
-          source: opts.source,
-          cursor,
-        })
-        cursor = q.cursor
-        const hit = q.lines.find((l) => l.includes(opts.contains as string))
-        if (hit) {
-          return {
-            matched: true,
-            reason: 'contains',
-            line: hit,
-            status: currentStatus(),
-            elapsedMs: Date.now() - started,
+      const ws = this.states.get(id)?.workloads.find((w) => w.type === (type ?? ''))
+      if (wantStatus && ws?.status === wantStatus) return result(true, 'status', ws.status)
+      if (opts.ready && ws?.pods.some((p) => p.ready)) return result(true, 'ready', ws.status)
+      // Prefer the latest request in creation order, never an old failure from
+      // another workload or a record moved by history compaction.
+      const op = opts.operationId
+        ? this.operations.get(opts.operationId)
+        : this.operations
+            .list(id)
+            .filter(relevant)
+            .sort((a, b) => b.createdAt - a.createdAt)[0]
+      const blocked = waitBlocked(
+        ws,
+        { ...opts, status: wantStatus },
+        op,
+        this.transitions.has(key),
+      )
+      if (blocked) return { ...result(false, blocked.reason, ws?.status), ...blocked }
+      if (remaining() === 0) return { ...result(false, 'timeout', ws?.status), error: lastError }
+      if (opts.contains && remaining() > 0) {
+        try {
+          const q = await this.queryLogs(id, {
+            workload: opts.workload,
+            source: opts.source,
             cursor,
+            ...(!watching ? { tail: 0 } : {}),
+            timeoutMs: Math.max(1, Math.min(30_000, remaining())),
+          })
+          cursor = q.cursor
+          const hit = watching
+            ? q.lines.find((line) => line.includes(opts.contains as string))
+            : undefined
+          watching = true
+          if (hit) return { ...result(true, 'contains', ws?.status), line: hit }
+        } catch (error) {
+          lastError = error instanceof Error ? error.message : 'Log readiness query failed'
+        }
+      }
+      if (opts.http && remaining() > 0) {
+        if (
+          !ws?.url &&
+          ws &&
+          !ws.unreachable &&
+          op?.state !== 'active' &&
+          ((!opts.contains && !opts.ready && !opts.status) ||
+            waitBlocked(
+              ws,
+              { contains: opts.contains, ready: opts.ready, status: wantStatus },
+              op,
+              this.transitions.has(key),
+            ))
+        )
+          return {
+            ...result(false, 'unreachable', ws.status),
+            error: 'Workload has no ingress URL for HTTP readiness',
+          }
+        if (ws?.url) {
+          const base = new URL(ws.url)
+          const url = new URL(`${base.pathname.replace(/\/$/, '')}${opts.http.path}`, base.origin)
+          try {
+            const response = await fetch(url, {
+              redirect: 'manual',
+              signal: AbortSignal.timeout(Math.max(1, Math.min(5000, remaining()))),
+            })
+            httpStatus = response.status
+            await response.body?.cancel()
+            if (remaining() > 0 && httpStatus === (opts.http.status ?? 200))
+              return result(true, 'http', ws.status)
+            lastError = `HTTP readiness returned ${httpStatus}`
+          } catch {
+            lastError = 'HTTP readiness request failed or timed out'
           }
         }
       }
-      if (Date.now() - started >= timeoutMs) {
-        return {
-          matched: false,
-          reason: 'timeout',
-          status: currentStatus(),
-          elapsedMs: Date.now() - started,
-          cursor,
-        }
-      }
-      await new Promise((r) => setTimeout(r, pollMs))
+      await new Promise((resolve) =>
+        setTimeout(resolve, Math.min(opts.pollMs ?? WAIT_POLL_MS, remaining())),
+      )
     }
   }
 

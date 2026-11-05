@@ -733,6 +733,35 @@ describe('daemon routes', () => {
     const bad = await app.inject({ method: 'POST', url: '/repos/svc-a/wait', payload: {} })
     expect(bad.statusCode).toBe(400)
   })
+
+  it('passes HTTP readiness and the operation dependency through the wait route', async () => {
+    const svc = makeRunService()
+    const wait = vi
+      .spyOn(svc, 'wait')
+      .mockResolvedValue({ matched: true, reason: 'http', elapsedMs: 12 })
+    const app = buildApp(svc)
+    const response = await app.inject({
+      method: 'POST',
+      url: '/repos/svc-a/wait',
+      payload: { http: { path: '/health', status: 204 }, operationId: 'op', timeoutMs: 500 },
+    })
+    expect(response.json()).toMatchObject({ matched: true, reason: 'http' })
+    expect(wait).toHaveBeenCalledWith(
+      'svc-a',
+      expect.objectContaining({
+        http: { path: '/health', status: 204 },
+        operationId: 'op',
+        timeoutMs: 500,
+      }),
+    )
+    wait.mockRestore()
+    const bad = await app.inject({
+      method: 'POST',
+      url: '/repos/svc-a/wait',
+      payload: { status: 'TYPO' },
+    })
+    expect(bad.statusCode).toBe(400)
+  })
 })
 
 it('serves sandbox reads on the development socket and validates actors on every write', async () => {
