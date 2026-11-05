@@ -85,3 +85,46 @@ it.each([
     ).toBe(reason)
   },
 )
+
+const retrying: WorkloadState = {
+  ...stopped,
+  status: 'CRASHED',
+  hasSession: true,
+  pods: [{ name: 'worker', phase: 'Running', ready: false, restartCount: 3, crashing: true }],
+}
+
+it.each([{ ready: true }, { http: { path: '/health' } }, { contains: 'ready' }])(
+  'keeps observing recoverable pod failures for %j',
+  (target) => {
+    expect(waitBlocked(retrying, target, undefined, false)).toBeUndefined()
+    expect(
+      waitBlocked({ ...retrying, hasSession: false }, target, undefined, false),
+    ).toBeUndefined()
+    expect(
+      waitBlocked(
+        { ...retrying, pods: retrying.pods.map((pod) => ({ ...pod, phase: 'Pending' })) },
+        target,
+        undefined,
+        false,
+      ),
+    ).toBeUndefined()
+  },
+)
+
+it.each([
+  [{ status: 'RUNNING_MANAGED' }, retrying],
+  [{ ready: true }, { ...retrying, sessionDead: true, hasSession: false }],
+  [
+    { http: { path: '/health' } },
+    { ...retrying, pods: retrying.pods.map((pod) => ({ ...pod, phase: 'Failed' })) },
+  ],
+  [{ contains: 'ready' }, { ...retrying, pods: [], hasSession: false }],
+] as const)('rejects terminal crashes for %j', (target, state) => {
+  expect(waitBlocked(state as WorkloadState, target, undefined, false)?.reason).toBe('unreachable')
+})
+
+it('allows an observable OR target to recover even when its status target is blocked', () => {
+  expect(
+    waitBlocked(retrying, { status: 'RUNNING_MANAGED', ready: true }, undefined, false),
+  ).toBeUndefined()
+})

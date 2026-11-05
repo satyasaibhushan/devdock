@@ -248,6 +248,34 @@ describe('Reconciler', () => {
     }))
   }
 
+  it('exposes a dead session even while its pod is retrying', async () => {
+    const runner = clusterRunner(
+      JSON.stringify({
+        items: [
+          {
+            metadata: { name: 'svc-devspace-1' },
+            status: {
+              phase: 'Running',
+              containerStatuses: [
+                {
+                  ready: false,
+                  restartCount: 3,
+                  state: { waiting: { reason: 'CrashLoopBackOff' } },
+                },
+              ],
+            },
+          },
+        ],
+      }),
+    )
+    const reconciler = new Reconciler(runner)
+    const alive = await reconciler.reconcileWorkload(repo, true, newClusterCache(), '')
+    const dead = await reconciler.reconcileWorkload(repo, false, newClusterCache(), '', true)
+    expect(alive).toMatchObject({ status: 'CRASHED', hasSession: true })
+    expect(alive.sessionDead).toBeUndefined()
+    expect(dead).toMatchObject({ status: 'CRASHED', hasSession: false, sessionDead: true })
+  })
+
   it.each(['svc-api', 'svc-api-devspace'])(
     'carries the matched deployment URL into workload state: %s',
     async (name) => {

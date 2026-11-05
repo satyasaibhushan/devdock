@@ -244,6 +244,7 @@ export class Reconciler {
       pods,
       deployments,
       hasSession,
+      ...(sessionDead ? { sessionDead: true } : {}),
       actions: [],
     }
     ws.actions = lifecycleActions(ws.status)

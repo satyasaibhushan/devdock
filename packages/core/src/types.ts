@@ -91,6 +91,8 @@ export interface WorkloadState {
   pods: PodInfo[]
   deployments: DeploymentInfo[]
   hasSession: boolean
+  /** The managed session's process exited, even if its pod can still run. */
+  sessionDead?: boolean
   /** Lifecycle actions valid for this exact reconciled state. */
   actions: LifecycleAction[]
   /** True when the kubectl queries behind this view failed (cluster

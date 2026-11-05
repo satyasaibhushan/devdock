@@ -260,6 +260,8 @@ export class Service {
   /** Per-workload status override held during a multi-step verb (restart) so the
    *  reconcile loop can't surface the STOPPED/DEPLOYED states it passes through. */
   private readonly transitions = new Map<string, RepoStatus>()
+  /** The latest lifecycle request owns implicit waits. Plain verbs have no receipt. */
+  private readonly lifecycleOperations = new Map<string, string | undefined>()
   /** When a dev session was first seen with no attributed pods — the stale
    *  timer counts the *condition's* duration, not the session's age. Reset by
    *  any pass that sees pods or couldn't see the cluster at all. */
@@ -568,6 +570,7 @@ export class Service {
     if (action === 'verify' && !this.workflowConfig().verification[id])
       throw new Error('Configure a verification URL for this repo first')
     const record = this.operations.create(id, type ?? '', namespace, action)
+    this.lifecycleOperations.set(key, record.id)
     // Pin all later steps, including recovery, to the namespace this request selected.
     this.store.setSessionNamespace(key, namespace)
     this.trackOperation(record, false)
@@ -857,6 +860,11 @@ export class Service {
   // Every verb narrates into the repo's log hub — the same output you'd see
   // running the devspace command in a terminal streams to the Logs panel live.
 
+  private recordLifecycle(id: string, workload?: string): void {
+    const { type, key } = this.scoped(id, workload)
+    this.lifecycleOperations.set(key, this.operations.active(id, type ?? '')?.id)
+  }
+
   /** Execute one state-checked lifecycle action. Every transport uses this
    *  interface so invalid actions cannot bypass the UI's buttons. */
   async lifecycle(
@@ -898,6 +906,7 @@ export class Service {
       }
     }
 
+    this.recordLifecycle(id, workload)
     if (action === 'build') return this.build(id, workload)
     if (action === 'start') return this.start(id, workload)
     if (action === 'destroy') return this.stop(id, workload)
@@ -944,6 +953,7 @@ export class Service {
 
   async start(id: string, workload?: string, automatic = false): Promise<RunResult> {
     const { base, repo: scopedRepo, type, key } = this.scoped(id, workload)
+    this.recordLifecycle(id, workload)
     const warning = environmentWarning(scopedRepo)
     if (warning) this.hubFor(key).push(`! ${warning}`)
     if (!automatic) this.pausedSessions.delete(key)
@@ -1025,6 +1035,7 @@ export class Service {
 
   async build(id: string, workload?: string): Promise<RunResult> {
     const { repo, key } = this.scoped(id, workload)
+    this.recordLifecycle(id, workload)
     const warning = environmentWarning(repo)
     if (warning) this.hubFor(key).push(`! ${warning}`)
     const checks = await this.prerequisites(id, 'build', workload)
@@ -1065,6 +1076,7 @@ export class Service {
         stdout: '',
         stderr: 'Wait for deployment changes to finish before stopping the session',
       }
+    this.recordLifecycle(id, workload)
     await this.claimOwnership(repo)
     if (activeOperation)
       this.operations.update(
@@ -1090,6 +1102,7 @@ export class Service {
 
   async stop(id: string, workload?: string): Promise<RunResult> {
     const { repo, key } = this.scoped(id, workload)
+    this.recordLifecycle(id, workload)
     this.operationStage(id, workload, 'stopping')
     const denied = await this.ensureAuth(key)
     if (denied) return denied
@@ -1188,6 +1201,7 @@ export class Service {
    *  → RUNNING as each sub-step reconciles. */
   async restart(id: string, workload?: string): Promise<RunResult> {
     const { key } = this.scoped(id, workload)
+    this.recordLifecycle(id, workload)
     this.transitions.set(key, 'RESTARTING')
     await this.reconcileOne(id) // reflect RESTARTING immediately
     try {
@@ -2559,6 +2573,14 @@ export class Service {
       op.repo === id && op.workload === (type ?? '') && (!namespace || op.namespace === namespace)
     if (opts.operationId && !relevant(this.operations.get(opts.operationId)))
       throw new Error('invalid wait operation: workload or namespace mismatch')
+    // Recovery receipts can predate this daemon's lifecycle tracking. Ignore
+    // already-finished history unless a request in this daemon owns the receipt.
+    const finishedBeforeWait = new Set(
+      this.operations
+        .list(id)
+        .filter((op) => op.state !== 'active')
+        .map((op) => op.id),
+    )
     let cursor = opts.cursor
     let watching = !!cursor
     let httpStatus: number | undefined
@@ -2579,13 +2601,17 @@ export class Service {
       const ws = this.states.get(id)?.workloads.find((w) => w.type === (type ?? ''))
       if (wantStatus && ws?.status === wantStatus) return result(true, 'status', ws.status)
       if (opts.ready && ws?.pods.some((p) => p.ready)) return result(true, 'ready', ws.status)
-      // Prefer the latest request in creation order, never an old failure from
-      // another workload or a record moved by history compaction.
+      // A later plain verb supersedes even a failure observed during this wait.
       const op = opts.operationId
         ? this.operations.get(opts.operationId)
         : this.operations
             .list(id)
             .filter(relevant)
+            .filter((op) =>
+              this.lifecycleOperations.has(key)
+                ? op.id === this.lifecycleOperations.get(key)
+                : !finishedBeforeWait.has(op.id),
+            )
             .sort((a, b) => b.createdAt - a.createdAt)[0]
       const blocked = waitBlocked(
         ws,
@@ -2620,6 +2646,7 @@ export class Service {
           ws &&
           !ws.unreachable &&
           op?.state !== 'active' &&
+          !this.transitions.has(key) &&
           ((!opts.contains && !opts.ready && !opts.status) ||
             waitBlocked(
               ws,

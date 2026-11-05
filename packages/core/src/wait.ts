@@ -27,16 +27,19 @@ export function waitBlocked(
     }
   }
   if (!state || state.unreachable || operation?.state === 'active' || transitioning) return
-  if (state.status === 'CRASHED')
-    return {
-      reason: 'unreachable',
-      error: 'Workload is CRASHED and no operation is in flight',
-    }
   const canRun =
     state.hasSession ||
     state.pods.some((p) => p.phase !== 'Failed') ||
     state.deployments.some((d) => d.replicas > 0)
   const canObserve = (target.ready || target.http || target.contains) && canRun
+  if (
+    state.status === 'CRASHED' &&
+    (!canObserve || state.sessionDead || state.pods.some((p) => p.phase === 'Failed'))
+  )
+    return {
+      reason: 'unreachable',
+      error: 'Workload is CRASHED and no operation is in flight',
+    }
   const canChangeStatus =
     target.status &&
     (state.status === 'BUILDING' ||
