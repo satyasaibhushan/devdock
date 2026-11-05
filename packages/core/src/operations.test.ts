@@ -68,3 +68,12 @@ it('records measured phase durations and leaves unobserved phases unknown', () =
     phasesMs: { build: 100, helm: 200, rollout: 350, imagePull: 300, ready: null },
   })
 })
+
+it('keeps the actual sandbox action distinct from its lifecycle receipt action', () => {
+  const file = join(dir, 'operations')
+  const operations = new Operations(file)
+  const op = operations.create('sandbox:ticket', '', 'sb1', 'build', 'sleep')
+  operations.update(op.id, { state: 'succeeded' })
+  expect(operations.get(op.id).action).toBe('build')
+  expect(JSON.parse(readFileSync(`${file}.timings.jsonl`, 'utf8')).kind).toBe('sleep')
+})

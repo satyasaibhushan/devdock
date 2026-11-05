@@ -21,6 +21,8 @@ export interface Operation {
   workload: string
   namespace: string
   action: WorkflowAction
+  /** Preserve sandbox verbs whose lifecycle receipt action is only build/destroy. */
+  kind?: string
   state: 'active' | 'succeeded' | 'failed' | 'interrupted'
   stage: OperationStage
   createdAt: number
@@ -61,7 +63,13 @@ export class Operations {
   active(repo: string, workload: string): Operation | undefined {
     return this.list(repo).find((r) => r.workload === workload && r.state === 'active')
   }
-  create(repo: string, workload: string, namespace: string, action: WorkflowAction): Operation {
+  create(
+    repo: string,
+    workload: string,
+    namespace: string,
+    action: WorkflowAction,
+    kind: string = action,
+  ): Operation {
     const prior = this.active(repo, workload)
     if (prior) {
       if (prior.action !== action || prior.namespace !== namespace)
@@ -75,6 +83,7 @@ export class Operations {
       workload,
       namespace,
       action,
+      kind,
       state: 'active',
       stage: 'checking',
       createdAt: now,
@@ -115,7 +124,7 @@ export class Operations {
           `${JSON.stringify({
             schemaVersion: 1,
             id: r.id,
-            kind: r.action,
+            kind: r.kind ?? r.action,
             service: r.repo,
             workload: r.workload,
             namespace: r.namespace,
