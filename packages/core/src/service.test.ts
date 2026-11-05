@@ -2229,6 +2229,8 @@ describe('Service.wait', () => {
     ['stop', 'kubernetes'],
     ['start', 'aws'],
     ['build', 'aws'],
+    ['restart', 'kubernetes'],
+    ['restart', 'aws'],
   ] as const)('preserves a failed receipt when direct %s is denied by %s', async (verb, gate) => {
     let denied = false
     const auth = {
@@ -2272,7 +2274,8 @@ describe('Service.wait', () => {
       ])
     runner.mockClear()
     expect((await svc[verb]('svc-a')).code).not.toBe(0)
-    expect(runner).not.toHaveBeenCalled()
+    // restart reconciles and may reset the session before reaching the gates
+    if (verb !== 'restart') expect(runner).not.toHaveBeenCalled()
     if (verb === 'start') expect((await svc.lifecycle('svc-a', 'start')).code).not.toBe(0)
     for (let attempt = 0; attempt < 2; attempt++)
       expect(await svc.wait('svc-a', { ready: true, timeoutMs: 100, pollMs: 5 })).toMatchObject({

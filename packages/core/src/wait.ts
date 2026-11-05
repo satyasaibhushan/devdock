@@ -64,9 +64,10 @@ export class WaitCrashTracker {
     let error: string | undefined
     for (const pod of state.pods) {
       for (const c of pod.containers ?? [
-        { name: '', restartCount: pod.restartCount, ready: pod.ready },
+        { name: '', restartCount: pod.restartCount, ready: pod.ready, init: false },
       ]) {
-        if (container && c.name !== container) continue
+        // A failing init container blocks the log container too, so it still counts.
+        if (container && c.name !== container && !c.init) continue
         const key = `${pod.name}/${c.name}`
         const progress = this.pods.get(key) ?? {
           restarts: c.restartCount,

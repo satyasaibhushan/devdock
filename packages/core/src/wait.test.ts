@@ -194,5 +194,23 @@ it('counts restarts separately and includes init containers', () => {
   const tracker = new WaitCrashTracker(state(0, 0))
   expect(tracker.observe(state(1, 1))).toBeUndefined()
   expect(tracker.observe(state(1, 2))).toContain('restarted twice')
-  expect(tracker.observe(state(1, 2), 'app')).toBeUndefined()
+  expect(tracker.observe(state(1, 2), 'app')).toContain('restarted twice')
+})
+it('lets a crash-looping init container fail a wait on the app container logs', () => {
+  const state = (init: number, sidecar: number): WorkloadState => ({
+    ...retrying,
+    pods: [
+      {
+        ...retrying.pods[0],
+        containers: [
+          { name: 'app', restartCount: 0, ready: false, init: false },
+          { name: 'sidecar', restartCount: sidecar, ready: false, init: false },
+          { name: 'init', restartCount: init, ready: false, init: true },
+        ],
+      },
+    ],
+  })
+  const tracker = new WaitCrashTracker(state(0, 0))
+  expect(tracker.observe(state(0, 2), 'app')).toBeUndefined()
+  expect(tracker.observe(state(2, 2), 'app')).toContain('restarted twice')
 })

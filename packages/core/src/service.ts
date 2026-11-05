@@ -1200,7 +1200,8 @@ export class Service {
    *  → RUNNING as each sub-step reconciles. */
   async restart(id: string, workload?: string): Promise<RunResult> {
     const { key } = this.scoped(id, workload)
-    this.recordLifecycle(id, workload)
+    // No recordLifecycle here: resetSession, build and start each record after
+    // their own gates, so a denied restart keeps the earlier failure visible.
     this.transitions.set(key, 'RESTARTING')
     await this.reconcileOne(id) // reflect RESTARTING immediately
     try {
