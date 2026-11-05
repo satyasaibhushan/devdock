@@ -112,7 +112,6 @@ it.each([{ ready: true }, { http: { path: '/health' } }, { contains: 'ready' }])
 )
 
 it.each([
-  [{ ready: true }, { ...retrying, sessionDead: true, hasSession: false }],
   [
     { http: { path: '/health' } },
     { ...retrying, pods: retrying.pods.map((pod) => ({ ...pod, phase: 'Failed' })) },
@@ -169,4 +168,31 @@ it('allows an observable OR target to recover even when its status target is blo
   expect(
     waitBlocked(retrying, { status: 'RUNNING_MANAGED', ready: true }, undefined, false),
   ).toBeUndefined()
+})
+
+it.each([{ ready: true }, { contains: 'marker' }, { http: { path: '/' } }])(
+  'observes live pods after session death: %j',
+  (target) => {
+    expect(
+      waitBlocked({ ...retrying, sessionDead: true }, target, undefined, false),
+    ).toBeUndefined()
+  },
+)
+it('counts restarts separately and includes init containers', () => {
+  const state = (a: number, b: number): WorkloadState => ({
+    ...retrying,
+    pods: [
+      {
+        ...retrying.pods[0],
+        containers: [
+          { name: 'app', restartCount: a, ready: false, init: false },
+          { name: 'init', restartCount: b, ready: false, init: true },
+        ],
+      },
+    ],
+  })
+  const tracker = new WaitCrashTracker(state(0, 0))
+  expect(tracker.observe(state(1, 1))).toBeUndefined()
+  expect(tracker.observe(state(1, 2))).toContain('restarted twice')
+  expect(tracker.observe(state(1, 2), 'app')).toBeUndefined()
 })

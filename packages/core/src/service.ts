@@ -45,7 +45,7 @@ import {
 import { type ReplicaRecord, StateStore } from './stateStore.js'
 import { type SessionState, type StreamRunner, Supervisor, verbLabel } from './supervisor.js'
 import { type RunOutcome, type TermInfo, type TermKind, TermRegistry } from './termRegistry.js'
-import type { Repo, RepoState, RepoStatus, TermMode } from './types.js'
+import type { PodInfo, Repo, RepoState, RepoStatus, TermMode } from './types.js'
 import { WAIT_STATUSES, WaitCrashTracker, waitBlocked } from './wait.js'
 import {
   type CheckResult,
@@ -906,7 +906,6 @@ export class Service {
       }
     }
 
-    this.recordLifecycle(id, workload)
     if (action === 'build') return this.build(id, workload)
     if (action === 'start') return this.start(id, workload)
     if (action === 'destroy') return this.stop(id, workload)
@@ -2344,7 +2343,7 @@ export class Service {
   /** The pod to exec into / read container logs from: prefer a ready dev pod
    *  (the `-devspace` replacement `devspace dev` creates), then any ready pod,
    *  then whatever exists. */
-  private pickPod(id: string, type?: string): { name: string } | undefined {
+  private pickPod(id: string, type?: string): PodInfo | undefined {
     const state = this.states.get(id)
     const pods = (type ? state?.workloads.find((w) => w.type === type)?.pods : state?.pods) ?? []
     return (
@@ -2585,7 +2584,7 @@ export class Service {
     let watching = !!cursor
     let httpStatus: number | undefined
     let lastError: string | undefined
-    const crashes = new WaitCrashTracker(
+    let crashes = new WaitCrashTracker(
       this.states.get(id)?.workloads.find((w) => w.type === (type ?? '')),
     )
     const result = (
@@ -2602,7 +2601,12 @@ export class Service {
     })
     for (;;) {
       const ws = this.states.get(id)?.workloads.find((w) => w.type === (type ?? ''))
-      const crashError = crashes.observe(ws)
+      const crashError = crashes.observe(
+        ws,
+        opts.contains && opts.source === 'container'
+          ? this.pickPod(id, type)?.logContainer
+          : undefined,
+      )
       if (wantStatus && ws?.status === wantStatus) return result(true, 'status', ws.status)
       if (opts.ready && ws?.pods.some((p) => p.ready)) return result(true, 'ready', ws.status)
       // A later plain verb supersedes even a failure observed during this wait.
@@ -2617,12 +2621,16 @@ export class Service {
                 : !finishedBeforeWait.has(op.id),
             )
             .sort((a, b) => b.createdAt - a.createdAt)[0]
-      const blocked = waitBlocked(
-        ws,
-        { ...opts, status: wantStatus },
-        op,
-        this.transitions.has(key),
-      )
+      const transitioning =
+        this.transitions.has(key) ||
+        !!(
+          ws?.sessionDead &&
+          ws.pods.length > 0 &&
+          !this.pausedSessions.has(key) &&
+          (this.reconnects.get(key)?.attempts ?? 0) < MAX_RECONNECT_ATTEMPTS
+        )
+      if (transitioning || op?.state === 'active') crashes = new WaitCrashTracker(ws)
+      const blocked = waitBlocked(ws, { ...opts, status: wantStatus }, op, transitioning)
       if (blocked) return { ...result(false, blocked.reason, ws?.status), ...blocked }
       if (remaining() === 0) return { ...result(false, 'timeout', ws?.status), error: lastError }
       if (opts.contains && remaining() > 0) {
@@ -2641,6 +2649,10 @@ export class Service {
           watching = true
           if (hit) return { ...result(true, 'contains', ws?.status), line: hit }
         } catch (error) {
+          if (!watching && opts.source === 'container') {
+            cursor = encodeCursor({ kind: 'container', sinceTime: new Date(started).toISOString() })
+            watching = true
+          }
           lastError = error instanceof Error ? error.message : 'Log readiness query failed'
         }
       }
@@ -2681,7 +2693,12 @@ export class Service {
           }
         }
       }
-      if (crashError && (opts.ready || opts.http || opts.contains))
+      if (
+        crashError &&
+        !transitioning &&
+        op?.state !== 'active' &&
+        (opts.ready || opts.http || opts.contains)
+      )
         return { ...result(false, 'unreachable', ws?.status), error: crashError }
       await new Promise((resolve) =>
         setTimeout(resolve, Math.min(opts.pollMs ?? WAIT_POLL_MS, remaining())),

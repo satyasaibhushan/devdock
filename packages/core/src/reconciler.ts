@@ -107,6 +107,7 @@ export function parsePods(json: string): PodInfo[] {
     const status = (item as { status?: Record<string, unknown> }).status ?? {}
     type ContainerStatus = {
       ready?: boolean
+      name: string
       imageID?: string
       restartCount?: number
       state?: {
@@ -153,6 +154,19 @@ export function parsePods(json: string): PodInfo[] {
       phase: typeof status.phase === 'string' ? status.phase : 'Unknown',
       ready,
       restartCount,
+      logContainer:
+        (meta as { annotations?: Record<string, string> } | undefined)?.annotations?.[
+          'kubectl.kubernetes.io/default-container'
+        ] ?? containers[0]?.name,
+      containers: [
+        ...containers.map((c) => ({ ...c, init: false })),
+        ...initContainers.map((c) => ({ ...c, init: true })),
+      ].map((c) => ({
+        name: c.name,
+        restartCount: c.restartCount ?? 0,
+        ready: c.ready === true,
+        init: c.init,
+      })),
       ...(crashing ? { crashing: true } : {}),
       ...(failureReason ? { failureReason } : {}),
     })

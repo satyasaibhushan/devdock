@@ -113,6 +113,8 @@ export interface PodInfo {
   name: string
   phase: string
   ready: boolean
+  logContainer?: string
+  containers?: { name: string; restartCount: number; ready: boolean; init: boolean }[]
   restartCount: number
   /** Node the pod is scheduled on. */
   node?: string

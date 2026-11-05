@@ -31,7 +31,6 @@ export function waitBlocked(
     state.pods.some((p) => p.phase !== 'Failed') || state.deployments.some((d) => d.replicas > 0)
   const canObserve =
     (target.ready || target.http || target.contains) &&
-    !state.sessionDead &&
     (canRun || (state.hasSession && state.pods.length === 0))
   const canChangeStatus =
     target.status &&
@@ -60,20 +59,26 @@ export class WaitCrashTracker {
     this.observe(state)
   }
 
-  observe(state: WorkloadState | undefined): string | undefined {
+  observe(state: WorkloadState | undefined, container?: string): string | undefined {
     if (!state || state.unreachable) return
     let error: string | undefined
     for (const pod of state.pods) {
-      const progress = this.pods.get(pod.name) ?? {
-        restarts: pod.restartCount,
-        wasReady: false,
+      for (const c of pod.containers ?? [
+        { name: '', restartCount: pod.restartCount, ready: pod.ready },
+      ]) {
+        if (container && c.name !== container) continue
+        const key = `${pod.name}/${c.name}`
+        const progress = this.pods.get(key) ?? {
+          restarts: c.restartCount,
+          wasReady: false,
+        }
+        progress.wasReady ||= pod.ready || c.ready
+        this.pods.set(key, progress)
+        if (pod.crashing && !progress.wasReady && c.restartCount - progress.restarts >= 2)
+          error = `Pod ${pod.name} restarted twice during this wait without becoming ready${
+            pod.failureReason ? `: ${pod.failureReason}` : ''
+          }`
       }
-      progress.wasReady ||= pod.ready
-      this.pods.set(pod.name, progress)
-      if (pod.crashing && !progress.wasReady && pod.restartCount - progress.restarts >= 2)
-        error = `Pod ${pod.name} restarted twice during this wait without becoming ready${
-          pod.failureReason ? `: ${pod.failureReason}` : ''
-        }`
     }
     return error
   }

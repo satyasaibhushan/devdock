@@ -2273,6 +2273,7 @@ describe('Service.wait', () => {
     runner.mockClear()
     expect((await svc[verb]('svc-a')).code).not.toBe(0)
     expect(runner).not.toHaveBeenCalled()
+    if (verb === 'start') expect((await svc.lifecycle('svc-a', 'start')).code).not.toBe(0)
     for (let attempt = 0; attempt < 2; attempt++)
       expect(await svc.wait('svc-a', { ready: true, timeoutMs: 100, pollMs: 5 })).toMatchObject({
         matched: false,
@@ -2663,6 +2664,82 @@ describe('Service.wait', () => {
       await restarting
       build.mockRestore()
     }
+  })
+
+  it.each(['transition', 'operation'] as const)(
+    'rebaselines crash counts during an active %s',
+    async (kind) => {
+      vi.useFakeTimers()
+      try {
+        const svc = await reconciledService(execRunner(() => ({ code: 0, stdout: '', stderr: '' })))
+        const ws = svc.get('svc-a')?.workloads[0]
+        if (!ws) throw new Error('Missing workload')
+        ws.pods = [{ name: 'pod', phase: 'Running', ready: false, restartCount: 0, crashing: true }]
+        const internal = svc as unknown as { transitions: Map<string, string> }
+        if (kind === 'transition') internal.transitions.set('svc-a', 'RESTARTING')
+        else
+          vi.spyOn(
+            (svc as unknown as { operations: Operations }).operations,
+            'list',
+          ).mockReturnValue([
+            {
+              id: 'active',
+              repo: 'svc-a',
+              workload: '',
+              namespace: 'ns',
+              state: 'active',
+              stage: 'deploying',
+              createdAt: Date.now(),
+            } as ReturnType<Operations['list']>[number],
+          ])
+        const waiting = svc.wait('svc-a', { ready: true, timeoutMs: 100, pollMs: 10 })
+        ws.pods[0].restartCount = 2
+        await vi.advanceTimersByTimeAsync(20)
+        ws.pods[0].ready = true
+        await vi.advanceTimersByTimeAsync(10)
+        expect(await waiting).toMatchObject({ matched: true, reason: 'ready' })
+      } finally {
+        vi.useRealTimers()
+      }
+    },
+  )
+
+  it.each([0, 2, 3])(
+    'waits through reconnect cooldown only below the cap: %s',
+    async (attempts) => {
+      const svc = await reconciledService(execRunner(() => ({ code: 0, stdout: '', stderr: '' })))
+      const ws = svc.get('svc-a')?.workloads[0]
+      if (!ws) throw new Error('Missing workload')
+      ws.status = 'CRASHED'
+      ws.sessionDead = true
+      ws.pods = [{ name: 'pod', phase: 'Running', ready: false, restartCount: 0 }]
+      const internal = svc as unknown as {
+        reconnects: Map<string, { attempts: number; lastAt: number }>
+      }
+      internal.reconnects.set('svc-a', { attempts, lastAt: Date.now() })
+      expect(
+        await svc.wait('svc-a', { status: 'RUNNING_MANAGED', timeoutMs: 15, pollMs: 1 }),
+      ).toMatchObject({ reason: attempts < 3 ? 'timeout' : 'unreachable' })
+    },
+  )
+
+  it('reads markers from wait start after the first container query fails', async () => {
+    const svc = await reconciledService(execRunner(() => ({ code: 0, stdout: '', stderr: '' })))
+    const query = vi
+      .spyOn(svc, 'queryLogs')
+      .mockRejectedValueOnce(new Error('Pending'))
+      .mockResolvedValue({ source: 'container', cursor: 'next', lines: ['marker'] })
+    const before = Date.now()
+    expect(
+      await svc.wait('svc-a', {
+        contains: 'marker',
+        source: 'container',
+        timeoutMs: 200,
+        pollMs: 1,
+      }),
+    ).toMatchObject({ matched: true, reason: 'contains' })
+    const cursor = query.mock.calls[1]?.[1]?.cursor
+    expect(Date.parse(cursor?.slice(2) ?? '')).toBeGreaterThanOrEqual(before)
   })
 
   it('retries HTTP readiness until the expected status arrives on the workload path', async () => {

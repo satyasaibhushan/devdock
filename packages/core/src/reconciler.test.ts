@@ -110,16 +110,51 @@ describe('parsePods', () => {
           status: {
             phase: 'Running',
             containerStatuses: [
-              { ready: true, restartCount: 1 },
-              { ready: false, restartCount: 2 },
+              { name: 'app', ready: true, restartCount: 1 },
+              { name: 'sidecar', ready: false, restartCount: 2 },
             ],
           },
         },
       ],
     })
     expect(parsePods(json)).toEqual([
-      { name: 'app-1', phase: 'Running', ready: false, restartCount: 3 },
+      {
+        name: 'app-1',
+        phase: 'Running',
+        ready: false,
+        restartCount: 3,
+        logContainer: 'app',
+        containers: [
+          { name: 'app', ready: true, restartCount: 1, init: false },
+          { name: 'sidecar', ready: false, restartCount: 2, init: false },
+        ],
+      },
     ])
+  })
+  it('keeps init restarts separate from the app restart count', () => {
+    const [pod] = parsePods(
+      JSON.stringify({
+        items: [
+          {
+            metadata: { name: 'pod' },
+            status: {
+              containerStatuses: [{ name: 'app', ready: false, restartCount: 0 }],
+              initContainerStatuses: [
+                {
+                  name: 'init',
+                  ready: false,
+                  restartCount: 2,
+                  state: { waiting: { reason: 'CrashLoopBackOff' } },
+                },
+              ],
+            },
+          },
+        ],
+      }),
+    )
+    expect(pod.restartCount).toBe(0)
+    expect(pod.containers?.find((c) => c.init)?.restartCount).toBe(2)
+    expect(pod.crashing).toBe(true)
   })
   it('tolerates junk', () => {
     expect(parsePods('not json')).toEqual([])
