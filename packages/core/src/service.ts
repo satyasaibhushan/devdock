@@ -46,7 +46,7 @@ import { type ReplicaRecord, StateStore } from './stateStore.js'
 import { type SessionState, type StreamRunner, Supervisor, verbLabel } from './supervisor.js'
 import { type RunOutcome, type TermInfo, type TermKind, TermRegistry } from './termRegistry.js'
 import type { Repo, RepoState, RepoStatus, TermMode } from './types.js'
-import { WAIT_STATUSES, waitBlocked } from './wait.js'
+import { WAIT_STATUSES, WaitCrashTracker, waitBlocked } from './wait.js'
 import {
   type CheckResult,
   type WorkflowAction,
@@ -953,7 +953,6 @@ export class Service {
 
   async start(id: string, workload?: string, automatic = false): Promise<RunResult> {
     const { base, repo: scopedRepo, type, key } = this.scoped(id, workload)
-    this.recordLifecycle(id, workload)
     const warning = environmentWarning(scopedRepo)
     if (warning) this.hubFor(key).push(`! ${warning}`)
     if (!automatic) this.pausedSessions.delete(key)
@@ -986,6 +985,7 @@ export class Service {
     if (this.ownership)
       await this.ownership.claim({ ...repo, namespace: repo.namespace || 'default' })
     if (cancelled()) return cancellation
+    this.recordLifecycle(id, workload)
     const hub = this.hubFor(key)
     const pipeFile = this.devLogPath(key)
     mkdirSync(dirname(pipeFile), { recursive: true })
@@ -1035,7 +1035,6 @@ export class Service {
 
   async build(id: string, workload?: string): Promise<RunResult> {
     const { repo, key } = this.scoped(id, workload)
-    this.recordLifecycle(id, workload)
     const warning = environmentWarning(repo)
     if (warning) this.hubFor(key).push(`! ${warning}`)
     const checks = await this.prerequisites(id, 'build', workload)
@@ -1045,6 +1044,7 @@ export class Service {
     const denied = (await this.ensureAuth(key)) ?? (await this.ensureAwsCreds(key))
     if (denied) return denied
     await this.claimOwnership(repo)
+    this.recordLifecycle(id, workload)
     const op = this.operations.active(id, this.scoped(id, workload).type ?? '')
     const r = await this.narrate(key, verbLabel(repo, 'deploy'), (onLine) =>
       this.supervisor.build(repo, (line) => {
@@ -1102,11 +1102,11 @@ export class Service {
 
   async stop(id: string, workload?: string): Promise<RunResult> {
     const { repo, key } = this.scoped(id, workload)
-    this.recordLifecycle(id, workload)
     this.operationStage(id, workload, 'stopping')
     const denied = await this.ensureAuth(key)
     if (denied) return denied
     await this.claimOwnership(repo)
+    this.recordLifecycle(id, workload)
     this.noPodsSince.delete(key)
     this.reconnects.delete(key)
     this.tailers.get(key)?.stop()
@@ -2585,6 +2585,9 @@ export class Service {
     let watching = !!cursor
     let httpStatus: number | undefined
     let lastError: string | undefined
+    const crashes = new WaitCrashTracker(
+      this.states.get(id)?.workloads.find((w) => w.type === (type ?? '')),
+    )
     const result = (
       matched: boolean,
       reason: WaitResult['reason'],
@@ -2599,6 +2602,7 @@ export class Service {
     })
     for (;;) {
       const ws = this.states.get(id)?.workloads.find((w) => w.type === (type ?? ''))
+      const crashError = crashes.observe(ws)
       if (wantStatus && ws?.status === wantStatus) return result(true, 'status', ws.status)
       if (opts.ready && ws?.pods.some((p) => p.ready)) return result(true, 'ready', ws.status)
       // A later plain verb supersedes even a failure observed during this wait.
@@ -2677,6 +2681,8 @@ export class Service {
           }
         }
       }
+      if (crashError && (opts.ready || opts.http || opts.contains))
+        return { ...result(false, 'unreachable', ws?.status), error: crashError }
       await new Promise((resolve) =>
         setTimeout(resolve, Math.min(opts.pollMs ?? WAIT_POLL_MS, remaining())),
       )

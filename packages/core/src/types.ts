@@ -108,6 +108,8 @@ export interface PodInfo {
   imagePulled?: boolean
   /** A current container failure, not historical restart counts. */
   crashing?: boolean
+  /** Current container failure and its most recent termination, when reported. */
+  failureReason?: string
   name: string
   phase: string
   ready: boolean

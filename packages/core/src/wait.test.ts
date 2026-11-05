@@ -1,7 +1,7 @@
 import { expect, it } from 'vitest'
 import type { Operation } from './operations.js'
 import type { WorkloadState } from './types.js'
-import { waitBlocked } from './wait.js'
+import { WaitCrashTracker, waitBlocked } from './wait.js'
 
 const stopped: WorkloadState = {
   type: '',
@@ -112,7 +112,6 @@ it.each([{ ready: true }, { http: { path: '/health' } }, { contains: 'ready' }])
 )
 
 it.each([
-  [{ status: 'RUNNING_MANAGED' }, retrying],
   [{ ready: true }, { ...retrying, sessionDead: true, hasSession: false }],
   [
     { http: { path: '/health' } },
@@ -121,6 +120,49 @@ it.each([
   [{ contains: 'ready' }, { ...retrying, pods: [], hasSession: false }],
 ] as const)('rejects terminal crashes for %j', (target, state) => {
   expect(waitBlocked(state as WorkloadState, target, undefined, false)?.reason).toBe('unreachable')
+})
+
+it('allows a live crashed session to reach RUNNING_MANAGED', () => {
+  expect(waitBlocked(retrying, { status: 'RUNNING_MANAGED' }, undefined, false)).toBeUndefined()
+})
+
+it('allows a deployment to replace failed pods while it still wants replicas', () => {
+  const failed = {
+    ...retrying,
+    pods: retrying.pods.map((pod) => ({ ...pod, phase: 'Failed' })),
+  }
+  expect(
+    waitBlocked(
+      { ...failed, deployments: [{ name: 'worker', replicas: 1, readyReplicas: 0 }] },
+      { ready: true },
+      undefined,
+      false,
+    ),
+  ).toBeUndefined()
+  expect(waitBlocked(failed, { ready: true }, undefined, false)?.reason).toBe('unreachable')
+})
+
+it('does not count historical restarts on a newly observed pod', () => {
+  const crashes = new WaitCrashTracker(stopped)
+  expect(crashes.observe(retrying)).toBeUndefined()
+  expect(crashes.observe(retrying)).toBeUndefined()
+  expect(
+    crashes.observe({
+      ...retrying,
+      pods: retrying.pods.map((pod) => ({ ...pod, restartCount: pod.restartCount + 2 })),
+    }),
+  ).toContain('restarted twice during this wait')
+})
+
+it('does not reject a pod that became ready earlier during the wait', () => {
+  const crashes = new WaitCrashTracker(retrying)
+  crashes.observe({ ...retrying, pods: retrying.pods.map((pod) => ({ ...pod, ready: true })) })
+  expect(
+    crashes.observe({
+      ...retrying,
+      pods: retrying.pods.map((pod) => ({ ...pod, restartCount: pod.restartCount + 2 })),
+    }),
+  ).toBeUndefined()
 })
 
 it('allows an observable OR target to recover even when its status target is blocked', () => {
