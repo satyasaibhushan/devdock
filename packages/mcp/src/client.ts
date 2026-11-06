@@ -65,6 +65,8 @@ export interface LogQueryOpts {
 }
 
 export interface WaitOpts {
+  operationId?: string
+  http?: { path: string; status?: number }
   workload?: string
   contains?: string
   source?: LogSource
@@ -144,6 +146,21 @@ export interface DaemonClient {
 /** Sends one request to the daemon API; `path` is relative to the daemon root. */
 export type DaemonTransport = (path: string, init?: RequestInit) => Promise<Response>
 
+/** Keep the response channel open past the daemon's bounded command/wait. */
+export function daemonRequestTimeoutMs(path: string, body?: unknown): number {
+  const route = path.split('?')[0] ?? ''
+  const maximum = /\/repos\/[^/]+\/wait$/.test(route)
+    ? 300_000
+    : /\/(?:repos|terminals)\/[^/]+\/run$/.test(route)
+      ? 600_000
+      : undefined
+  if (!maximum || !body || typeof body !== 'object' || !('timeoutMs' in body)) return 180_000
+  const timeout = body.timeoutMs
+  return typeof timeout === 'number' && Number.isFinite(timeout) && timeout > 0
+    ? Math.max(180_000, Math.min(timeout, maximum) + 10_000)
+    : 180_000
+}
+
 /** A DaemonClient backed by the running daemon's HTTP endpoints. */
 export function httpClient(
   baseUrl: string,
@@ -160,10 +177,14 @@ export function httpClient(
   }
 
   const send: DaemonTransport = async (path, init) => {
+    const timeoutMs = daemonRequestTimeoutMs(
+      path,
+      typeof init?.body === 'string' ? JSON.parse(init.body) : undefined,
+    )
     const headers = new Headers(init?.headers)
     if (token) headers.set('authorization', `Bearer ${token}`)
     if (!socketPath) {
-      return fetch(url(path), { ...init, headers, signal: AbortSignal.timeout(180_000) })
+      return fetch(url(path), { ...init, headers, signal: AbortSignal.timeout(timeoutMs) })
     }
     return new Promise<Response>((resolve, reject) => {
       const target = new URL(url(path))
@@ -197,7 +218,7 @@ export function httpClient(
       )
       const timer = setTimeout(
         () => req.destroy(new Error('Daemon request timed out; check status before retrying')),
-        180_000,
+        timeoutMs,
       )
       req.on('close', () => clearTimeout(timer))
       req.on('error', reject)

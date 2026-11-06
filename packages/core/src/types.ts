@@ -91,6 +91,8 @@ export interface WorkloadState {
   pods: PodInfo[]
   deployments: DeploymentInfo[]
   hasSession: boolean
+  /** The managed session's process exited, even if its pod can still run. */
+  sessionDead?: boolean
   /** Lifecycle actions valid for this exact reconciled state. */
   actions: LifecycleAction[]
   /** True when the kubectl queries behind this view failed (cluster
@@ -106,9 +108,13 @@ export interface PodInfo {
   imagePulled?: boolean
   /** A current container failure, not historical restart counts. */
   crashing?: boolean
+  /** Current container failure and its most recent termination, when reported. */
+  failureReason?: string
   name: string
   phase: string
   ready: boolean
+  logContainer?: string
+  containers?: { name: string; restartCount: number; ready: boolean; init: boolean }[]
   restartCount: number
   /** Node the pod is scheduled on. */
   node?: string

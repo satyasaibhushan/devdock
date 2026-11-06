@@ -107,13 +107,18 @@ export function parsePods(json: string): PodInfo[] {
     const status = (item as { status?: Record<string, unknown> }).status ?? {}
     type ContainerStatus = {
       ready?: boolean
+      name: string
       imageID?: string
       restartCount?: number
-      state?: { waiting?: { reason?: string }; terminated?: { exitCode?: number } }
+      state?: {
+        waiting?: { reason?: string }
+        terminated?: { exitCode?: number; reason?: string }
+      }
+      lastState?: { terminated?: { exitCode?: number; reason?: string } }
     }
     const containers = (status.containerStatuses as ContainerStatus[] | undefined) ?? []
     const initContainers = (status.initContainerStatuses as ContainerStatus[] | undefined) ?? []
-    const crashing = [...containers, ...initContainers].some(
+    const crashing = [...containers, ...initContainers].find(
       (c) =>
         !c.ready &&
         ([
@@ -126,6 +131,14 @@ export function parsePods(json: string): PodInfo[] {
         ].includes(c.state?.waiting?.reason ?? '') ||
           (typeof c.state?.terminated?.exitCode === 'number' && c.state.terminated.exitCode !== 0)),
     )
+    const termination = crashing?.state?.terminated ?? crashing?.lastState?.terminated
+    const failureReason = [
+      crashing?.state?.waiting?.reason,
+      termination?.reason,
+      typeof termination?.exitCode === 'number' ? `exit ${termination.exitCode}` : undefined,
+    ]
+      .filter(Boolean)
+      .join(': ')
     const restartCount = containers.reduce((sum, c) => sum + (c.restartCount ?? 0), 0)
     const ready = containers.length > 0 && containers.every((c) => c.ready === true)
     const spec = (item as { spec?: { nodeName?: string } }).spec
@@ -141,7 +154,21 @@ export function parsePods(json: string): PodInfo[] {
       phase: typeof status.phase === 'string' ? status.phase : 'Unknown',
       ready,
       restartCount,
+      logContainer:
+        (meta as { annotations?: Record<string, string> } | undefined)?.annotations?.[
+          'kubectl.kubernetes.io/default-container'
+        ] ?? containers[0]?.name,
+      containers: [
+        ...containers.map((c) => ({ ...c, init: false })),
+        ...initContainers.map((c) => ({ ...c, init: true })),
+      ].map((c) => ({
+        name: c.name,
+        restartCount: c.restartCount ?? 0,
+        ready: c.ready === true,
+        init: c.init,
+      })),
       ...(crashing ? { crashing: true } : {}),
+      ...(failureReason ? { failureReason } : {}),
     })
   }
   return pods
@@ -244,6 +271,7 @@ export class Reconciler {
       pods,
       deployments,
       hasSession,
+      ...(sessionDead ? { sessionDead: true } : {}),
       actions: [],
     }
     ws.actions = lifecycleActions(ws.status)

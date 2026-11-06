@@ -469,6 +469,7 @@ export class Sandboxes {
       '',
       s.slot ?? '',
       action === 'expire' || action === 'delete' ? 'destroy' : 'build',
+      action,
     )
     s.error = undefined
     this.touch(s, actor, action)

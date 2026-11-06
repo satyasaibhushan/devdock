@@ -498,6 +498,8 @@ export function buildApp(
   app.post<{
     Params: { id: string }
     Body: {
+      operationId?: string
+      http?: { path: string; status?: number }
       contains?: string
       status?: string
       ready?: boolean
@@ -513,6 +515,8 @@ export function buildApp(
     }
     try {
       return await service.wait(req.params.id, {
+        operationId: b.operationId,
+        http: b.http,
         contains: b.contains,
         status: b.status,
         ready: b.ready,
@@ -525,7 +529,7 @@ export function buildApp(
       const message = err instanceof Error ? err.message : String(err)
       const code = message.includes('unknown repo')
         ? 404
-        : message.includes('at least one condition')
+        : message.includes('at least one condition') || message.includes('invalid wait')
           ? 400
           : 500
       return reply.code(code).send({ error: message })
