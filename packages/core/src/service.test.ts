@@ -20,6 +20,9 @@ import { PtyBroker } from './ptyBroker.js'
 import { Service } from './service.js'
 import { StateStore } from './stateStore.js'
 
+// Keep pull-secret stamps out of the real ~/.devdock.
+process.env.DEVDOCK_STATE_DIR = mkdtempSync(join(tmpdir(), 'devdock-state-'))
+
 let root: string
 let stateFile: string
 beforeEach(() => {
@@ -1001,6 +1004,7 @@ describe('Service', () => {
     before.rescan()
     before.setStartupCommand('svc-a', 'pnpm run dev')
     await before.start('svc-a')
+    writeFileSync(join(root, 'logs', 'svc-a.dev.log'), 'term  Opening shell to svc-a\n') // shell is open
 
     // …the daemon restarts inside the deploy window (fresh Service, same store),
     // and the pod only becomes ready on the new process's watch.
@@ -1077,6 +1081,8 @@ describe('Service', () => {
       )
       svc.rescan()
       svc.setStartupCommand('svc-a', 'python main.py')
+      mkdirSync(join(root, 'logs'), { recursive: true })
+      writeFileSync(join(root, 'logs', 'svc-a.dev.log'), 'term  Opening shell to svc-a\n') // shell is open
       vi.useFakeTimers()
       try {
         await svc.reconcileAll()
@@ -1103,6 +1109,51 @@ describe('Service', () => {
     },
   )
 
+  it('holds the startup command until the dev shell opens after the initial sync', async () => {
+    const before = new Service(
+      { roots: [root], stateFile },
+      { runner: cannedRunner('{"items":[]}', true), streamSpawner: fakeStreamSpawner().spawner },
+    )
+    before.rescan()
+    before.setStartupCommand('svc-a', 'pnpm run dev')
+    await before.start('svc-a')
+    const readyPod = JSON.stringify({
+      items: [
+        {
+          metadata: { name: 'svc-a-app-1' },
+          status: { phase: 'Running', containerStatuses: [{ ready: true, restartCount: 0 }] },
+        },
+      ],
+    })
+    vi.useFakeTimers()
+    try {
+      const runner = cannedRunner(readyPod, true)
+      const after = new Service(
+        { roots: [root], stateFile },
+        { runner, streamSpawner: fakeStreamSpawner().spawner },
+      )
+      after.rescan()
+      await after.reconcileAll()
+      await vi.advanceTimersByTimeAsync(3000)
+      expect(runner).not.toHaveBeenCalledWith('tmux', expect.arrayContaining(['send-keys']))
+      writeFileSync(
+        join(root, 'logs', 'svc-a.dev.log'),
+        'term  Opening shell to svc-a:app (pod:container)\n',
+      )
+      await after.reconcileAll()
+      await vi.advanceTimersByTimeAsync(3000)
+      expect(runner).toHaveBeenCalledWith('tmux', [
+        'send-keys',
+        '-t',
+        '=devdock-svc-a:',
+        'pnpm run dev',
+        'Enter',
+      ])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('waits for pod readiness before startup injection and log tailing', async () => {
     const before = new Service(
       { roots: [root], stateFile },
@@ -1111,6 +1162,7 @@ describe('Service', () => {
     before.rescan()
     before.setStartupCommand('svc-a', 'pnpm run dev')
     await before.start('svc-a')
+    writeFileSync(join(root, 'logs', 'svc-a.dev.log'), 'term  Opening shell to svc-a\n') // shell is open
 
     let ready = false
     const runner = vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
@@ -1214,19 +1266,44 @@ describe('Service', () => {
     expect(new StateStore(stateFile).getPendingStartup('svc-a')).toBeUndefined()
   })
 
-  it('restart recycles the workload: kill → build → start', async () => {
+  it('restart redeploys without purging: deploy then dev', async () => {
     const runner = cannedRunner('{"items":[]}', false)
     const { spawner } = fakeStreamSpawner()
     const svc = new Service({ roots: [root], stateFile }, { runner, streamSpawner: spawner })
     svc.rescan()
     await svc.restart('svc-a')
-    // purge then deploy run through the login shell; dev starts a tmux session.
     const shellCmds = runner.mock.calls
       .filter((c) => c[0] === loginShell)
       .map((c) => (c[1] as string[])[1] ?? '')
-    expect(shellCmds.some((c) => c.includes('devspace purge'))).toBe(true)
+    // No purge: it would only flip the Ingress to the UAT proxy and back.
+    expect(shellCmds.some((c) => c.includes('devspace purge'))).toBe(false)
+    expect(shellCmds.some((c) => c.includes('devspace reset pods'))).toBe(false)
     expect(shellCmds.some((c) => c.includes('devspace deploy'))).toBe(true)
     expect(runner).toHaveBeenCalledWith('tmux', expect.arrayContaining(['new-session']))
+  })
+
+  it('restart drops an existing replacement pod first so dev pulls the new image', async () => {
+    const devPod = JSON.stringify({
+      items: [
+        {
+          metadata: { name: 'svc-a-devspace-1' },
+          status: { phase: 'Running', containerStatuses: [{ ready: true, restartCount: 0 }] },
+        },
+      ],
+    })
+    const runner = cannedRunner(devPod, true)
+    const { spawner } = fakeStreamSpawner()
+    const svc = new Service({ roots: [root], stateFile }, { runner, streamSpawner: spawner })
+    svc.rescan()
+    await svc.restart('svc-a')
+    const shellCmds = runner.mock.calls
+      .filter((c) => c[0] === loginShell)
+      .map((c) => (c[1] as string[])[1] ?? '')
+    const reset = shellCmds.findIndex((c) => c.includes('devspace reset pods'))
+    const deploy = shellCmds.findIndex((c) => c.includes('devspace deploy'))
+    expect(reset).toBeGreaterThanOrEqual(0)
+    expect(deploy).toBeGreaterThan(reset)
+    expect(shellCmds.some((c) => c.includes('devspace purge'))).toBe(false)
   })
 
   it('namespaceInfo unions the context namespace, remembered ones, and repo-declared ones', async () => {

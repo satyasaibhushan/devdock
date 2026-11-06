@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import {
+  chmodSync,
   cpSync,
   existsSync,
   lstatSync,
@@ -8,12 +9,14 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'node:fs'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { parse, parseDocument } from 'yaml'
 import type { RunResult } from './exec.js'
 import { parseIngressUrls } from './ingressUrl.js'
+import { cleanLine } from './logTailer.js'
 import type { Operations } from './operations.js'
 import { replicaCheckoutPath } from './replicas.js'
 import {
@@ -189,6 +192,40 @@ export function sandboxMarkdown(
     '```',
   ].join('\n')
 }
+/** DevSpace prints its errors on stdout; stderr holds only the login shell's
+ *  noise and `fatal exit status N`. Keep the tail of both so a failed sandbox
+ *  build says what failed. */
+const ROUTE_HASH_ANNOTATION = 'devdock.dev/route-hash'
+const ROUTE_APPLY_CONCURRENCY = 8
+
+type RouteIngress = { metadata: { name: string; annotations?: Record<string, string> } }
+
+/** Stable hash of what a generated route says, excluding the hash itself. */
+export function routeHash(ingress: RouteIngress): string {
+  const { [ROUTE_HASH_ANNOTATION]: _, ...annotations } = ingress.metadata.annotations ?? {}
+  const body = { ...ingress, metadata: { ...ingress.metadata, annotations } }
+  return createHash('sha256').update(JSON.stringify(body)).digest('hex').slice(0, 16)
+}
+
+export function withRouteHash<T extends RouteIngress>(ingress: T): T {
+  return {
+    ...ingress,
+    metadata: {
+      ...ingress.metadata,
+      annotations: { ...ingress.metadata.annotations, [ROUTE_HASH_ANNOTATION]: routeHash(ingress) },
+    },
+  }
+}
+
+export function devspaceFailure(r: { stdout: string; stderr: string }, fallback: string): string {
+  const noise = /cannot set terminal process group|no job control in this shell/
+  const lines = `${r.stdout}\n${r.stderr}`
+    .split(/\r?\n/)
+    .map(cleanLine)
+    .filter((line) => line.trim() && !noise.test(line))
+  return lines.slice(-12).join('\n') || fallback
+}
+
 export function requireActor(actor: string): void {
   if (typeof actor !== 'string' || !actor.trim()) throw new Error('actor required')
 }
@@ -877,7 +914,7 @@ export class Sandboxes {
       })
       const repo = await this.config(s, m, path)
       const sync = await this.deps.supervisor.sandbox(repo, 'sync')
-      if (sync.code !== 0) throw new Error(sync.stderr || 'Sandbox env sync failed')
+      if (sync.code !== 0) throw new Error(devspaceFailure(sync, 'Sandbox env sync failed'))
       await this.rewriteEnv(s, repo)
       // ECR lifecycle rules can prune a tag inside the snapshot TTL; deploying it would only
       // leave pods in ImagePullBackOff.
@@ -890,7 +927,7 @@ export class Sandboxes {
       this.recordedImage(repo, m, saved.image)
       // Recorded images are content-addressed in ECR, so skip-build redeploys exactly what was seen.
       const deployed = await this.deps.supervisor.sandbox(repo, 'deploy', true, true)
-      if (deployed.code !== 0) throw new Error(deployed.stderr || 'Sandbox restore failed')
+      if (deployed.code !== 0) throw new Error(devspaceFailure(deployed, 'Sandbox restore failed'))
       m.deployedSha = saved.sha
       m.dirtyFiles = [...saved.dirtyFiles]
       m.branch = saved.branch
@@ -1167,7 +1204,7 @@ echo "SANDBOX_ARCH=$architecture"`,
             const pr = branch ? await this.pr(source) : undefined
             const repo = await this.config(s, m, buildPath)
             const sync = await this.deps.supervisor.sandbox(repo, 'sync')
-            if (sync.code !== 0) throw new Error(sync.stderr || 'Sandbox env sync failed')
+            if (sync.code !== 0) throw new Error(devspaceFailure(sync, 'Sandbox env sync failed'))
             await this.rewriteEnv(s, repo)
             const image = await this.prepareImage(repo, m)
             await this.imageBuilds.deploy(
@@ -1181,7 +1218,8 @@ echo "SANDBOX_ARCH=$architecture"`,
               async (skip) => {
                 await this.owned(s)
                 const deployed = await this.deps.supervisor.sandbox(repo, 'deploy', awake, skip)
-                if (deployed.code !== 0) throw new Error(deployed.stderr || 'Sandbox deploy failed')
+                if (deployed.code !== 0)
+                  throw new Error(devspaceFailure(deployed, 'Sandbox deploy failed'))
               },
             )
             m.image = image
@@ -1260,6 +1298,7 @@ echo "SANDBOX_ARCH=$architecture"`,
       ['ls-files', '-co', '--exclude-standard', '-z'],
       source,
     )
+    const dirs = new Set<string>()
     for (const file of new Set(listed.split('\0').filter(Boolean))) {
       const target = resolve(destination, file)
       if (isAbsolute(file) || relative(destination, target).startsWith('..'))
@@ -1274,7 +1313,13 @@ echo "SANDBOX_ARCH=$architecture"`,
         throw new Error(`Unsupported worktree entry: ${file}`)
       mkdirSync(dirname(target), { recursive: true })
       cpSync(from, target, { dereference: false })
+      for (let dir = dirname(file); dir !== '.' && !dirs.has(dir); dir = dirname(dir)) dirs.add(dir)
     }
+    // The daemon's 0077 umask made every copied directory owner-only; images
+    // keep those modes, so the app user could not read them (composer failed
+    // on database/seeds). Give each directory its source's mode.
+    for (const dir of dirs)
+      chmodSync(join(destination, dir), statSync(join(source, dir)).mode & 0o7777)
     const changed = await this.checked('git', ['diff', 'HEAD', '--name-only', '-z'], source)
     const untracked = await this.checked(
       'git',
@@ -1300,7 +1345,8 @@ echo "SANDBOX_ARCH=$architecture"`,
   }
   private async prepareImage(repo: Repo, member: SandboxMember): Promise<string> {
     const printed = await this.deps.supervisor.sandbox(repo, 'print')
-    if (printed.code !== 0) throw new Error(printed.stderr || 'Cannot resolve sandbox build config')
+    if (printed.code !== 0)
+      throw new Error(devspaceFailure(printed, 'Cannot resolve sandbox build config'))
     const effective = parse(printed.stdout) as { images?: Record<string, SandboxImage> }
     if (!effective?.images?.app || Object.keys(effective.images).length !== 1)
       throw new Error('Sandbox requires exactly one app image')
@@ -1413,34 +1459,68 @@ echo "SANDBOX_ARCH=$architecture"`,
     )
   }
   private async deleteRouting(slot: string): Promise<void> {
-    for (const ingress of await this.ingresses()) {
-      const name = ingress.metadata?.name
-      if (name?.startsWith(`devdock-${slot}-route-`))
-        await this.checked('kubectl', [
-          'delete',
-          'ingress',
-          guardSandboxName(name, slot),
-          '-n',
-          await this.namespace(),
-          '--ignore-not-found',
-        ])
-    }
+    const names = (await this.ingresses())
+      .map((ingress) => ingress.metadata?.name)
+      .filter((name): name is string => !!name?.startsWith(`devdock-${slot}-route-`))
+    await this.deleteIngresses(names, slot)
   }
+  /** One call for any number of ingresses; each kubectl start costs a token check. */
+  private async deleteIngresses(names: string[], slot: string): Promise<void> {
+    if (!names.length) return
+    await this.checked('kubectl', [
+      'delete',
+      'ingress',
+      ...names.map((name) => guardSandboxName(name, slot)),
+      '-n',
+      await this.namespace(),
+      '--ignore-not-found',
+    ])
+  }
+  /** Every Ingress write costs ~4.6s in the cluster's admission webhook, and a
+   *  slot carries one route per fallback host (~60). Rewriting them all on each
+   *  build took minutes, so routes carry a content hash: unchanged ones are left
+   *  alone, stale or changed ones are removed first (a moved host/path must not
+   *  collide with its old route), and the rest are applied concurrently. */
   private async applyRouting(s: Sandbox): Promise<void> {
     const slot = s.slot as string
     const routing = await this.routing(s)
-    await this.deleteRouting(slot)
-    if (!routing.hosts.size) return
+    const prefix = `devdock-${slot}-route-`
+    const desired = routing.hosts.size
+      ? [routing.tls, ...routing.fallback].map((ingress) => withRouteHash(ingress))
+      : []
+    const wanted = new Map(desired.map((i) => [i.metadata.name, routeHash(i)]))
+    const current = new Map<string, string | undefined>()
+    for (const ingress of await this.ingresses()) {
+      const name = ingress.metadata?.name
+      if (name && (name.startsWith(prefix) || wanted.has(name)))
+        current.set(name, ingress.metadata?.annotations?.[ROUTE_HASH_ANNOTATION])
+    }
+    const changed = desired.filter(
+      (i) => current.get(i.metadata.name) !== wanted.get(i.metadata.name),
+    )
+    const changedNames = new Set(changed.map((i) => i.metadata.name))
+    const stale = [...current.keys()].filter(
+      (name) => name.startsWith(prefix) && (!wanted.has(name) || changedNames.has(name)),
+    )
+    await this.deleteIngresses(stale, slot)
+    if (!changed.length) return
     const dir = mkdtempSync(
       join(dirname(this.repo(s.members[0] as SandboxMember).path), '.devdock-routing-'),
     )
     try {
-      for (const ingress of [routing.tls, ...routing.fallback]) {
-        guardSandboxName(ingress.metadata.name, slot)
-        const path = join(dir, `${ingress.metadata.name}.json`)
-        writeFileSync(path, JSON.stringify(ingress))
-        await this.checked('kubectl', ['apply', '-n', await this.namespace(), '-f', path])
+      const namespace = await this.namespace()
+      const queue = [...changed]
+      const worker = async () => {
+        for (let ingress = queue.shift(); ingress; ingress = queue.shift()) {
+          guardSandboxName(ingress.metadata.name, slot)
+          const path = join(dir, `${ingress.metadata.name}.json`)
+          writeFileSync(path, JSON.stringify(ingress))
+          await this.checked('kubectl', ['apply', '-n', namespace, '-f', path])
+        }
       }
+      await Promise.all(
+        Array.from({ length: Math.min(ROUTE_APPLY_CONCURRENCY, queue.length) }, worker),
+      )
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }

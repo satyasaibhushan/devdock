@@ -23,6 +23,8 @@ export function nextReplicaId(parentId: string, isTaken: (id: string) => boolean
   }
 }
 
+export const CACHE_SEED_VAR = 'DEVDOCK_CACHE_SEED'
+
 /** A replica's copy of one parent config: same document (comments and anchors
  *  preserved) with the project renamed — `<replicaId>-<type>` for a member
  *  config, plain `<replicaId>` for a single root config (the deployment/
@@ -34,7 +36,7 @@ export function nextReplicaId(parentId: string, isTaken: (id: string) => boolean
  *  pins a tag derived from its own name and builds it via deploy first. */
 export function generateReplicaConfig(
   parentYaml: string,
-  opts: { replicaId: string; workloadType?: string; imageTag?: string },
+  opts: { replicaId: string; workloadType?: string; imageTag?: string; cacheSeed?: string },
 ): string {
   const doc = parseDocument(parentYaml)
   const parentName = doc.get('name')
@@ -42,6 +44,9 @@ export function generateReplicaConfig(
   doc.setIn(['name'], replicaName)
   doc.setIn(['vars', 'INGRESS_PATH'], opts.replicaId)
   if (opts.imageTag !== undefined) doc.setIn(['vars', 'IMAGE_TAG'], opts.imageTag)
+  // An own-image replica's first build seeds its layer cache from the parent's
+  // (read by devdock's tuned overlay; an unused plain var otherwise).
+  if (opts.cacheSeed !== undefined) doc.setIn(['vars', CACHE_SEED_VAR], opts.cacheSeed)
 
   // Some repositories interpolate WORKLOAD_NAME in their dev selector, while
   // older UI configs hardcode the project name. Retarget exact hardcoded

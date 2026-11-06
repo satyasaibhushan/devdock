@@ -35,7 +35,13 @@ import {
   Sandboxes,
   requireActor,
 } from './sandboxes.js'
-import { startProgress } from './startProgress.js'
+import {
+  devSessionPods,
+  devSessionReady,
+  initialSyncDone,
+  shellOpened,
+  startProgress,
+} from './startProgress.js'
 import { type ReplicaRecord, StateStore } from './stateStore.js'
 import { type SessionState, type StreamRunner, Supervisor, verbLabel } from './supervisor.js'
 import { type RunOutcome, type TermInfo, type TermKind, TermRegistry } from './termRegistry.js'
@@ -47,6 +53,7 @@ import {
   loadWorkflowConfig,
   verifyEndpoint,
 } from './workflow.js'
+import { canReusePullSecret, markPullSecretRefreshed } from './workloadConfig.js'
 import {
   assembleState,
   resolveWorkload,
@@ -63,10 +70,11 @@ export interface ServiceOptions {
   instanceId?: string
 }
 
-/** Grace after the dev pod reports ready before sending the startup command —
- *  `devspace dev` opens its in-container terminal a beat after the pod is up, so
- *  the keystrokes land at the shell prompt rather than mid-deploy output. */
-const STARTUP_RUN_DELAY_MS = 2500
+/** Grace after DevSpace reports the shell open before sending the startup
+ *  command, so the keystrokes land at its prompt rather than in its banner. */
+const STARTUP_RUN_DELAY_MS = 1000
+const SHELL_WATCH_MS = 500
+const STARTUP_NO_SYNC_GRACE_MS = 30_000
 /** How long the "live session but no attributed pods" condition must hold —
  *  continuously, across reconcile passes that could actually see the cluster —
  *  before the session is retired as stale. A single empty/failed kubectl read
@@ -251,6 +259,12 @@ export class Service {
   private readonly pausedSessions = new Set<string>()
   private readonly sessionGenerations = new Map<string, number>()
   private readonly readyPodGenerations = new Map<string, string>()
+  /** Node of each workload's most recent DevSpace pod (in-memory). */
+  private readonly lastDevNodes = new Map<string, string>()
+  /** When a pending startup command first saw its session pods ready. */
+  private readonly startupReadySince = new Map<string, number>()
+  /** Fast re-checks for a pending startup between the 5s reconcile ticks. */
+  private readonly shellWatches = new Map<string, NodeJS.Timeout>()
   private readonly replicaRequests = new Map<string, Promise<ReplicaRecord>>()
   private timer?: NodeJS.Timeout
   private authTimer?: NodeJS.Timeout
@@ -598,6 +612,7 @@ export class Service {
       let ready = false
       const logPath = this.devLogPath(this.scoped(op.repo, workload).key)
       let logOffset = existsSync(logPath) ? statSync(logPath).size : 0
+      let synced = false
       while (
         !this.stopped &&
         this.operations.get(op.id).state === 'active' &&
@@ -608,15 +623,12 @@ export class Service {
         if (selected && !selected.unreachable) {
           const slice = readFileSlice(logPath, logOffset)
           if (slice) logOffset = slice.nextOffset
+          if (slice && initialSyncDone(slice.lines)) synced = true
           for (const message of startProgress(selected.pods, slice?.lines ?? [])) {
             if (!this.operations.get(op.id).logs.some((l) => l.message === message))
               this.operations.update(op.id, {}, message)
           }
-          if (
-            selected.hasSession &&
-            selected.pods.length > 0 &&
-            selected.pods.every((p) => p.ready)
-          ) {
+          if (selected.hasSession && devSessionReady(selected.pods, synced)) {
             ready = true
             break
           }
@@ -924,7 +936,12 @@ export class Service {
       return { code: 2, stdout: '', stderr: 'Machine prerequisites did not pass' }
     if (cancelled()) return cancellation
     this.operationStage(id, workload, 'starting')
-    const denied = (await this.ensureAuth(key)) ?? (await this.ensureAwsCreds(key))
+    // `dev` needs AWS only to mint the pull-secret token; with a fresh secret in
+    // the namespace it runs without it, so an expired AWS sign-in does not
+    // block reattaching or starting a session.
+    const denied =
+      (await this.ensureAuth(key)) ??
+      (canReusePullSecret(scopedRepo) ? null : await this.ensureAwsCreds(key))
     if (denied) return denied
     let repo = scopedRepo
     // First start of an un-namespaced repo: run it against the kube context's
@@ -945,7 +962,10 @@ export class Service {
     writeFileSync(pipeFile, '') // fresh run, fresh file — old output doesn't linger
     this.logGens.set(key, (this.logGens.get(key) ?? 0) + 1) // invalidate old f: cursors
     hub.push(`$ ${verbLabel(repo, 'dev')}`)
-    const r = await this.supervisor.start(repo, pipeFile)
+    const r = await this.supervisor.start(
+      { ...repo, preferNodes: this.imageNodes(id, workload) },
+      pipeFile,
+    )
     if (cancelled()) {
       await this.supervisor.stopSession(repo)
       return cancellation
@@ -971,6 +991,16 @@ export class Service {
     return warning ? { ...r, stdout: `${warning}\n${r.stdout}` } : r
   }
 
+  /** Nodes that hold this workload's current image: where its pods run now
+   *  (after a deploy, the pod that just pulled it) and where its last dev pod ran. */
+  private imageNodes(id: string, workload?: string): string[] {
+    const { key, type } = this.scoped(id, workload)
+    const pods = this.states.get(id)?.workloads.find((w) => w.type === (type ?? ''))?.pods ?? []
+    const nodes = pods.flatMap((p) => (p.node ? [p.node] : []))
+    const last = this.lastDevNodes.get(key)
+    return [...new Set(last ? [...nodes, last] : nodes)]
+  }
+
   async build(id: string, workload?: string): Promise<RunResult> {
     const { repo, key } = this.scoped(id, workload)
     const warning = environmentWarning(repo)
@@ -985,6 +1015,7 @@ export class Service {
     const r = await this.narrate(key, verbLabel(repo, 'deploy'), (onLine) =>
       this.supervisor.build(repo, onLine),
     )
+    if (r.code === 0) markPullSecretRefreshed(repo)
     await this.reconcileOne(id)
     const hint =
       r.code === 0
@@ -1086,9 +1117,15 @@ export class Service {
   /** Clear a crashed dev session: drop the replaced dev pod and release the
    *  session lock without purge or rebuild (image/deployment stay as deployed). */
   async clear(id: string, workload?: string): Promise<RunResult> {
-    const { repo, key } = this.scoped(id, workload)
     if (this.operations.active(id, this.scoped(id, workload).type ?? ''))
       return { code: 2, stdout: '', stderr: 'A workflow operation is active' }
+    return this.resetSession(id, workload)
+  }
+
+  /** Drop the dev session and its replaced pod, restoring the deployment as
+   *  deployed (`devspace reset pods`). No purge: the Ingress is not rewritten. */
+  private async resetSession(id: string, workload?: string): Promise<RunResult> {
+    const { repo, key } = this.scoped(id, workload)
     const denied = await this.ensureAuth(key)
     if (denied) return denied
     await this.claimOwnership(repo)
@@ -1106,9 +1143,15 @@ export class Service {
     return r
   }
 
-  /** Recycle the workload from any state: kill → build → start (purge, then
-   *  deploy, then dev). Available in every state as a one-click "start fresh".
-   *  Stops early if a step fails so a broken purge/deploy doesn't cascade.
+  /** Recycle the workload from any state: reset → build → start (drop the dev
+   *  session and its pod, then deploy, then dev). Available in every state as a
+   *  one-click "start fresh". Stops early if a step fails.
+   *
+   *  No purge: purging only pointed the Ingress at the UAT proxy for deploy to
+   *  point it straight back, two ~4.6s Ingress writes plus the purge itself.
+   *  The rebuilt image keeps its tag, so it reaches the session through the
+   *  fresh replacement pod `dev` creates (the chart pulls Always); the reset
+   *  makes sure no earlier replacement is reused.
    *
    *  The whole sequence is held under a RESTARTING status override so the row
    *  shows one stable "restarting" state instead of flickering STOPPED → DEPLOYED
@@ -1118,8 +1161,12 @@ export class Service {
     this.transitions.set(key, 'RESTARTING')
     await this.reconcileOne(id) // reflect RESTARTING immediately
     try {
-      const killed = await this.stop(id, workload)
-      if (killed.code !== 0) return killed
+      const state = this.states.get(id) ?? (await this.reconcileOne(id))
+      const current = state.workloads.find((w) => w.type === (this.scoped(id, workload).type ?? ''))
+      if (current?.hasSession || current?.pods.some((p) => p.name.includes('-devspace'))) {
+        const reset = await this.resetSession(id, workload)
+        if (reset.code !== 0) return reset
+      }
       const built = await this.build(id, workload)
       if (built.code !== 0) return built
       return await this.start(id, workload)
@@ -1438,6 +1485,7 @@ export class Service {
             // Default: the parent's tag — code arrives via sync, so the
             // replica runs on the parent's base image.
             imageTag: ownTag ?? `${namespace ?? ''}-${member.name}`,
+            ...(ownTag ? { cacheSeed: `${namespace ?? ''}-${member.name}` } : {}),
           })
           const dir = join(wt, '.devspace', `${id}-${type}`)
           mkdirSync(dir, { recursive: true })
@@ -1459,6 +1507,7 @@ export class Service {
         const generated = generateReplicaConfig(readFileSync(parent.configPath, 'utf8'), {
           replicaId: id,
           imageTag: ownTag ?? parentTag,
+          ...(ownTag ? { cacheSeed: parentTag } : {}),
         })
         mkdirSync(wt, { recursive: true })
         const configPath = join(wt, 'devspace.yaml')
@@ -1867,6 +1916,40 @@ export class Service {
 
   /** Run the queued startup command in the dev session after a short grace, so
    *  the keystrokes land at the in-container shell `devspace dev` opens. */
+  /** The shell opens a couple of seconds after the pod is ready; poll for it
+   *  instead of waiting up to a full reconcile tick. Bounded by the no-sync grace. */
+  private watchShell(id: string, key: string): void {
+    if (this.shellWatches.has(key)) return
+    const timer = setInterval(() => {
+      if (this.stopped || !this.store.getPendingStartup(key)) return this.stopShellWatch(key)
+      if (this.devShellOpen(key)) {
+        this.stopShellWatch(key)
+        void this.reconcileOne(id).catch(() => undefined)
+      }
+    }, SHELL_WATCH_MS)
+    timer.unref?.()
+    this.shellWatches.set(key, timer)
+  }
+
+  private stopShellWatch(key: string): void {
+    clearInterval(this.shellWatches.get(key))
+    this.shellWatches.delete(key)
+  }
+
+  /** DevSpace opens the session's shell only after the initial sync, so typing
+   *  the startup command earlier lands in deploy output. Configs without a sync
+   *  never log one; give those a fixed grace after their pods are ready. */
+  private devShellOpen(key: string): boolean {
+    const since = this.startupReadySince.get(key) ?? Date.now()
+    this.startupReadySince.set(key, since)
+    if (Date.now() - since >= STARTUP_NO_SYNC_GRACE_MS) return true
+    const path = this.devLogPath(key)
+    const size = existsSync(path) ? statSync(path).size : 0
+    // Only the tail can hold a fresh sync line; the log is truncated per start.
+    const slice = readFileSlice(path, Math.max(0, size - 256 * 1024))
+    return slice !== undefined && shellOpened(slice.lines)
+  }
+
   private scheduleStartup(scoped: Repo, key: string, command: string): void {
     const sessionGeneration = this.sessionGenerations.get(key)
     const podGeneration = this.readyPodGenerations.get(key)
@@ -1986,7 +2069,12 @@ export class Service {
       // A live DevSpace session can survive a replacement pod or container.
       // The old app process cannot: re-arm its configured command once for
       // the new ready generation, without restarting or deploying the parent.
-      const readyGeneration = ws.pods
+      // Only the session's own pods count: after a deploy the Helm pod is ready
+      // first, and its swap for the DevSpace pod is not a restart of the app.
+      const sessionPods = devSessionPods(ws.pods)
+      const devNode = ws.pods.find((p) => p.name.includes('-devspace') && p.node)?.node
+      if (devNode) this.lastDevNodes.set(key, devNode)
+      const readyGeneration = sessionPods
         .filter((pod) => pod.ready)
         .map((pod) => `${pod.name}:${pod.restartCount}`)
         .sort()
@@ -2009,9 +2097,16 @@ export class Service {
       // Once the dev session's pod is up, fire any queued startup command into
       // the session (the initial dev pod) — one shot per start.
       const pending = this.store.getPendingStartup(key)
-      if (ws.status === 'RUNNING_MANAGED' && ws.pods.some((pod) => pod.ready) && pending) {
-        this.store.setPendingStartup(key, undefined)
-        this.scheduleStartup(scoped, key, pending)
+      if (ws.status === 'RUNNING_MANAGED' && sessionPods.some((pod) => pod.ready) && pending) {
+        if (this.devShellOpen(key)) {
+          this.stopShellWatch(key)
+          this.startupReadySince.delete(key)
+          this.store.setPendingStartup(key, undefined)
+          this.scheduleStartup(scoped, key, pending)
+        } else this.watchShell(id, key)
+      } else {
+        this.startupReadySince.delete(key)
+        this.stopShellWatch(key)
       }
       if (exists) {
         // The session is present (alive or a dead/crashed shell). Keep its pane

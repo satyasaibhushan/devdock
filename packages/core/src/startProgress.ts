@@ -7,6 +7,33 @@ export function initialSyncDone(lines: string[]): boolean {
   )
 }
 
+/** Whether a just-started dev session is usable. Right after a deploy the Helm
+ *  pod is already ready while DevSpace is still replacing it, so readiness must
+ *  come from the replacement (`*-devspace`) pod. A config that never replaces
+ *  its pod has no such pod; then the observed initial sync is the signal. */
+export function devSessionReady(pods: PodInfo[], synced: boolean): boolean {
+  const dev = pods.filter(isDevPod)
+  if (dev.length > 0) return dev.every((p) => p.ready)
+  return synced && pods.length > 0 && pods.every((p) => p.ready)
+}
+
+/** The pods a dev session runs in: the DevSpace replacements when there are
+ *  any, otherwise (a config that never replaces) all of the workload's pods. */
+export function devSessionPods(pods: PodInfo[]): PodInfo[] {
+  const dev = pods.filter(isDevPod)
+  return dev.length > 0 ? dev : pods
+}
+
+function isDevPod(pod: PodInfo): boolean {
+  return pod.name.includes('-devspace')
+}
+
+/** DevSpace's terminal line once the session shell is attached (it opens only
+ *  after the initial sync). */
+export function shellOpened(lines: string[]): boolean {
+  return lines.some((line) => /\bOpening shell to\b/.test(cleanLine(line)))
+}
+
 export function startProgress(pods: PodInfo[], lines: string[]): string[] {
   // Ignore the old Helm pods while DevSpace is creating its replacement.
   const dev = pods.filter((p) => p.name.includes('-devspace'))

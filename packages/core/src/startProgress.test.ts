@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { parsePods } from './reconciler.js'
-import { initialSyncDone, startProgress } from './startProgress.js'
+import { devSessionReady, initialSyncDone, shellOpened, startProgress } from './startProgress.js'
 
 describe('dev start milestones', () => {
   it.each([
@@ -37,6 +37,7 @@ describe('dev start milestones', () => {
       }),
     )
     expect(startProgress(pods, [])).toEqual(['Pod scheduled', 'Image pulled'])
+    expect(pods.map((p) => p.node)).toEqual(['node', 'node'])
     expect(
       startProgress(
         pods.map((p) => ({ ...p, ready: true })),
@@ -49,5 +50,32 @@ describe('dev start milestones', () => {
         [],
       ),
     ).toEqual([])
+  })
+})
+
+describe('dev session readiness', () => {
+  const pod = (name: string, ready: boolean) => ({ name, phase: 'Running', ready, restartCount: 0 })
+  it('ignores the ready Helm pod while the DevSpace replacement is not ready', () => {
+    expect(devSessionReady([pod('app-old', true)], false)).toBe(false)
+    expect(devSessionReady([pod('app-old', true), pod('app-devspace-1', false)], false)).toBe(false)
+  })
+  it('is ready once every replacement pod is ready', () => {
+    expect(devSessionReady([pod('app-old', true), pod('app-devspace-1', true)], false)).toBe(true)
+  })
+  it('falls back to the initial sync for configs that never replace their pod', () => {
+    expect(devSessionReady([pod('app', true)], true)).toBe(true)
+    expect(devSessionReady([pod('app', false)], true)).toBe(false)
+    expect(devSessionReady([], true)).toBe(false)
+  })
+})
+
+describe('dev shell detection', () => {
+  it('recognizes the DevSpace terminal attach line only', () => {
+    expect(
+      shellOpened([
+        '\u001b[36mdev:common term \u001b[0m Opening shell to web:web-devspace-1 (pod:container)',
+      ]),
+    ).toBe(true)
+    expect(shellOpened(['dev:common sync  Initial sync completed'])).toBe(false)
   })
 })

@@ -4,7 +4,14 @@
 import { randomUUID } from 'node:crypto'
 import { type RunResult, loginShell, loginShellArgs, run, runStream } from './exec.js'
 import type { Repo } from './types.js'
-import { prepareWorkloadConfig, workloadConfigPath } from './workloadConfig.js'
+import {
+  CACHED_PULL_SECRET_PROFILE,
+  DEVDOCK_PROFILE,
+  canReusePullSecret,
+  devdockConfigPath,
+  hasDevdockProfile,
+  prepareWorkloadConfig,
+} from './workloadConfig.js'
 
 /** Injectable command runner — defaults to the real `run`; swapped in tests. */
 export type Runner = (cmd: string, args: string[], opts?: { cwd?: string }) => Promise<RunResult>
@@ -65,6 +72,10 @@ export function exactPane(session: string): string {
   return `=${session}:`
 }
 
+const TUNED_VERBS = new Set(['dev', 'deploy', 'purge'])
+/** `deploy` always refreshes the pull secret; these may reuse a recent one. */
+const PULL_SECRET_REUSE_VERBS = new Set(['dev', 'purge'])
+
 /** Build the shell command that runs `devspace <verb>` the way the user's
  *  `./devspace` wrapper does: cd into the service dir, every `question:` var
  *  pre-answered, and — for multi-service repos — DEVSPACE_BINARY_DIR exported to
@@ -75,10 +86,16 @@ export function devspaceCommand(repo: Repo, verb: string): string {
   const extra = devspaceArgs(repo)
     .map((a) => (a.startsWith('-') ? a : shellQuote(a)))
     .join(' ')
-  const config = repo.devspaceTemplateName
-    ? `DEVSPACE_CONFIG=${shellQuote(workloadConfigPath(repo))} `
-    : ''
-  const cmd = `cd ${shellQuote(repo.path)} && ${config}devspace ${verb}${extra ? ` ${extra}` : ''}`
+  const overlay = devdockConfigPath(repo)
+  const config = overlay ? `DEVSPACE_CONFIG=${shellQuote(overlay)} ` : ''
+  // Only the plain lifecycle verbs take the tuning; sandbox verbs bring their
+  // own profiles (`persistent` already replaces the same image build block).
+  const profile =
+    (TUNED_VERBS.has(verb) && hasDevdockProfile(repo) ? ` -p ${DEVDOCK_PROFILE}` : '') +
+    (PULL_SECRET_REUSE_VERBS.has(verb) && canReusePullSecret(repo)
+      ? ` -p ${CACHED_PULL_SECRET_PROFILE}`
+      : '')
+  const cmd = `cd ${shellQuote(repo.path)} && ${config}devspace ${verb}${profile}${extra ? ` ${extra}` : ''}`
   return repo.root ? `export DEVSPACE_BINARY_DIR=${shellQuote(repo.root)} && ${cmd}` : cmd
 }
 
@@ -88,7 +105,8 @@ export function devspaceCommand(repo: Repo, verb: string): string {
  *  show `./devspace`; plain repos call `devspace` directly. */
 export function verbLabel(repo: Repo, verb: string): string {
   const bin = repo.root ? './devspace' : 'devspace'
-  return [bin, verb, ...devspaceArgs(repo)].join(' ')
+  const profile = TUNED_VERBS.has(verb) && hasDevdockProfile(repo) ? ['-p', DEVDOCK_PROFILE] : []
+  return [bin, verb, ...profile, ...devspaceArgs(repo)].join(' ')
 }
 
 export class Supervisor {

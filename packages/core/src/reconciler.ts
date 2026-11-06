@@ -135,6 +135,7 @@ export function parsePods(json: string): PodInfo[] {
       containers.every((c) => typeof c.imageID === 'string' && c.imageID.length > 0)
     pods.push({
       ...(scheduled !== undefined ? { scheduled } : {}),
+      ...(spec?.nodeName ? { node: spec.nodeName } : {}),
       ...(imagePulled ? { imagePulled: true } : {}),
       name: meta?.name ?? '<unknown>',
       phase: typeof status.phase === 'string' ? status.phase : 'Unknown',
@@ -234,8 +235,11 @@ export class Reconciler {
     const ws: WorkloadState = {
       type,
       ...(url ? { url } : {}),
+      // A deploy-only Helm pod (no session, no DevSpace pod) is DEPLOYED for
+      // backends too; reporting it as external made `start` unavailable after
+      // `build`, so purge → deploy → dev could only run as one restart.
       status: deriveStatus(pods, hasSession, deployments.length > 0, sessionDead, {
-        deployedWhenRunning: repo.codeArea === 'frontend',
+        deployedWhenRunning: true,
       }),
       pods,
       deployments,

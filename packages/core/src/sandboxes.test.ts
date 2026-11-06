@@ -1,18 +1,20 @@
 import { execFileSync } from 'node:child_process'
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { Operations } from './operations.js'
-import { type SandboxMemberInput, Sandboxes, isExpired } from './sandboxes.js'
+import { type SandboxMemberInput, Sandboxes, devspaceFailure, isExpired } from './sandboxes.js'
 import { Service } from './service.js'
 import { StateStore } from './stateStore.js'
 import { Supervisor } from './supervisor.js'
@@ -775,6 +777,7 @@ describe('snapshots', () => {
     writeFileSync(join(wt, 'src', 'b.ts'), 'untracked\n')
     writeFileSync(join(wt, 'debug.log'), 'ignored\n')
     rmSync(join(wt, 'src', 'gone.ts'))
+    chmodSync(join(wt, 'src'), 0o751) // copied directories keep their source mode
     const mocked = f.runner.getMockImplementation()
     f.runner.mockImplementation(async (cmd, args, options) =>
       cmd === 'git' && options?.cwd === wt
@@ -789,6 +792,7 @@ describe('snapshots', () => {
         seen.b = existsSync(join(repo.root, 'src', 'b.ts'))
         seen.log = existsSync(join(repo.root, 'debug.log'))
         seen.gone = existsSync(join(repo.root, 'src', 'gone.ts'))
+        seen.srcMode = (statSync(join(repo.root, 'src')).mode & 0o777).toString(8)
       }
       return f.sandboxResult(repo, action)
     })
@@ -803,6 +807,7 @@ describe('snapshots', () => {
       b: true,
       log: false,
       gone: false,
+      srcMode: '751',
     })
     expect(existsSync(seen.root as string)).toBe(false)
     expect(readdirSync(wt).filter((n) => n.startsWith('.devdock'))).toEqual([])
@@ -1273,4 +1278,81 @@ it('maps personal member URLs by their unsuffixed deployment names', async () =>
     'app:ui': 'https://dashboard.example/',
   })
   expect(view?.urls).toEqual(['https://api.example/app', 'https://dashboard.example/'])
+})
+
+describe('sandbox failure detail', () => {
+  it('keeps DevSpace stdout errors and drops login-shell noise', () => {
+    expect(
+      devspaceFailure(
+        {
+          stdout: 'info Using namespace x\n\u001b[1;31mfatal\u001b[0m build failed: no space left',
+          stderr: 'bash: no job control in this shell\nfatal exit status 1\n',
+        },
+        'fallback',
+      ),
+    ).toBe('info Using namespace x\nfatal build failed: no space left\nfatal exit status 1')
+    expect(devspaceFailure({ stdout: '', stderr: '' }, 'fallback')).toBe('fallback')
+  })
+})
+
+it('rewrites only stale or changed fallback routes on a rebuild', async () => {
+  const f = fixture()
+  const base = JSON.parse(
+    (await f.runner('kubectl', ['get', 'ingresses', '-n', 'personal', '-o', 'json'])).stdout,
+  ).items as unknown[]
+  // A personal service the sandbox does not run gets a fallback route on its host.
+  base.push({
+    metadata: { name: 'other-api' },
+    spec: {
+      rules: [
+        {
+          host: 'api-personal-candidate.vmock.dev',
+          http: {
+            paths: [
+              { path: '/other', backend: { service: { name: 'other-api', port: { number: 80 } } } },
+            ],
+          },
+        },
+      ],
+    },
+  })
+  f.setIngresses(base)
+  await f.done(
+    await f.core.create({
+      key: 'SULF-1',
+      members: [input, { ...input, workload: 'ui' }],
+      actor: 'you',
+    }),
+  )
+  const first = [...f.applied]
+  const route = first.find((i) => i.metadata.name.startsWith('devdock-sb1-route-'))
+  expect(route).toBeDefined()
+  const deletes = () =>
+    f.runner.mock.calls
+      .filter(([cmd, args]) => cmd === 'kubectl' && args[0] === 'delete' && args[1] === 'ingress')
+      .map(([, args]) => args.filter((a) => a.startsWith('devdock-')))
+
+  // Unchanged: nothing is deleted or written.
+  f.setIngresses([...base, ...first])
+  f.applied.length = 0
+  f.runner.mockClear()
+  await f.done(f.core.build('SULF-1', { actor: 'you' }))
+  expect(f.applied).toEqual([])
+  expect(deletes()).toEqual([])
+
+  // One route edited out of band and one left over: both go, the edited one returns.
+  const edited = {
+    ...route,
+    metadata: {
+      ...(route as { metadata: object }).metadata,
+      annotations: { 'devdock.dev/route-hash': 'x' },
+    },
+  }
+  const others = first.filter((i) => i !== route)
+  f.setIngresses([...base, ...others, edited, { metadata: { name: 'devdock-sb1-route-99' } }])
+  f.applied.length = 0
+  f.runner.mockClear()
+  await f.done(f.core.build('SULF-1', { actor: 'you' }))
+  expect(deletes()).toEqual([[route?.metadata.name, 'devdock-sb1-route-99']])
+  expect(f.applied.map((i) => i.metadata.name)).toEqual([route?.metadata.name])
 })

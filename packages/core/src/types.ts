@@ -34,6 +34,9 @@ export interface Repo {
   root?: string
   /** Path to the discovered devspace.yaml. */
   configPath: string
+  /** Transient, per `dev` run: nodes that already hold the workload's image,
+   *  which the dev pod should prefer (an image pull on a fresh node is 25-40s). */
+  preferNodes?: string[]
   /** Original template name when a shared config has a workload-specific project lock. */
   devspaceTemplateName?: string
   /** Kubernetes namespace, if declared in the config. */
@@ -107,6 +110,8 @@ export interface PodInfo {
   phase: string
   ready: boolean
   restartCount: number
+  /** Node the pod is scheduled on. */
+  node?: string
 }
 
 /** A deployment object observed in the cluster — exists even when scaled to zero. */
