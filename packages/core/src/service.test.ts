@@ -677,6 +677,84 @@ describe('Service', () => {
     nowSpy.mockRestore()
   })
 
+  it('reports the current scheduler reason for an empty rollout and still retries the rollout', async () => {
+    const start = 1_800_000_000_000
+    const now = vi.spyOn(Date, 'now').mockReturnValue(start + 10_000)
+    const deployment = 'svc-a-devspace'
+    const base = cannedRunner(
+      '{"items":[]}',
+      true,
+      JSON.stringify({
+        items: [{ metadata: { name: deployment }, spec: { replicas: 1 }, status: {} }],
+      }),
+    )
+    const event = (pod: string, message: string, time: number, reason = 'FailedScheduling') => ({
+      involvedObject: { kind: 'Pod', name: pod },
+      reason,
+      message,
+      lastTimestamp: new Date(time).toISOString(),
+    })
+    let podAppeared = false
+    const runner = vi.fn(async (cmd: string, args: string[]) => {
+      if (cmd === 'tmux' && args[0] === 'list-panes')
+        return { code: 0, stdout: `devdock-svc-a 0 ${start / 1000}\n`, stderr: '' }
+      if (cmd === 'kubectl' && args[0] === 'get' && args[1] === 'events') {
+        expect(args).toContain('reason=FailedScheduling')
+        expect(args.slice(-2)).toEqual(['-n', 'ns'])
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            items: [
+              event(`${deployment}-rs-deleted`, 'Insufficient memory', start + 2000),
+              event(`${deployment}-rs-stale`, 'Stale reason', start - 1000),
+              event('other-devspace-rs-other', 'Unrelated reason', start + 9000),
+              event(`${deployment}-rs-image`, 'Image error', start + 8000, 'Failed'),
+              event(`${deployment}-rs-first`, 'Insufficient cpu', start + 1000),
+            ],
+          }),
+          stderr: '',
+        }
+      }
+      if (cmd === 'kubectl' && args[0] === 'get' && args[1] === 'pods' && podAppeared) {
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            items: [
+              { metadata: { name: `${deployment}-rs-pending` }, status: { phase: 'Pending' } },
+            ],
+          }),
+          stderr: '',
+        }
+      }
+      return base(cmd, args)
+    })
+    const svc = new Service({ roots: [root], stateFile }, { runner })
+    const line = '! svc-a-devspace has no pods. FailedScheduling: Insufficient memory'
+    try {
+      svc.rescan()
+      const state = await svc.reconcileOne('svc-a')
+      expect(state.workloads[0]).toMatchObject({
+        status: 'BUILDING',
+        schedulingFailure: 'Insufficient memory',
+      })
+      expect(svc.logs('svc-a')).toContain(line)
+
+      now.mockReturnValue(start + 10_000 + 5 * 60_000)
+      await svc.reconcileOne('svc-a')
+      expect(runner).toHaveBeenCalledWith(
+        'kubectl',
+        ['rollout', 'restart', 'deployment/svc-a-devspace', '-n', 'ns'],
+        { timeoutMs: 15_000 },
+      )
+      expect(svc.logs('svc-a').filter((log) => log === line)).toHaveLength(1)
+      podAppeared = true
+      expect((await svc.reconcileOne('svc-a')).workloads[0]?.schedulingFailure).toBeUndefined()
+    } finally {
+      now.mockRestore()
+      svc.stopLoop()
+    }
+  })
+
   it.each([
     { situation: 'empty rollout', readyToPatch: true },
     { situation: 'terminated session', readyToPatch: true, dead: true },

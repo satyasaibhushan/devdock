@@ -2244,6 +2244,7 @@ export class Service {
         cc,
         type ?? repo.defaultWorkload ?? '',
         sessionDead,
+        session?.createdAt,
       )
 
       // While a multi-step verb (restart) is in flight, force the transient
@@ -2268,6 +2269,15 @@ export class Service {
       const dev = ws.deployments.find(
         (deployment) => deployment.name === `${scoped.name}-devspace` && deployment.replicas > 0,
       )
+      if (recovering && dev && ws.schedulingFailure) {
+        const previous = this.states.get(id)?.workloads.find((w) => w.type === ws.type)
+        if (previous?.schedulingFailure !== ws.schedulingFailure) {
+          const message = `${dev.name} has no pods. FailedScheduling: ${ws.schedulingFailure}`
+          this.hubFor(key).push(`! ${message}`)
+          const op = this.operations.active(id, type ?? '')
+          if (op) this.operations.update(op.id, {}, message)
+        }
+      }
       await this.recoverEmptyRollout(
         scoped,
         key,

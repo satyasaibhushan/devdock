@@ -91,6 +91,8 @@ export interface WorkloadState {
   pods: PodInfo[]
   deployments: DeploymentInfo[]
   hasSession: boolean
+  /** The latest scheduler message for this session's empty DevSpace rollout. */
+  schedulingFailure?: string
   /** The managed session's process exited, even if its pod can still run. */
   sessionDead?: boolean
   /** Lifecycle actions valid for this exact reconciled state. */
