@@ -34,6 +34,22 @@ export function shellOpened(lines: string[]): boolean {
   return lines.some((line) => /\bOpening shell to\b/.test(cleanLine(line)))
 }
 
+/** The session shell has printed its prompt since DevSpace last opened it.
+ *  Keys typed between the "Opening shell" banner and the prompt can be lost
+ *  while the terminal is still attaching, so startup waits for the prompt. */
+export function shellPromptReady(lines: string[]): boolean {
+  let opened = false
+  let ready = false
+  for (const line of lines) {
+    const text = cleanLine(line).trimEnd()
+    if (/\bOpening shell to\b/.test(text)) {
+      opened = true
+      ready = false
+    } else if (opened && /(?:^|\s)\S*[#$]$/.test(text)) ready = true
+  }
+  return ready
+}
+
 /** The last pod DevSpace selected for this pane, even if the log also contains
  *  banners from earlier connections. DevSpace 6 logs the container first. */
 export function shellPod(lines: string[]): string | undefined {

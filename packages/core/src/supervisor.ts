@@ -343,7 +343,8 @@ export class Supervisor {
     return this.exec(
       repo,
       guarded
-        ? `if ! ps -eo args= | grep -Fqx -- ${shellQuote(argv)}; then ${command}; fi`
+        ? // Dev images often ship without ps; /proc lists the same argv then.
+          `if ! { if command -v ps >/dev/null 2>&1; then ps -eo args=; else for f in /proc/[0-9]*/cmdline; do tr '\\0' ' ' < "$f" 2>/dev/null; echo; done | sed 's/ $//'; fi; } | grep -Fqx -- ${shellQuote(argv)}; then ${command}; fi`
         : command,
     )
   }

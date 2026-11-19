@@ -39,8 +39,8 @@ import {
   devSessionPods,
   devSessionReady,
   initialSyncDone,
-  shellOpened,
   shellPod,
+  shellPromptReady,
   startProgress,
 } from './startProgress.js'
 import { type ReplicaRecord, StateStore } from './stateStore.js'
@@ -2079,13 +2079,14 @@ export class Service {
     const openOffset = (): number | undefined => {
       const output = readFileSlice(path, pending ? 0 : (last?.shellOffset ?? 0), 256 * 1024)
       if (pending) {
-        if (shellOpened(output?.lines ?? []) || Date.now() - since >= STARTUP_NO_SYNC_GRACE_MS)
+        if (shellPromptReady(output?.lines ?? []) || Date.now() - since >= STARTUP_NO_SYNC_GRACE_MS)
           return output?.nextOffset ?? 0
       } else if (output) {
         // A ready replacement alone cannot tell us which pod receives tmux
         // input. Require a new terminal banner naming this ready pod.
         const attached = shellPod(output.lines)
-        if (ready.some((pod) => pod.name === attached)) return output.nextOffset
+        if (ready.some((pod) => pod.name === attached) && shellPromptReady(output.lines))
+          return output.nextOffset
       }
       return undefined
     }

@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest'
 import { parsePods } from './reconciler.js'
-import { devSessionReady, initialSyncDone, shellOpened, startProgress } from './startProgress.js'
+import {
+  devSessionReady,
+  initialSyncDone,
+  shellOpened,
+  shellPromptReady,
+  startProgress,
+} from './startProgress.js'
 
 describe('dev start milestones', () => {
   it.each([
@@ -77,5 +83,23 @@ describe('dev shell detection', () => {
       ]),
     ).toBe(true)
     expect(shellOpened(['dev:common sync  Initial sync completed'])).toBe(false)
+  })
+})
+
+describe('shellPromptReady', () => {
+  const banner = (pod: string) => `dev:common term  Opening shell to api:${pod} (pod:container)`
+
+  it('waits for the prompt after the latest banner', () => {
+    expect(shellPromptReady([banner('api-1')])).toBe(false)
+    expect(shellPromptReady([banner('api-1'), 'Welcome to your development container!'])).toBe(
+      false,
+    )
+    expect(shellPromptReady([banner('api-1'), '\u001b[?2004hdevspace ./app # '])).toBe(true)
+  })
+
+  it('ignores the prompt of a shell that was replaced', () => {
+    expect(
+      shellPromptReady([banner('api-1'), 'devspace ./app # ', 'python main.py', banner('api-2')]),
+    ).toBe(false)
   })
 })

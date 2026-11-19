@@ -1083,7 +1083,10 @@ describe('Service', () => {
     before.rescan()
     before.setStartupCommand('svc-a', 'pnpm run dev')
     await before.start('svc-a')
-    writeFileSync(join(root, 'logs', 'svc-a.dev.log'), 'term  Opening shell to svc-a\n') // shell is open
+    writeFileSync(
+      join(root, 'logs', 'svc-a.dev.log'),
+      'term  Opening shell to svc-a\ndevspace ./app # \n',
+    ) // shell is open
 
     // …the daemon restarts inside the deploy window (fresh Service, same store),
     // and the pod only becomes ready on the new process's watch.
@@ -1164,7 +1167,8 @@ describe('Service', () => {
       svc.setStartupCommand('svc-a', 'python main.py')
       mkdirSync(join(root, 'logs'), { recursive: true })
       const devLog = join(root, 'logs', 'svc-a.dev.log')
-      const banner = (pod: string) => `term  Opening shell to app:${pod} (pod:container)\n`
+      const banner = (pod: string) =>
+        `term  Opening shell to app:${pod} (pod:container)\ndevspace ./app # \n`
       const original = banner(name)
       writeFileSync(devLog, original)
       vi.useFakeTimers()
@@ -1236,7 +1240,7 @@ describe('Service', () => {
       expect(runner).not.toHaveBeenCalledWith('tmux', expect.arrayContaining(['send-keys']))
       writeFileSync(
         join(root, 'logs', 'svc-a.dev.log'),
-        'term  Opening shell to svc-a:app (pod:container)\n',
+        'term  Opening shell to svc-a:app (pod:container)\ndevspace ./app # \n',
       )
       await after.reconcileAll()
       await vi.advanceTimersByTimeAsync(3000)
@@ -1260,7 +1264,10 @@ describe('Service', () => {
     before.rescan()
     before.setStartupCommand('svc-a', 'pnpm run dev')
     await before.start('svc-a')
-    writeFileSync(join(root, 'logs', 'svc-a.dev.log'), 'term  Opening shell to svc-a\n') // shell is open
+    writeFileSync(
+      join(root, 'logs', 'svc-a.dev.log'),
+      'term  Opening shell to svc-a\ndevspace ./app # \n',
+    ) // shell is open
 
     let ready = false
     const runner = vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
