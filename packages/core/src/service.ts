@@ -46,7 +46,7 @@ import {
 import { type ReplicaRecord, StateStore } from './stateStore.js'
 import { type SessionState, type StreamRunner, Supervisor, verbLabel } from './supervisor.js'
 import { type RunOutcome, type TermInfo, type TermKind, TermRegistry } from './termRegistry.js'
-import type { PodInfo, Repo, RepoState, RepoStatus, TermMode } from './types.js'
+import type { DeploymentInfo, PodInfo, Repo, RepoState, RepoStatus, TermMode } from './types.js'
 import { WAIT_STATUSES, WaitCrashTracker, waitBlocked } from './wait.js'
 import {
   type CheckResult,
@@ -82,6 +82,7 @@ const STARTUP_NO_SYNC_GRACE_MS = 30_000
  *  before the session is retired as stale. A single empty/failed kubectl read
  *  must never retire a healthy session. */
 const STALE_NO_POD_SESSION_MS = 30 * 60 * 1000
+const EMPTY_DEV_ROLLOUT_MS = 5 * 60 * 1000
 /** Auto-reconnect pacing for a dead dev session whose pod still runs: at most
  *  one attempt per cooldown, giving up after the cap until the workload holds
  *  RUNNING_MANAGED for RECONNECT_RESET_MS (or a manual stop/clear intervenes),
@@ -267,6 +268,10 @@ export class Service {
    *  timer counts the *condition's* duration, not the session's age. Reset by
    *  any pass that sees pods or couldn't see the cluster at all. */
   private readonly noPodsSince = new Map<string, number>()
+  private readonly emptyDevRollouts = new Map<
+    string,
+    { target: string; since: number; attempted: boolean }
+  >()
   /** Auto-reconnect bookkeeping for dead sessions whose pod still runs. */
   private readonly reconnects = new Map<string, { attempts: number; lastAt: number }>()
   private readonly pausedSessions = new Set<string>()
@@ -1094,6 +1099,7 @@ export class Service {
     this.sessionGenerations.set(key, (this.sessionGenerations.get(key) ?? 0) + 1)
     this.reconnects.delete(key)
     this.noPodsSince.delete(key)
+    this.emptyDevRollouts.delete(key)
     this.store.setPendingStartup(key, undefined)
     const result = await this.supervisor.stopSession(repo)
     if (result.code !== 0) return result
@@ -1114,6 +1120,7 @@ export class Service {
     await this.claimOwnership(repo)
     this.recordLifecycle(id, workload)
     this.noPodsSince.delete(key)
+    this.emptyDevRollouts.delete(key)
     this.reconnects.delete(key)
     this.tailers.get(key)?.stop()
     this.tailers.delete(key)
@@ -1179,6 +1186,7 @@ export class Service {
     if (denied) return denied
     await this.claimOwnership(repo)
     this.noPodsSince.delete(key)
+    this.emptyDevRollouts.delete(key)
     this.reconnects.delete(key)
     this.tailers.get(key)?.stop()
     this.tailers.delete(key)
@@ -1910,6 +1918,7 @@ export class Service {
       this.watchers,
       this.transitions,
       this.noPodsSince,
+      this.emptyDevRollouts,
       this.reconnects,
       this.pendingTermOpens,
     ] as Map<string, unknown>[]) {
@@ -2154,7 +2163,22 @@ export class Service {
         if (prev && prev.status !== 'RESTARTING') ws.status = prev.status
       }
 
-      if (!transition && this.shouldRetireNoPodSession(ws, session, key)) {
+      // A Pending pod is already in the scheduler's hands. Only an empty
+      // DevSpace deployment with positive desired replicas needs a new rollout.
+      const recovering = exists && !transition && !ws.unreachable && !this.pausedSessions.has(key)
+      const dev = ws.deployments.find(
+        (deployment) => deployment.name === `${scoped.name}-devspace` && deployment.replicas > 0,
+      )
+      await this.recoverEmptyRollout(
+        scoped,
+        key,
+        session,
+        recovering && ws.pods.length === 0 && !dev?.paused && dev?.actualReplicas === 0
+          ? dev
+          : undefined,
+      )
+
+      if (!transition && !dev && this.shouldRetireNoPodSession(ws, session, key)) {
         const target = ws.deployments.length > 0 ? 'DEPLOYED' : 'STOPPED'
         this.hubFor(key).push(
           `! stale dev session retired: no matching pods; reconciled to ${target.toLowerCase()}`,
@@ -2301,6 +2325,49 @@ export class Service {
     return (
       session.createdAt !== undefined && Date.now() - session.createdAt >= STALE_NO_POD_SESSION_MS
     )
+  }
+
+  private async recoverEmptyRollout(
+    repo: Repo,
+    key: string,
+    session: SessionState | undefined,
+    deployment: DeploymentInfo | undefined,
+  ): Promise<void> {
+    if (!deployment || this.stopped) {
+      this.emptyDevRollouts.delete(key)
+      return
+    }
+    const now = Date.now()
+    const target = JSON.stringify([repo.namespace, deployment.name, session?.createdAt])
+    const previous = this.emptyDevRollouts.get(key)
+    if (previous?.target !== target) {
+      this.emptyDevRollouts.set(key, { target, since: now, attempted: false })
+      return
+    }
+    if (previous.attempted || now - previous.since < EMPTY_DEV_ROLLOUT_MS) return
+
+    const namespace = repo.namespace || (await this.contextNamespace()) || 'default'
+    if (this.ownership && !(await this.ownership.owns(repo, namespace).catch(() => false))) return
+    if (
+      this.stopped ||
+      this.transitions.has(key) ||
+      this.pausedSessions.has(key) ||
+      this.emptyDevRollouts.get(key) !== previous ||
+      previous.attempted
+    )
+      return
+    previous.attempted = true
+
+    const hub = this.hubFor(key)
+    hub.push(
+      `! restarting rollout for ${deployment.name}: desired replicas but no pods for five minutes`,
+    )
+    const result = await this.kubectl(
+      'kubectl',
+      ['rollout', 'restart', `deployment/${deployment.name}`, '-n', namespace],
+      { timeoutMs: 15_000 },
+    ).catch(() => undefined)
+    if (result?.code !== 0) hub.push(`✗ rollout restart failed for ${deployment.name}`)
   }
 
   /** Kick off an auto-reconnect for a dead dev session whose pod still runs.

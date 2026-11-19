@@ -87,17 +87,21 @@ export function matchDeployments(
   return matchByName(deployments, name, knownNames)
 }
 
-/** Parse `kubectl get pods -o json` into PodInfo[]. Defensive against junk. */
-export function parsePods(json: string): PodInfo[] {
-  let doc: unknown
+function listItems(json: string): unknown[] | null {
   try {
-    doc = JSON.parse(json)
+    const doc = JSON.parse(json) as { items?: unknown } | null
+    return Array.isArray(doc?.items) ? doc.items : null
   } catch {
-    return []
+    return null
   }
-  const items = (doc as { items?: unknown })?.items
-  if (!Array.isArray(items)) return []
+}
 
+/** Parse `kubectl get pods -o json` into PodInfo[]. */
+export function parsePods(json: string): PodInfo[] {
+  return podInfos(listItems(json) ?? [])
+}
+
+function podInfos(items: unknown[]): PodInfo[] {
   const pods: PodInfo[] = []
   for (const item of items) {
     const meta = (
@@ -178,24 +182,21 @@ export function parsePods(json: string): PodInfo[] {
 
 /** Parse `kubectl get deployments -o json` into DeploymentInfo[]. Defensive against junk. */
 export function parseDeployments(json: string): DeploymentInfo[] {
-  let doc: unknown
-  try {
-    doc = JSON.parse(json)
-  } catch {
-    return []
-  }
-  const items = (doc as { items?: unknown })?.items
-  if (!Array.isArray(items)) return []
+  return deploymentInfos(listItems(json) ?? [])
+}
 
+function deploymentInfos(items: unknown[]): DeploymentInfo[] {
   const out: DeploymentInfo[] = []
   for (const item of items) {
     const meta = (item as { metadata?: { name?: string } }).metadata
-    const spec = (item as { spec?: { replicas?: unknown } }).spec
-    const status = (item as { status?: { readyReplicas?: unknown } }).status
+    const spec = (item as { spec?: { replicas?: unknown; paused?: boolean } }).spec
+    const status = (item as { status?: { readyReplicas?: number; replicas?: number } }).status
     out.push({
       name: meta?.name ?? '<unknown>',
       replicas: typeof spec?.replicas === 'number' ? spec.replicas : 0,
       readyReplicas: typeof status?.readyReplicas === 'number' ? status.readyReplicas : 0,
+      ...(status ? { actualReplicas: status.replicas ?? 0 } : {}),
+      ...(spec?.paused === true ? { paused: true } : {}),
     })
   }
   return out
@@ -307,7 +308,8 @@ export class Reconciler {
       if (repo.namespace) args.push('-n', repo.namespace)
       if (repo.selector) args.push('-l', repo.selector)
       const r = await this.runner('kubectl', args).catch(() => undefined)
-      pods = !r || r.code !== 0 ? null : parsePods(r.stdout)
+      const items = r?.code === 0 ? listItems(r.stdout) : null
+      pods = items && podInfos(items)
       cache.pods.set(key, pods)
     }
     if (pods === null) return null
@@ -329,7 +331,8 @@ export class Reconciler {
       const args = ['get', 'deployments', '-o', 'json']
       if (repo.namespace) args.push('-n', repo.namespace)
       const r = await this.runner('kubectl', args).catch(() => undefined)
-      deployments = !r || r.code !== 0 ? null : parseDeployments(r.stdout)
+      const items = r?.code === 0 ? listItems(r.stdout) : null
+      deployments = items && deploymentInfos(items)
       cache.deployments.set(key, deployments)
     }
     return deployments

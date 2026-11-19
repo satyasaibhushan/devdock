@@ -128,6 +128,9 @@ export interface DeploymentInfo {
   replicas: number
   /** Ready replicas (status.readyReplicas). */
   readyReplicas: number
+  /** Replicas reported by the deployment controller. */
+  actualReplicas?: number
+  paused?: boolean
 }
 
 /** The reconciled view of a single repo (spec §6). */

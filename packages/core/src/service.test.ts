@@ -492,6 +492,85 @@ describe('Service', () => {
     nowSpy.mockRestore()
   })
 
+  it.each([
+    { situation: 'empty rollout', readyToPatch: true },
+    { situation: 'terminated session', readyToPatch: true, dead: true },
+    { situation: 'unschedulable pod', pod: true },
+    { situation: 'scaled down intentionally', desired: 0 },
+    { situation: 'paused deployment', paused: true },
+    { situation: 'no session', hasSession: false },
+    { situation: 'failed pod query', podQuery: 'failed' },
+    { situation: 'unreadable pod list', podQuery: 'malformed' },
+    { situation: 'controller reports existing replicas', actual: 1 },
+  ])('reconciles a stalled rollout with $situation', async (scenario) => {
+    const time = Date.now()
+    const now = vi.spyOn(Date, 'now').mockReturnValue(time)
+    const deployments = JSON.stringify({
+      items: [
+        {
+          metadata: { name: 'svc-a-devspace' },
+          spec: { replicas: scenario.desired ?? 1, paused: scenario.paused },
+          status: { replicas: scenario.actual ?? 0 },
+        },
+      ],
+    })
+    const pending = JSON.stringify({
+      items: [{ metadata: { name: 'svc-a-devspace-1' }, status: { phase: 'Pending' } }],
+    })
+    const original = cannedRunner(
+      scenario.pod ? pending : '{"items":[]}',
+      scenario.hasSession ?? true,
+      deployments,
+    )
+    let pendingPod = false
+    const runner = vi.fn(async (cmd: string, args: string[]) => {
+      if (cmd === 'tmux' && args[0] === 'list-panes' && scenario.dead)
+        return { code: 0, stdout: 'devdock-svc-a 1', stderr: '' }
+      if (cmd === 'kubectl' && args[0] === 'get' && args[1] === 'pods') {
+        if (pendingPod) return { code: 0, stdout: pending, stderr: '' }
+        if (scenario.podQuery === 'failed') return { code: 1, stdout: '', stderr: '' }
+        if (scenario.podQuery === 'malformed') return { code: 0, stdout: 'invalid', stderr: '' }
+      }
+      return original(cmd, args)
+    })
+    const svc = new Service({ roots: [root], stateFile }, { runner })
+    const attempts = () =>
+      runner.mock.calls.filter(([cmd, args]) => cmd === 'kubectl' && args[0] === 'rollout')
+    try {
+      svc.rescan()
+      await svc.reconcileAll()
+      now.mockReturnValue(time + 4 * 60_000)
+      await svc.reconcileAll()
+      expect(attempts()).toHaveLength(0)
+      if (scenario.readyToPatch && !scenario.dead) {
+        // The Pending pod interrupts the empty-rollout timer.
+        pendingPod = true
+        await svc.reconcileAll()
+        pendingPod = false
+        now.mockReturnValue(time + 5 * 60_000)
+        await svc.reconcileAll()
+        expect(attempts()).toHaveLength(0)
+      }
+      now.mockReturnValue(time + 10 * 60_000)
+      await svc.reconcileAll()
+      now.mockReturnValue(time + 20 * 60_000)
+      await svc.reconcileAll()
+      expect(attempts()).toHaveLength(scenario.readyToPatch ? 1 : 0)
+      if (scenario.readyToPatch) {
+        expect(attempts()[0].slice(0, 2)).toEqual([
+          'kubectl',
+          ['rollout', 'restart', 'deployment/svc-a-devspace', '-n', 'ns'],
+        ])
+        expect(svc.logs('svc-a')).toContain(
+          '! restarting rollout for svc-a-devspace: desired replicas but no pods for five minutes',
+        )
+      }
+    } finally {
+      now.mockRestore()
+      svc.stopLoop()
+    }
+  })
+
   it('a transient kubectl failure never retires the session or drops the status', async () => {
     const podsJson = JSON.stringify({
       items: [

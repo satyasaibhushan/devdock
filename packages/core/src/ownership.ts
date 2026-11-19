@@ -48,6 +48,15 @@ export class DeploymentOwnership {
     private readonly runner: OwnershipRunner,
   ) {}
 
+  async owns(repo: Repo, namespace: string): Promise<boolean> {
+    const result = await this.read(repo.name, namespace)
+    if (result.code !== 0 || !result.stdout.trim()) return false
+    const { data } = JSON.parse(result.stdout) as {
+      data?: { deployment?: string; instance?: string }
+    }
+    return data?.deployment === repo.name && data.instance === this.instanceId
+  }
+
   async claim(repo: Repo): Promise<void> {
     if (!repo.namespace) throw new Error('Deployment ownership requires an explicit namespace')
     const name = claimName(repo.name)

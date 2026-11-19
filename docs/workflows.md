@@ -130,3 +130,7 @@ omitted field keeps the value from the repo or its DevSpace import.
 ```
 
 DevDock reads the file on each launch. Start a new dev session to apply edits.
+
+If a managed session's DevSpace deployment wants replicas and stays empty for
+five minutes, DevDock asks Kubernetes for one new rollout and logs the reason.
+A Pending pod counts as a scheduling attempt and resets the five-minute timer.
