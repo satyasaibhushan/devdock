@@ -10,7 +10,7 @@ import { type AwsCredential, AwsCreds } from './awsCreds.js'
 import { CrashWatch } from './crashWatch.js'
 import { environmentWarning } from './environmentWarning.js'
 import { type RunResult, run, runStream, spawnStream } from './exec.js'
-import { helmReleaseNames } from './helmRelease.js'
+import { clusterIPService, helmReleaseNames } from './helmRelease.js'
 import { type LifecycleAction, lifecyclePlan } from './lifecycle.js'
 import { decodeCursor, encodeCursor, readFileSlice } from './logQuery.js'
 import { LogHub, LogTailer, type SpawnFn, cleanLine } from './logTailer.js'
@@ -278,6 +278,8 @@ export class Service {
   private readonly pausedSessions = new Set<string>()
   private readonly sessionGenerations = new Map<string, number>()
   private readonly readyPodGenerations = new Map<string, string>()
+  /** Effective release names are stable for a running DevSpace session. */
+  private readonly sessionHelmReleases = new Map<string, { target: string; names: string[] }>()
   /** Node of each workload's most recent DevSpace pod (in-memory). */
   private readonly lastDevNodes = new Map<string, string>()
   /** When a pending startup command first saw its session pods ready. */
@@ -999,6 +1001,7 @@ export class Service {
     writeFileSync(pipeFile, '') // fresh run, fresh file — old output doesn't linger
     this.logGens.set(key, (this.logGens.get(key) ?? 0) + 1) // invalidate old f: cursors
     hub.push(`$ ${verbLabel(repo, 'dev')}`)
+    this.sessionHelmReleases.delete(key)
     const r = await this.supervisor.start(
       { ...repo, preferNodes: this.imageNodes(id, workload) },
       pipeFile,
@@ -2013,6 +2016,7 @@ export class Service {
       this.transitions,
       this.noPodsSince,
       this.emptyDevRollouts,
+      this.sessionHelmReleases,
       this.reconnects,
       this.pendingTermOpens,
     ] as Map<string, unknown>[]) {
@@ -2295,6 +2299,10 @@ export class Service {
         // in CRASHED — devspace reattaches to the existing dev pod.
         if (this.scheduleReconnect(id, type, key)) ws.status = 'RESTARTING'
       }
+      if (!hasSession) this.sessionHelmReleases.delete(key)
+      if (session && ws.status === 'RUNNING_MANAGED' && !ws.unreachable) {
+        await this.repairApiService(scoped, key, session).catch(() => undefined)
+      }
       if (transition) ws.status = transition
 
       // A workload that has run managed for a while proved the reconnect took —
@@ -2349,6 +2357,68 @@ export class Service {
         await this.applyReplicaIngress(repo, rec).catch(() => undefined)
     }
     return state
+  }
+
+  private async repairApiService(repo: Repo, key: string, session: SessionState): Promise<void> {
+    const type =
+      repo.varDefaults?.WORKLOAD_TYPE ??
+      repo.workloadType ??
+      (repo.codeArea === 'backend' ? 'api' : undefined)
+    if (type !== 'api' || this.pausedSessions.has(key)) return
+    const generation = this.sessionGenerations.get(key)
+    const namespace = repo.namespace || (await this.contextNamespace()) || 'default'
+    const target = `${repo.configPath}:${namespace}:${session.createdAt ?? ''}`
+    let releases = this.sessionHelmReleases.get(key)
+    if (releases?.target !== target) {
+      releases = { target, names: await this.releaseNames({ ...repo, namespace }) }
+      this.sessionHelmReleases.set(key, releases)
+    }
+    for (const name of releases.names) {
+      const service = await this.kubectl(
+        'kubectl',
+        ['get', 'service', name, '-n', namespace, '-o', 'json'],
+        { timeoutMs: 10_000 },
+      )
+      if (service.code !== 0) continue
+      const live = JSON.parse(service.stdout) as {
+        metadata?: { resourceVersion?: string }
+        spec?: { type?: string; externalName?: string }
+      } | null
+      const version = live?.metadata?.resourceVersion
+      if (live?.spec?.type !== 'ExternalName' || !version) continue
+
+      const manifest = await this.kubectl('helm', ['get', 'manifest', name, '-n', namespace], {
+        timeoutMs: 10_000,
+      })
+      if (manifest.code !== 0) continue
+      const desired = clusterIPService(manifest.stdout, name, namespace)
+      if (!desired) continue
+      if (
+        this.stopped ||
+        this.pausedSessions.has(key) ||
+        generation !== this.sessionGenerations.get(key)
+      )
+        return
+
+      // Reject stale reads if Helm or another reconcile touched the Service.
+      const patch = [
+        { op: 'test', path: '/metadata/resourceVersion', value: version },
+        { op: 'test', path: '/spec/type', value: 'ExternalName' },
+        ...(live.spec.externalName !== undefined
+          ? [{ op: 'remove', path: '/spec/externalName' }]
+          : []),
+        { op: 'add', path: '/spec/type', value: 'ClusterIP' },
+        { op: 'add', path: '/spec/selector', value: desired.selector },
+        { op: 'add', path: '/spec/ports', value: desired.ports },
+      ]
+      const repaired = await this.kubectl(
+        'kubectl',
+        ['patch', 'service', name, '-n', namespace, '--type=json', '-p', JSON.stringify(patch)],
+        { timeoutMs: 10_000 },
+      )
+      if (repaired.code === 0)
+        this.hubFor(key).push(`✓ repaired Service ${namespace}/${name} to ClusterIP`)
+    }
   }
 
   /** Every name that can claim pods this pass — repo names plus their

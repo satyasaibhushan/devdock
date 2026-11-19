@@ -173,6 +173,98 @@ describe('Service', () => {
     },
   )
 
+  it.each(['start', 'build_start'] as const)(
+    'repairs an API Service after %s and heals subsequent drift',
+    async (action) => {
+      writeFileSync(
+        join(root, 'svc-a', 'devspace.yaml'),
+        'name: svc-a\nnamespace: ns\nvars:\n  WORKLOAD_TYPE: api\ndeployments:\n  api:\n    helm:\n      releaseName: shared-api\n',
+      )
+      const ready = cannedRunner(
+        JSON.stringify({
+          items: [
+            {
+              metadata: { name: 'svc-a-devspace-abc-123' },
+              status: { phase: 'Running', containerStatuses: [{ name: 'api', ready: true }] },
+            },
+          ],
+        }),
+        true,
+      )
+      const stopped = cannedRunner('{"items":[]}', false)
+      let session = false
+      let external = true
+      let desiredType = 'ClusterIP'
+      let customPorts = action === 'build_start'
+      const patchCalls: object[][] = []
+      const runner = vi.fn(async (cmd: string, args: string[]) => {
+        if (cmd === 'tmux' && args[0] === 'new-session') session = true
+        if (cmd === 'kubectl' && args[0] === 'get' && args[1] === 'service') {
+          expect(args.slice(2)).toEqual(['shared-api', '-n', 'ns', '-o', 'json'])
+          return {
+            code: 0,
+            stdout: JSON.stringify({
+              metadata: { resourceVersion: '123' },
+              spec: external
+                ? { type: 'ExternalName', externalName: 'shared-api.uat-us.svc.cluster.local' }
+                : { type: 'ClusterIP' },
+            }),
+            stderr: '',
+          }
+        }
+        if (cmd === 'helm' && args[0] === 'get' && args[1] === 'manifest') {
+          expect(args.slice(2)).toEqual(['shared-api', '-n', 'ns'])
+          return {
+            code: 0,
+            stdout: `---\nkind: Deployment\nmetadata: {name: shared-api}\n---\nkind: Service\nmetadata: {name: shared-api}\nspec:\n  type: ${desiredType}\n  selector: {svc: shared-api}\n${customPorts ? '  ports: [{name: http, port: 8080, targetPort: web}]\n' : ''}`,
+            stderr: '',
+          }
+        }
+        if (cmd === 'kubectl' && args[0] === 'patch' && args[1] === 'service') {
+          expect(args.slice(2, -1)).toEqual(['shared-api', '-n', 'ns', '--type=json', '-p'])
+          patchCalls.push(JSON.parse(args.at(-1) ?? ''))
+          external = false
+        }
+        return (session ? ready : stopped)(cmd, args)
+      })
+      const svc = new Service(
+        { roots: [root], stateFile },
+        { runner, streamSpawner: fakeStreamSpawner().spawner },
+      )
+      svc.rescan()
+      await svc.reconcileOne('svc-a')
+      expect(patchCalls).toHaveLength(0)
+      if (action === 'start') expect((await svc.start('svc-a')).code).toBe(0)
+      else expect((await svc.lifecycle('svc-a', action)).code).toBe(0)
+
+      const ports = customPorts
+        ? [{ name: 'http', port: 8080, targetPort: 'web' }]
+        : [{ port: 80, targetPort: 80 }]
+      expect(patchCalls).toEqual([
+        [
+          { op: 'test', path: '/metadata/resourceVersion', value: '123' },
+          { op: 'test', path: '/spec/type', value: 'ExternalName' },
+          { op: 'remove', path: '/spec/externalName' },
+          { op: 'add', path: '/spec/type', value: 'ClusterIP' },
+          { op: 'add', path: '/spec/selector', value: { svc: 'shared-api' } },
+          { op: 'add', path: '/spec/ports', value: ports },
+        ],
+      ])
+      expect(svc.logs('svc-a')).toContain('✓ repaired Service ns/shared-api to ClusterIP')
+      await svc.reconcileOne('svc-a')
+      expect(patchCalls).toHaveLength(1)
+
+      external = true
+      desiredType = 'ExternalName'
+      await svc.reconcileOne('svc-a')
+      expect(patchCalls).toHaveLength(1)
+      desiredType = 'ClusterIP'
+      customPorts = false
+      await svc.reconcileOne('svc-a')
+      expect(patchCalls).toHaveLength(2)
+    },
+  )
+
   it('starts and rescans with duplicates while retaining the registered path across restarts', async () => {
     const known = join(root, 'svc-a')
     const ignored = join(root, 'a', 'svc-a')
