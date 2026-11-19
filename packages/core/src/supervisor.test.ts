@@ -1,9 +1,24 @@
+import { execFileSync } from 'node:child_process'
 import { describe, expect, it, vi } from 'vitest'
 import { type RunResult, loginShell, loginShellArgs } from './exec.js'
 import { sessionName } from './registry.js'
 import { Supervisor, devspaceArgs, devspaceCommand, shellQuote, verbLabel } from './supervisor.js'
 import type { Repo } from './types.js'
 import { scopeRepo } from './workloads.js'
+
+it('starts a simple command only when its process is absent', async () => {
+  const runner = vi.fn(async (_cmd: string, _args: string[]) => ok())
+  await new Supervisor(runner).startup(repo, 'python main.py')
+  const command = runner.mock.calls[0][1][3]
+  const run = (processes: string) =>
+    execFileSync(
+      'sh',
+      ['-c', `ps() { printf '%s\\n' '${processes}'; }; python() { echo started; }; ${command}`],
+      { encoding: 'utf8' },
+    )
+  expect(run('python main.py')).toBe('')
+  expect(run('python other.py')).toBe('started\n')
+})
 
 it('requires a shell acknowledgement rather than echoed keystrokes', async () => {
   let sent = ''

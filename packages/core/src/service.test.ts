@@ -1031,7 +1031,7 @@ describe('Service', () => {
         'send-keys',
         '-t',
         '=devdock-svc-a:',
-        'pnpm run dev',
+        expect.stringContaining('then pnpm run dev; fi'),
         'Enter',
       ])
 
@@ -1072,17 +1072,22 @@ describe('Service', () => {
         }
         return base(cmd, args)
       })
-      const svc = new Service(
-        { roots: [root], stateFile },
-        {
-          runner,
-          streamSpawner: fakeStreamSpawner().spawner,
-        },
-      )
+      const createService = () =>
+        new Service(
+          { roots: [root], stateFile },
+          {
+            runner,
+            streamSpawner: fakeStreamSpawner().spawner,
+          },
+        )
+      const svc = createService()
       svc.rescan()
       svc.setStartupCommand('svc-a', 'python main.py')
       mkdirSync(join(root, 'logs'), { recursive: true })
-      writeFileSync(join(root, 'logs', 'svc-a.dev.log'), 'term  Opening shell to svc-a\n') // shell is open
+      const devLog = join(root, 'logs', 'svc-a.dev.log')
+      const banner = (pod: string) => `term  Opening shell to app:${pod} (pod:container)\n`
+      const original = banner(name)
+      writeFileSync(devLog, original)
       vi.useFakeTimers()
       try {
         await svc.reconcileAll()
@@ -1095,10 +1100,24 @@ describe('Service', () => {
         await vi.advanceTimersByTimeAsync(3000)
         expect(runner).not.toHaveBeenCalledWith('tmux', expect.arrayContaining(['send-keys']))
         ready = true
-        await svc.reconcileAll()
+        // Reconciliation after a daemon restart must still remember the previous pod.
+        svc.stopLoop()
+        const resumed = createService()
+        resumed.rescan()
+        await resumed.reconcileAll()
+        await vi.advanceTimersByTimeAsync(31_000)
+        expect(runner).not.toHaveBeenCalledWith('tmux', expect.arrayContaining(['send-keys']))
+        writeFileSync(devLog, original + banner('another-workload'))
+        await resumed.reconcileAll()
         await vi.advanceTimersByTimeAsync(3000)
-        await svc.reconcileAll()
+        expect(runner).not.toHaveBeenCalledWith('tmux', expect.arrayContaining(['send-keys']))
+        writeFileSync(devLog, original + banner('another-workload') + banner(name))
+        await resumed.reconcileAll()
+        await resumed.reconcileAll()
         await vi.advanceTimersByTimeAsync(3000)
+        await resumed.reconcileAll()
+        await vi.advanceTimersByTimeAsync(3000)
+        resumed.stopLoop()
         expect(
           runner.mock.calls.filter(([cmd, args]) => cmd === 'tmux' && args[0] === 'send-keys'),
         ).toHaveLength(1)
@@ -1146,7 +1165,7 @@ describe('Service', () => {
         'send-keys',
         '-t',
         '=devdock-svc-a:',
-        'pnpm run dev',
+        expect.stringContaining('then pnpm run dev; fi'),
         'Enter',
       ])
     } finally {
@@ -1217,7 +1236,7 @@ describe('Service', () => {
         'send-keys',
         '-t',
         '=devdock-svc-a:',
-        'pnpm run dev',
+        expect.stringContaining('then pnpm run dev; fi'),
         'Enter',
       ])
     } finally {

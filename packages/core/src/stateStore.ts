@@ -54,6 +54,11 @@ export interface ReplicaRecord {
   ingressName?: string
 }
 
+interface StartupPod {
+  generation: string
+  shellOffset: number
+}
+
 interface Persisted {
   /** Last registered paths disambiguate repo ids across daemon restarts. */
   repoPaths: Record<string, string>
@@ -69,6 +74,7 @@ interface Persisted {
    *  deploy (minutes) — a daemon restart or crash inside that window must not
    *  eat the queued command. Cleared when it fires or the workload stops. */
   pendingStartup: Record<string, string>
+  startupPods: Record<string, StartupPod>
   /** Every namespace devdock has seen or the user has switched to — the
    *  selector's options, since listing cluster namespaces is RBAC-forbidden. */
   namespaces: string[]
@@ -89,6 +95,7 @@ const EMPTY: Persisted = {
   grants: [],
   startup: {},
   pendingStartup: {},
+  startupPods: {},
   namespaces: [],
   sessionNamespaces: {},
   replicas: {},
@@ -113,6 +120,7 @@ export class StateStore {
         grants: parsed.grants ?? [],
         startup: parsed.startup ?? {},
         pendingStartup: parsed.pendingStartup ?? {},
+        startupPods: parsed.startupPods ?? {},
         namespaces: parsed.namespaces ?? [],
         sessionNamespaces: parsed.sessionNamespaces ?? {},
         replicas: parsed.replicas ?? {},
@@ -235,6 +243,16 @@ export class StateStore {
     else delete commands[podType]
     if (Object.keys(commands).length) this.data.startup[repo] = commands
     else delete this.data.startup[repo]
+    this.flush()
+  }
+
+  getStartupPod(key: string): StartupPod | undefined {
+    return this.data.startupPods[key]
+  }
+
+  setStartupPod(key: string, pod: StartupPod | undefined): void {
+    if (pod) this.data.startupPods[key] = pod
+    else delete this.data.startupPods[key]
     this.flush()
   }
 

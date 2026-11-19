@@ -40,6 +40,7 @@ import {
   devSessionReady,
   initialSyncDone,
   shellOpened,
+  shellPod,
   startProgress,
 } from './startProgress.js'
 import { type ReplicaRecord, StateStore } from './stateStore.js'
@@ -274,6 +275,7 @@ export class Service {
   /** Node of each workload's most recent DevSpace pod (in-memory). */
   private readonly lastDevNodes = new Map<string, string>()
   /** When a pending startup command first saw its session pods ready. */
+  private readonly startingPods = new Set<string>()
   private readonly startupReadySince = new Map<string, number>()
   /** Fast re-checks for a pending startup between the 5s reconcile ticks. */
   private readonly shellWatches = new Map<string, NodeJS.Timeout>()
@@ -1013,7 +1015,12 @@ export class Service {
       // Queued in the store: the ready-wait spans the whole deploy (minutes),
       // and a daemon restart in that window must not eat the command.
       const startup = this.store.getStartup(id, startupPodType(base, type))
-      if (startup) this.store.setPendingStartup(key, startup)
+      const previousPod = this.store.getStartupPod(key)
+      if (automatic && previousPod) {
+        // The new tmux log starts at byte zero. Its shell can reattach to the
+        // same container and screen session, where startup already ran.
+        this.store.setStartupPod(key, { ...previousPod, shellOffset: 0 })
+      } else if (startup) this.store.setPendingStartup(key, startup)
     } else {
       for (const line of nonEmptyLines(r.stderr)) hub.push(line)
       hub.push(`✗ devspace dev failed to start (exit ${r.code})`)
@@ -1958,15 +1965,13 @@ export class Service {
     return this.namespaceInfo()
   }
 
-  /** Run the queued startup command in the dev session after a short grace, so
-   *  the keystrokes land at the in-container shell `devspace dev` opens. */
-  /** The shell opens a couple of seconds after the pod is ready; poll for it
-   *  instead of waiting up to a full reconcile tick. Bounded by the no-sync grace. */
-  private watchShell(id: string, key: string): void {
+  /** Poll faster than reconcile while a new shell is opening. */
+  private watchShell(id: string, key: string, isOpen: () => boolean): void {
     if (this.shellWatches.has(key)) return
+    const deadline = Date.now() + STARTUP_NO_SYNC_GRACE_MS
     const timer = setInterval(() => {
-      if (this.stopped || !this.store.getPendingStartup(key)) return this.stopShellWatch(key)
-      if (this.devShellOpen(key)) {
+      if (this.stopped || Date.now() > deadline) return this.stopShellWatch(key)
+      if (isOpen()) {
         this.stopShellWatch(key)
         void this.reconcileOne(id).catch(() => undefined)
       }
@@ -1980,36 +1985,107 @@ export class Service {
     this.shellWatches.delete(key)
   }
 
-  /** DevSpace opens the session's shell only after the initial sync, so typing
-   *  the startup command earlier lands in deploy output. Configs without a sync
-   *  never log one; give those a fixed grace after their pods are ready. */
-  private devShellOpen(key: string): boolean {
-    const since = this.startupReadySince.get(key) ?? Date.now()
-    this.startupReadySince.set(key, since)
-    if (Date.now() - since >= STARTUP_NO_SYNC_GRACE_MS) return true
-    const path = this.devLogPath(key)
-    const size = existsSync(path) ? statSync(path).size : 0
-    // Only the tail can hold a fresh sync line; the log is truncated per start.
-    const slice = readFileSlice(path, Math.max(0, size - 256 * 1024))
-    return slice !== undefined && shellOpened(slice.lines)
+  private scheduleStartup(
+    scoped: Repo,
+    key: string,
+    command: string,
+    generation: string,
+    openOffset: () => number | undefined,
+    initial: boolean,
+  ): void {
+    const sessionGeneration = this.sessionGenerations.get(key)
+    this.startingPods.add(key)
+    const timer = setTimeout(async () => {
+      try {
+        if (
+          this.stopped ||
+          this.pausedSessions.has(key) ||
+          this.sessionGenerations.get(key) !== sessionGeneration ||
+          this.readyPodGenerations.get(key) !== generation ||
+          (initial && this.store.getPendingStartup(key) !== command)
+        )
+          return
+        const shellOffset = openOffset()
+        if (shellOffset === undefined) return
+        const hub = this.hubFor(key)
+        hub.push(`$ ${command}  (startup)`)
+        const r = await this.supervisor.startup(scoped, command)
+        if (r.code !== 0) {
+          hub.push(`✗ could not send startup command (exit ${r.code})`)
+          return
+        }
+        this.store.setStartupPod(key, { generation, shellOffset })
+        if (initial && this.store.getPendingStartup(key) === command)
+          this.store.setPendingStartup(key, undefined)
+      } catch {
+        this.hubFor(key).push('✗ could not send startup command to the dev session')
+      } finally {
+        this.startingPods.delete(key)
+      }
+    }, STARTUP_RUN_DELAY_MS)
+    timer.unref()
   }
 
-  private scheduleStartup(scoped: Repo, key: string, command: string): void {
-    const sessionGeneration = this.sessionGenerations.get(key)
-    const podGeneration = this.readyPodGenerations.get(key)
-    setTimeout(() => {
-      if (
-        this.pausedSessions.has(key) ||
-        this.sessionGenerations.get(key) !== sessionGeneration ||
-        this.readyPodGenerations.get(key) !== podGeneration
-      )
-        return
-      const hub = this.hubFor(key)
-      hub.push(`$ ${command}  (startup)`)
-      void this.supervisor.exec(scoped, command).then((r) => {
-        if (r.code !== 0) hub.push(`✗ startup command exited ${r.code}`)
+  private reconcileStartup(
+    id: string,
+    key: string,
+    scoped: Repo,
+    pods: PodInfo[],
+    command: string | undefined,
+  ): void {
+    const ready = pods.filter((pod) => pod.ready)
+    const generation = ready.length
+      ? JSON.stringify([
+          scoped.namespace,
+          ready.map((pod) => [pod.name, pod.uid, pod.restartCount]).sort(),
+        ])
+      : undefined
+    if (this.readyPodGenerations.get(key) !== generation) {
+      this.stopShellWatch(key)
+      this.startupReadySince.delete(key)
+    }
+    if (!generation) {
+      this.readyPodGenerations.delete(key)
+      return
+    }
+    this.readyPodGenerations.set(key, generation)
+
+    const pending = this.store.getPendingStartup(key)
+    const last = this.store.getStartupPod(key)
+    if (last?.generation === generation && !pending) return
+    const path = this.devLogPath(key)
+    if (!pending && (!last || !command)) {
+      // Adopt an already-running session without typing into its terminal.
+      this.store.setStartupPod(key, {
+        generation,
+        shellOffset: readFileSlice(path, 0)?.nextOffset ?? 0,
       })
-    }, STARTUP_RUN_DELAY_MS)
+      return
+    }
+
+    const startup = pending ?? command
+    if (!startup || this.startingPods.has(key)) return
+    const since = this.startupReadySince.get(key) ?? Date.now()
+    this.startupReadySince.set(key, since)
+    const openOffset = (): number | undefined => {
+      const output = readFileSlice(path, pending ? 0 : (last?.shellOffset ?? 0), 256 * 1024)
+      if (pending) {
+        if (shellOpened(output?.lines ?? []) || Date.now() - since >= STARTUP_NO_SYNC_GRACE_MS)
+          return output?.nextOffset ?? 0
+      } else if (output) {
+        // A ready replacement alone cannot tell us which pod receives tmux
+        // input. Require a new terminal banner naming this ready pod.
+        const attached = shellPod(output.lines)
+        if (ready.some((pod) => pod.name === attached)) return output.nextOffset
+      }
+      return undefined
+    }
+    const offset = openOffset()
+    if (offset === undefined) this.watchShell(id, key, () => openOffset() !== undefined)
+    else {
+      this.stopShellWatch(key)
+      this.scheduleStartup(scoped, key, startup, generation, openOffset, !!pending)
+    }
   }
 
   // ---- reconciliation (spec §6) ----
@@ -2110,48 +2186,16 @@ export class Service {
       }
       workloads.push(ws)
 
-      // A live DevSpace session can survive a replacement pod or container.
-      // The old app process cannot: re-arm its configured command once for
-      // the new ready generation, without restarting or deploying the parent.
-      // Only the session's own pods count: after a deploy the Helm pod is ready
-      // first, and its swap for the DevSpace pod is not a restart of the app.
-      const sessionPods = devSessionPods(ws.pods)
       const devNode = ws.pods.find((p) => p.name.includes('-devspace') && p.node)?.node
       if (devNode) this.lastDevNodes.set(key, devNode)
-      const readyGeneration = sessionPods
-        .filter((pod) => pod.ready)
-        .map((pod) => `${pod.name}:${pod.restartCount}`)
-        .sort()
-        .join(',')
-      if (ws.status === 'RUNNING_MANAGED' && readyGeneration) {
-        const previousGeneration = this.readyPodGenerations.get(key)
-        this.readyPodGenerations.set(key, readyGeneration)
-        if (
-          previousGeneration !== undefined &&
-          previousGeneration !== readyGeneration &&
-          !this.store.getPendingStartup(key)
-        ) {
-          const startup = this.store.getStartup(id, startupPodType(repo, type))
-          if (startup) this.store.setPendingStartup(key, startup)
-        }
-      } else if (!exists) {
-        this.readyPodGenerations.delete(key)
-      }
-
-      // Once the dev session's pod is up, fire any queued startup command into
-      // the session (the initial dev pod) — one shot per start.
-      const pending = this.store.getPendingStartup(key)
-      if (ws.status === 'RUNNING_MANAGED' && sessionPods.some((pod) => pod.ready) && pending) {
-        if (this.devShellOpen(key)) {
-          this.stopShellWatch(key)
-          this.startupReadySince.delete(key)
-          this.store.setPendingStartup(key, undefined)
-          this.scheduleStartup(scoped, key, pending)
-        } else this.watchShell(id, key)
-      } else {
-        this.startupReadySince.delete(key)
-        this.stopShellWatch(key)
-      }
+      if (!exists && this.store.getStartupPod(key)) this.store.setStartupPod(key, undefined)
+      this.reconcileStartup(
+        id,
+        key,
+        scoped,
+        ws.status === 'RUNNING_MANAGED' && !ws.unreachable ? devSessionPods(ws.pods) : [],
+        this.store.getStartup(id, startupPodType(repo, type)),
+      )
       if (exists) {
         // The session is present (alive or a dead/crashed shell). Keep its pane
         // mirrored to the on-disk dev log — a forensic record of the session

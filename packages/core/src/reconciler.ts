@@ -100,8 +100,9 @@ export function parsePods(json: string): PodInfo[] {
 
   const pods: PodInfo[] = []
   for (const item of items) {
-    const meta = (item as { metadata?: { name?: string; deletionTimestamp?: string | null } })
-      .metadata
+    const meta = (
+      item as { metadata?: { name?: string; uid?: string; deletionTimestamp?: string | null } }
+    ).metadata
     // Lost nodes can retain ready container statuses after eviction begins.
     if (meta?.deletionTimestamp != null) continue
     const status = (item as { status?: Record<string, unknown> }).status ?? {}
@@ -151,6 +152,7 @@ export function parsePods(json: string): PodInfo[] {
       ...(spec?.nodeName ? { node: spec.nodeName } : {}),
       ...(imagePulled ? { imagePulled: true } : {}),
       name: meta?.name ?? '<unknown>',
+      ...(meta?.uid ? { uid: meta.uid } : {}),
       phase: typeof status.phase === 'string' ? status.phase : 'Unknown',
       ready,
       restartCount,

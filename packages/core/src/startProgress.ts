@@ -34,6 +34,19 @@ export function shellOpened(lines: string[]): boolean {
   return lines.some((line) => /\bOpening shell to\b/.test(cleanLine(line)))
 }
 
+/** The last pod DevSpace selected for this pane, even if the log also contains
+ *  banners from earlier connections. DevSpace 6 logs the container first. */
+export function shellPod(lines: string[]): string | undefined {
+  for (const line of [...lines].reverse()) {
+    const text = cleanLine(line)
+    const current = /\bOpening shell to [^: ]+:([a-z0-9.-]+) \(pod:container\)$/.exec(text)
+    if (current) return current[1]
+    const alternate = /\bOpening shell to pod:container ([a-z0-9.-]+):[^ ]+$/.exec(text)
+    if (alternate) return alternate[1]
+  }
+  return undefined
+}
+
 export function startProgress(pods: PodInfo[], lines: string[]): string[] {
   // Ignore the old Helm pods while DevSpace is creating its replacement.
   const dev = pods.filter((p) => p.name.includes('-devspace'))

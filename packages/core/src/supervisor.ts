@@ -335,6 +335,19 @@ export class Supervisor {
   }
 
   /** Run a one-off command inside the repo's dev session via `tmux send-keys`. */
+  startup(repo: Repo, command: string): Promise<RunResult> {
+    // Simple foreground commands have a directly comparable process argv.
+    // Leave compound shell commands intact so their shell semantics stay intact.
+    const argv = command.trim().split(/\s+/).join(' ')
+    const guarded = /^[\w./:@%+-]+(?: [\w./:@%+=,-]+)*$/.test(argv) && !command.includes('\n')
+    return this.exec(
+      repo,
+      guarded
+        ? `if ! ps -eo args= | grep -Fqx -- ${shellQuote(argv)}; then ${command}; fi`
+        : command,
+    )
+  }
+
   exec(repo: Repo, command: string): Promise<RunResult> {
     return this.runner('tmux', ['send-keys', '-t', exactPane(repo.session), command, 'Enter'])
   }
