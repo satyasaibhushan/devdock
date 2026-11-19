@@ -116,6 +116,7 @@ interface OverlayPlan {
   text: string
   imp?: GuidelinesImport
   patches: Patch[]
+  resources: DevResourceOverride[]
   /** The template mints an ECR pull secret on every config load. */
   pullSecrets: boolean
 }
@@ -145,7 +146,19 @@ function overlayPlan(repo: Repo): OverlayPlan | undefined {
   if (imp?.template === 'ui') patches.push(...noSyncWaitPatches(repoDoc))
   const targets = { ...(template?.dev ?? (imp ? { common: {} } : {})), ...repoDoc.dev }
   const settings = devPodSettings(repo)
+  const resources: DevResourceOverride[] = []
   for (const [name, target] of Object.entries(targets)) {
+    for (const group of ['requests', 'limits'] as const) {
+      for (const resource of ['cpu', 'memory'] as const) {
+        const quantity = settings.resources?.[group]?.[resource]
+        if (quantity === undefined) continue
+        if (typeof quantity !== 'string' || !quantity.trim())
+          throw new Error(
+            `Invalid dev pod resource quantity for ${repo.name}: ${group}.${resource}`,
+          )
+        resources.push({ target: name, group, resource, quantity })
+      }
+    }
     const podPatches: Patch[] = []
     if (settings.safeToEvict !== true) {
       podPatches.push({
@@ -165,10 +178,10 @@ function overlayPlan(repo: Repo): OverlayPlan | undefined {
       patches.push({ op: 'add', path, value: podPatches })
     }
   }
-  if (!imp && !patches.length) return undefined
+  if (!imp && !patches.length && !resources.length) return undefined
   const pullSecrets =
     !!imp && (template?.pullSecrets !== undefined || repoDoc.pullSecrets !== undefined)
-  return { text, imp, patches, pullSecrets }
+  return { text, imp, patches, resources, pullSecrets }
 }
 
 type ConfigShape = {
@@ -249,7 +262,21 @@ function preferredNodePatch(nodes: string[]): Patch {
 }
 
 /** Workload names match the scoped name shown in the devspace config. */
-function devPodSettings(repo: Repo): { safeToEvict?: boolean } {
+interface DevResourceOverride {
+  target: string
+  group: 'requests' | 'limits'
+  resource: 'cpu' | 'memory'
+  quantity: string
+}
+
+interface DevPodSettings {
+  safeToEvict?: boolean
+  resources?: Partial<
+    Record<DevResourceOverride['group'], Partial<Record<DevResourceOverride['resource'], string>>>
+  >
+}
+
+function devPodSettings(repo: Repo): DevPodSettings {
   const file = join(process.env.DEVDOCK_STATE_DIR ?? join(homedir(), '.devdock'), 'dev-pods.json')
   const text = readOptional(file)
   return text === undefined ? {} : (JSON.parse(text)[repo.name] ?? {})
@@ -387,6 +414,9 @@ function writeOverlay(alias: string, target: string, plan: OverlayPlan): void {
     if (!ours) throw new Error(`Refusing to replace workload config ${alias}`)
   }
   const doc = parseDocument(plan.text)
+  for (const { target, group, resource, quantity } of plan.resources) {
+    doc.setIn(['dev', target, 'resources', group, resource], quantity)
+  }
   if (plan.imp) {
     const cache = guidelinesCacheDir(plan.imp.git, plan.imp.branch)
     const local = join(cache, plan.imp.subPath)

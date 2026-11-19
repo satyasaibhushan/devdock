@@ -99,6 +99,47 @@ describe('workload config isolation', () => {
     }
   })
 
+  it('overrides only the resources configured for the scoped workload', () => {
+    const repo = fixture()
+    const source = `version: v2beta1
+name: service
+dev:
+  common:
+    imageSelector: app
+    resources:
+      requests: { cpu: 1, memory: 1Gi }
+      limits: { cpu: 2, memory: 2Gi }
+`
+    writeFileSync(repo.configPath, source)
+    const config = join(process.env.DEVDOCK_STATE_DIR as string, 'dev-pods.json')
+    writeFileSync(
+      config,
+      JSON.stringify({
+        'service-api': {
+          safeToEvict: true,
+          resources: { requests: { cpu: '1500m' }, limits: { memory: '4Gi' } },
+        },
+      }),
+    )
+    try {
+      const api = scopeRepo(repo, 'api')
+      const worker = scopeRepo(repo, 'worker')
+      prepareWorkloadConfig(api)
+      prepareWorkloadConfig(worker)
+      const resources = (target: Repo) =>
+        parseYaml(readFileSync(workloadConfigPath(target), 'utf8')).dev.common.resources
+      expect(devdockConfigPath(api)).toBe(workloadConfigPath(api))
+      expect(resources(api)).toEqual({
+        requests: { cpu: '1500m', memory: '1Gi' },
+        limits: { cpu: 2, memory: '4Gi' },
+      })
+      expect(resources(worker)).toEqual(parseYaml(source).dev.common.resources)
+      expect(readFileSync(repo.configPath, 'utf8')).toBe(source)
+    } finally {
+      rmSync(config)
+    }
+  })
+
   it('refuses to overwrite an existing file', () => {
     const repo = scopeRepo(fixture(), 'api')
     writeFileSync(workloadConfigPath(repo), 'user file')

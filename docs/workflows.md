@@ -114,3 +114,19 @@ An annotation supplied by the workload itself takes precedence.
   "example-api": { "safeToEvict": true }
 }
 ```
+
+Use `resources.requests` and `resources.limits` to override individual CPU and
+memory quantities for a workload. Use Kubernetes quantity strings. Any
+omitted field keeps the value from the repo or its DevSpace import.
+
+```json
+{
+  "career-service-agents-api": {
+    "resources": {
+      "limits": { "memory": "4Gi" }
+    }
+  }
+}
+```
+
+DevDock reads the file on each launch. Start a new dev session to apply edits.
