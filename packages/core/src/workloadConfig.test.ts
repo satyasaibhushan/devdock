@@ -68,6 +68,37 @@ describe('workload config isolation', () => {
       execFileSync('git', ['status', '--porcelain'], { cwd: base.path, encoding: 'utf8' }),
     ).toBe(before)
   })
+  it('protects dev pod templates by default and honors a workload opt-out', () => {
+    const repo = scopeRepo(fixture(), 'api')
+    writeFileSync(
+      repo.configPath,
+      'version: v2beta1\nname: service\ndev:\n  api:\n    imageSelector: app\n',
+    )
+    prepareWorkloadConfig(repo)
+    const alias = workloadConfigPath(repo)
+    expect(parseYaml(readFileSync(alias, 'utf8')).profiles[0].patches).toEqual([
+      {
+        op: 'add',
+        path: 'dev.api.patches',
+        value: [
+          expect.objectContaining({
+            op: 'add',
+            value: { 'cluster-autoscaler.kubernetes.io/safe-to-evict': 'false' },
+          }),
+        ],
+      },
+    ])
+    const config = join(process.env.DEVDOCK_STATE_DIR as string, 'dev-pods.json')
+    writeFileSync(config, JSON.stringify({ 'service-api': { safeToEvict: true } }))
+    try {
+      prepareWorkloadConfig(repo)
+      expect(readlinkSync(alias)).toBe('devspace.yaml')
+      expect(devspaceCommand(repo, 'dev')).not.toContain('-p devdock')
+    } finally {
+      rmSync(config)
+    }
+  })
+
   it('refuses to overwrite an existing file', () => {
     const repo = scopeRepo(fixture(), 'api')
     writeFileSync(workloadConfigPath(repo), 'user file')
@@ -131,9 +162,10 @@ imports:
     expect(doc.functions.prepare_local_env).toBe(
       'file="$1"\nsed -i.devdock-bak -r "s~a~b~" $file\nrm -f "$1.devdock-bak"',
     )
-    // non-ui has no image tuning yet, so there is no profile to activate.
-    expect(doc.profiles).toBeUndefined()
-    expect(devspaceCommand(repo, 'dev')).not.toContain('-p devdock')
+    expect(doc.profiles[0].patches).toEqual([
+      expect.objectContaining({ path: 'dev.common.patches' }),
+    ])
+    expect(devspaceCommand(repo, 'dev')).toContain('-p devdock')
     expect(devspaceCommand(repo, 'dev')).toContain('DEVSPACE_CONFIG=')
   })
   it('seeds an own-image replica build from the parent cache', () => {
@@ -216,8 +248,8 @@ deployments:
     )
   })
   it('softly prefers nodes that already hold the image', () => {
-    const affinity = (repo: Repo) =>
-      profile(repo, 'devdock').patches.find(
+    const podPatches = (repo: Repo) =>
+      profile(repo, 'devdock').patches.filter(
         (p: { path: string }) => p.path === 'dev.common.patches',
       )
     // The repo already patches its dev pod: append to that list.
@@ -228,7 +260,9 @@ deployments:
       preferNodes: ['node-a', 'node-a', 'node-b'],
     }
     prepareWorkloadConfig(withList)
-    const appended = affinity(withList)
+    const appended = podPatches(withList).find(
+      (p: { value: { path: string } }) => p.value.path === 'spec.affinity',
+    )
     expect(Array.isArray(appended.value)).toBe(false)
     expect(
       appended.value.value.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution[0]
@@ -240,11 +274,15 @@ deployments:
       preferNodes: ['node-a'],
     }
     prepareWorkloadConfig(withoutList)
-    expect(Array.isArray(affinity(withoutList).value)).toBe(true)
+    expect(podPatches(withoutList)[0].value).toContainEqual(
+      expect.objectContaining({ path: 'spec.affinity' }),
+    )
     // Nothing known: no preference.
     const none = uiRepo('dev:\n  common:\n    workingDir: /app\n')
     prepareWorkloadConfig(none)
-    expect(affinity(none)).toBeUndefined()
+    expect(podPatches(none)[0].value).not.toContainEqual(
+      expect.objectContaining({ path: 'spec.affinity' }),
+    )
   })
   it('reuses the pull secret for dev and purge only after a recent deploy', () => {
     const repo = { ...uiRepo(), namespace: 'team' }
