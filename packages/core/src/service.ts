@@ -10,6 +10,7 @@ import { type AwsCredential, AwsCreds } from './awsCreds.js'
 import { CrashWatch } from './crashWatch.js'
 import { environmentWarning } from './environmentWarning.js'
 import { type RunResult, run, runStream, spawnStream } from './exec.js'
+import { helmReleaseNames } from './helmRelease.js'
 import { type LifecycleAction, lifecyclePlan } from './lifecycle.js'
 import { decodeCursor, encodeCursor, readFileSlice } from './logQuery.js'
 import { LogHub, LogTailer, type SpawnFn, cleanLine } from './logTailer.js'
@@ -1113,34 +1114,115 @@ export class Service {
   }
 
   async stop(id: string, workload?: string): Promise<RunResult> {
-    const { repo, key } = this.scoped(id, workload)
+    const { repo: scoped, key } = this.scoped(id, workload)
     this.operationStage(id, workload, 'stopping')
     const denied = await this.ensureAuth(key)
     if (denied) return denied
-    await this.claimOwnership(repo)
+    const namespace = scoped.namespace || (await this.contextNamespace()) || 'default'
+    const repo = { ...scoped, namespace }
+    const sessions = await this.supervisor.sessionStates()
+    const shared = await this.sharedRelease(
+      key,
+      namespace,
+      sessions,
+      async () => {
+        const names = await this.releaseNames(repo)
+        const type = repo.varDefaults?.WORKLOAD_TYPE ?? repo.workloadType
+        // The non-api fallback also uninstalls the release named after the project.
+        return type && type !== 'api' ? [...names, repo.name] : names
+      },
+      repo.name,
+    )
+    if (!shared) await this.claimOwnership(repo)
+    this.pausedSessions.add(key)
+    this.sessionGenerations.set(key, (this.sessionGenerations.get(key) ?? 0) + 1)
     this.recordLifecycle(id, workload)
     this.noPodsSince.delete(key)
     this.emptyDevRollouts.delete(key)
     this.reconnects.delete(key)
     this.tailers.get(key)?.stop()
     this.tailers.delete(key)
-    const r = await this.narrate(key, verbLabel(repo, 'purge'), (onLine) =>
-      this.supervisor.kill(repo, onLine),
-    )
-    if (r.code === 0) {
-      await this.uninstallLeftoverRelease(repo, key)
-      // Nothing of this workload runs any more, so any instance may deploy it next.
-      await this.releaseOwnership(repo).catch((error: unknown) =>
-        this.hubFor(key).push(
-          `! ownership kept: ${error instanceof Error ? error.message : String(error)}`,
-        ),
+    let r: RunResult
+    if (shared) {
+      const message = `Skipping purge of Helm release ${shared.release} in ${namespace}: ${shared.workload} is active or holds its deployment claim.`
+      this.hubFor(key).push(message)
+      const ours = !(await this.claimedElsewhere(repo))
+      if (!shared.sameProject && ours && sessions.has(repo.session)) {
+        // DevSpace resets pods recorded for this project without running the purge pipeline.
+        r = await this.narrate(key, verbLabel(repo, 'reset pods'), (onLine) =>
+          this.supervisor.clear(repo, onLine),
+        )
+      } else {
+        // Worktrees of one project can share both the replacement pod and its lock.
+        await this.supervisor.abandonSession(repo)
+        r = { code: 0, stdout: message, stderr: '' }
+      }
+    } else {
+      r = await this.narrate(key, verbLabel(repo, 'purge'), (onLine) =>
+        this.supervisor.kill(repo, onLine),
       )
+      if (r.code === 0) {
+        await this.uninstallLeftoverRelease(repo, key)
+        // Nothing of this workload runs any more, so any instance may deploy it next.
+        await this.releaseOwnership(repo).catch((error: unknown) =>
+          this.hubFor(key).push(
+            `! ownership kept: ${error instanceof Error ? error.message : String(error)}`,
+          ),
+        )
+      }
     }
     this.piped.delete(key)
     this.store.setSessionNamespace(key, undefined) // session gone → pin released
     this.store.setPendingStartup(key, undefined) // canceled start must not fire later
     await this.reconcileOne(id)
     return r
+  }
+
+  private async releaseNames(repo: Repo): Promise<string[]> {
+    const printed = await this.supervisor.print(repo)
+    if (printed.code !== 0) throw new Error(`Cannot resolve Helm releases for ${repo.id}`)
+    const names = helmReleaseNames(printed.stdout)
+    return names.length ? names : [repo.name]
+  }
+
+  private async sharedRelease(
+    key: string,
+    namespace: string,
+    sessions: Map<string, SessionState>,
+    releaseNames: () => Promise<string[]>,
+    project?: string,
+  ): Promise<{ release: string; workload: string; sameProject: boolean } | undefined> {
+    const candidates = []
+    for (const [id, base] of this.repos) {
+      if (id === key) continue
+      for (const type of workloadTypes(base)) {
+        const candidateKey = workloadKey(id, type)
+        if (candidateKey === key) continue
+        const candidate = this.pinned(scopeRepo(base, type), candidateKey)
+        if ((candidate.namespace || namespace) !== namespace) continue
+        candidates.push({ candidate, candidateKey })
+      }
+    }
+    if (!candidates.length) return
+    const owners = await this.ownership?.owners(namespace, true)
+    const active = candidates.filter(({ candidate }) => {
+      const session = sessions.get(candidate.session)
+      const holder = owners?.[candidate.name]
+      // Our claim is keyed by project name, so aliases with the same name
+      // can only be distinguished by their local session.
+      return (
+        (session && !session.dead) ||
+        (holder && !(candidate.name === project && holder === this.instanceId))
+      )
+    })
+    if (!active.length) return
+    const releases = await releaseNames()
+    const sameProject = active.some(({ candidate }) => candidate.name === project)
+    for (const { candidate, candidateKey } of active) {
+      const names = await this.releaseNames({ ...candidate, namespace })
+      const release = names.find((name) => releases.includes(name))
+      if (release) return { release, workload: candidateKey, sameProject }
+    }
   }
 
   /** The shared purge pipeline removes a non-api workload with
@@ -1680,6 +1762,18 @@ export class Service {
       // Older records lack `releases`; their config dirs carry the names.
       const releases = rec.releases ?? rec.configPaths.map((cfg) => basename(dirname(cfg)))
       for (const release of releases) {
+        const shared = await this.sharedRelease(
+          id,
+          rec.namespace,
+          await this.supervisor.sessionStates(),
+          async () => [release],
+        )
+        if (shared) {
+          this.hubFor(id).push(
+            `Skipping uninstall of Helm release ${release} in ${rec.namespace}: ${shared.workload} is active or holds its deployment claim.`,
+          )
+          continue
+        }
         await this.kubectl('helm', ['uninstall', release, '-n', rec.namespace]).catch(
           () => undefined,
         )

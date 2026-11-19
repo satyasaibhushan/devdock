@@ -80,6 +80,99 @@ function fakeStreamSpawner() {
 }
 
 describe('Service', () => {
+  it.each([
+    {
+      label: 'a live worktree',
+      peerName: 'svc-a',
+      namespace: 'ns',
+      release: 'shared-api',
+      live: true,
+      keep: true,
+    },
+    {
+      label: 'a claimed deployment',
+      peerName: 'different-project',
+      namespace: 'ns',
+      release: 'shared-api',
+      claimed: true,
+      keep: true,
+    },
+    {
+      label: 'a live unrelated release',
+      peerName: 'different-project',
+      namespace: 'ns',
+      release: 'other-api',
+      live: true,
+      keep: false,
+    },
+    {
+      label: 'the same release in another namespace',
+      peerName: 'svc-a',
+      namespace: 'other',
+      release: 'shared-api',
+      live: true,
+      keep: false,
+    },
+    {
+      label: 'an inactive worktree',
+      peerName: 'svc-a',
+      namespace: 'ns',
+      release: 'shared-api',
+      keep: false,
+    },
+  ])(
+    'stops a workload beside $label',
+    async ({ peerName, namespace, release, live, claimed, keep }) => {
+      const config = (name: string, ns: string, releaseName: string) =>
+        `name: ${name}\nnamespace: ${ns}\nvars:\n  WORKLOAD_TYPE: api\ndeployments:\n  api:\n    helm:\n      releaseName: ${releaseName}\n`
+      writeFileSync(join(root, 'svc-a', 'devspace.yaml'), config('svc-a', 'ns', 'shared-api'))
+      mkdirSync(join(root, 'worktree'))
+      writeFileSync(join(root, 'worktree', 'devspace.yaml'), config(peerName, namespace, release))
+
+      const base = cannedRunner('{"items":[]}', false)
+      let localSession = true
+      const owner = 'aaaaaaaa-1111-4111-8111-111111111111'
+      const claim = `devdock-owner-${createHash('sha256').update(peerName).digest('hex').slice(0, 32)}`
+      const runner = vi.fn(async (cmd: string, args: string[]) => {
+        if (cmd === 'tmux' && args[0] === 'list-panes')
+          return {
+            code: 0,
+            stdout:
+              (localSession ? 'devdock-svc-a 0\n' : '') + (live ? 'devdock-worktree 0\n' : ''),
+            stderr: '',
+          }
+        if (cmd === 'tmux' && args[0] === 'kill-session' && args[2] === '=devdock-svc-a')
+          localSession = false
+        if (cmd === 'kubectl' && args[0] === 'get' && args[1] === 'configmaps')
+          return { code: 0, stdout: claimed ? `${claim}\t${peerName}\t${owner}\n` : '', stderr: '' }
+        if (cmd === 'kubectl' && args[0] === 'get' && args[1] === 'configmap')
+          return { code: 0, stdout: '', stderr: '' }
+        return base(cmd, args)
+      })
+      const svc = new Service(
+        {
+          roots: [root],
+          stateFile,
+          instanceId: claimed ? 'bbbbbbbb-2222-4222-8222-222222222222' : undefined,
+        },
+        { runner, streamSpawner: fakeStreamSpawner().spawner },
+      )
+      svc.rescan()
+
+      expect((await svc.stop('svc-a')).code).toBe(0)
+      expect(localSession).toBe(false)
+      expect(
+        runner.mock.calls.some(
+          ([cmd, args]) => cmd === loginShell && args[1]?.includes('devspace purge'),
+        ),
+      ).toBe(!keep)
+      expect(
+        svc.logs('svc-a').some((line) => line.includes('shared-api') && line.includes('worktree')),
+      ).toBe(keep)
+      expect(runner).not.toHaveBeenCalledWith('tmux', ['kill-session', '-t', '=devdock-worktree'])
+    },
+  )
+
   it('starts and rescans with duplicates while retaining the registered path across restarts', async () => {
     const known = join(root, 'svc-a')
     const ignored = join(root, 'a', 'svc-a')
@@ -2204,6 +2297,27 @@ describe('Service replicas', () => {
     ])
     expect(svc.listReplicas()).toEqual([])
     expect(svc.listRepos().some((r) => r.id === 'parent-r1')).toBe(false)
+  })
+
+  it('keeps a live shared release when deleting a replica with a missing checkout', async () => {
+    const id = 'missing-replica'
+    const path = join(root, '.devdock-missing-replica')
+    new StateStore(stateFile).addReplica({
+      id,
+      parentId: 'svc-a',
+      path,
+      branch: 'feature',
+      configPaths: [join(path, 'devspace.yaml')],
+      releases: ['svc-a', 'unused-release'],
+      namespace: 'ns',
+      createdAt: Date.now(),
+    })
+    const { svc, runner } = newService(cannedRunner('{"items":[]}', true))
+    await svc.deleteReplica(id)
+
+    expect(runner).not.toHaveBeenCalledWith('helm', ['uninstall', 'svc-a', '-n', 'ns'])
+    expect(runner).toHaveBeenCalledWith('helm', ['uninstall', 'unused-release', '-n', 'ns'])
+    expect(svc.listReplicas()).toEqual([])
   })
 
   it('stop uninstalls a non-api release the purge pipeline left behind, never the api one', async () => {

@@ -15,9 +15,9 @@ export class DeploymentOwnership {
   private snapshots = new Map<string, { expires: number; value: Promise<Record<string, string>> }>()
 
   /** Read claims without acquiring them. Cache and coalesce namespace reads for UI polling. */
-  owners(namespace: string): Promise<Record<string, string>> {
+  owners(namespace: string, fresh = false): Promise<Record<string, string>> {
     const cached = this.snapshots.get(namespace)
-    if (cached && cached.expires > Date.now()) return cached.value
+    if (!fresh && cached && cached.expires > Date.now()) return cached.value
     const value = this.runner(
       'kubectl',
       [
