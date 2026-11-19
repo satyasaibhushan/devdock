@@ -116,7 +116,7 @@ interface OverlayPlan {
   text: string
   imp?: GuidelinesImport
   patches: Patch[]
-  resources: DevResourceOverride[]
+  resourceOverrides: Record<string, { resources: DevResources }>
   /** The template mints an ECR pull secret on every config load. */
   pullSecrets: boolean
 }
@@ -146,19 +146,10 @@ function overlayPlan(repo: Repo): OverlayPlan | undefined {
   if (imp?.template === 'ui') patches.push(...noSyncWaitPatches(repoDoc))
   const targets = { ...(template?.dev ?? (imp ? { common: {} } : {})), ...repoDoc.dev }
   const settings = devPodSettings(repo)
-  const resources: DevResourceOverride[] = []
-  for (const [name, target] of Object.entries(targets)) {
-    for (const group of ['requests', 'limits'] as const) {
-      for (const resource of ['cpu', 'memory'] as const) {
-        const quantity = settings.resources?.[group]?.[resource]
-        if (quantity === undefined) continue
-        if (typeof quantity !== 'string' || !quantity.trim())
-          throw new Error(
-            `Invalid dev pod resource quantity for ${repo.name}: ${group}.${resource}`,
-          )
-        resources.push({ target: name, group, resource, quantity })
-      }
-    }
+  const resourceOverrides: OverlayPlan['resourceOverrides'] = {}
+  const resources = readResourceOverrides(settings.resources, repo.name)
+  for (const name of Object.keys(targets)) {
+    if (Object.keys(resources).length) resourceOverrides[name] = { resources }
     const podPatches: Patch[] = []
     if (settings.safeToEvict !== true) {
       podPatches.push({
@@ -171,23 +162,24 @@ function overlayPlan(repo: Repo): OverlayPlan | undefined {
       podPatches.push(preferredNodePatch(repo.preferNodes))
     if (!podPatches.length) continue
 
-    const path = `dev.${name}.patches`
-    if (Array.isArray(target?.patches ?? template?.dev?.[name]?.patches)) {
-      patches.push(...podPatches.map((value) => ({ op: 'add', path, value })))
-    } else {
-      patches.push({ op: 'add', path, value: podPatches })
-    }
+    // DevSpace applies profiles after resolving imports. Check the effective
+    // target before creating or appending to its patch list.
+    const path = `dev.${name}`
+    patches.push(
+      ...podPatches.map((value) => ({ op: 'add', path: `${path}[?(@.patches)].patches`, value })),
+      { op: 'add', path: `${path}[?(!@.patches)].patches`, value: podPatches },
+    )
   }
-  if (!imp && !patches.length && !resources.length) return undefined
+  if (!imp && !patches.length && !Object.keys(resourceOverrides).length) return undefined
   const pullSecrets =
     !!imp && (template?.pullSecrets !== undefined || repoDoc.pullSecrets !== undefined)
-  return { text, imp, patches, resources, pullSecrets }
+  return { text, imp, patches, resourceOverrides, pullSecrets }
 }
 
 type ConfigShape = {
   pullSecrets?: unknown
   deployments?: Record<string, { helm?: { chart?: { git?: unknown } } }>
-  dev?: Record<string, { sync?: unknown[]; patches?: unknown[] }>
+  dev?: Record<string, { sync?: unknown[] }>
 }
 
 function parseYamlSafe(text: string | undefined): unknown {
@@ -238,8 +230,7 @@ function noSyncWaitPatches(repo: ConfigShape): Patch[] {
 }
 
 /** Softly prefer nodes that already pulled the image: a dev pod on a fresh node
- *  paid a 25-40s pull. Appends to the dev target's pod patches, creating the
- *  list when neither the repo nor the template has one. */
+ *  paid a 25-40s pull. */
 function preferredNodePatch(nodes: string[]): Patch {
   return {
     op: 'add',
@@ -261,25 +252,37 @@ function preferredNodePatch(nodes: string[]): Patch {
   }
 }
 
-/** Workload names match the scoped name shown in the devspace config. */
-interface DevResourceOverride {
-  target: string
-  group: 'requests' | 'limits'
-  resource: 'cpu' | 'memory'
-  quantity: string
-}
+type DevResources = Partial<
+  Record<'requests' | 'limits', Partial<Record<'cpu' | 'memory', string>>>
+>
 
 interface DevPodSettings {
   safeToEvict?: boolean
-  resources?: Partial<
-    Record<DevResourceOverride['group'], Partial<Record<DevResourceOverride['resource'], string>>>
-  >
+  resources?: DevResources
 }
 
+/** Workload names match the scoped name shown in the devspace config. */
 function devPodSettings(repo: Repo): DevPodSettings {
   const file = join(process.env.DEVDOCK_STATE_DIR ?? join(homedir(), '.devdock'), 'dev-pods.json')
   const text = readOptional(file)
-  return text === undefined ? {} : (JSON.parse(text)[repo.name] ?? {})
+  if (text === undefined) return {}
+  const settings = JSON.parse(text) as Record<string, DevPodSettings>
+  return Object.hasOwn(settings, repo.name) ? (settings[repo.name] ?? {}) : {}
+}
+
+function readResourceOverrides(overrides: DevResources | undefined, name: string): DevResources {
+  const resources: DevResources = {}
+  for (const group of ['requests', 'limits'] as const) {
+    for (const resource of ['cpu', 'memory'] as const) {
+      const quantity = overrides?.[group]?.[resource]
+      if (quantity === undefined) continue
+      if (typeof quantity !== 'string' || !quantity.trim())
+        throw new Error(`Invalid dev pod resource quantity for ${name}: ${group}.${resource}`)
+      resources[group] ??= {}
+      resources[group][resource] = quantity
+    }
+  }
+  return resources
 }
 
 function helmChartsDir(): string {
@@ -335,7 +338,8 @@ export function canReusePullSecret(repo: Repo): boolean {
 
 /** Whether the overlay carries a `devdock` profile to activate. */
 export function hasDevdockProfile(repo: Repo): boolean {
-  return (overlayPlan(repo)?.patches.length ?? 0) > 0
+  const plan = overlayPlan(repo)
+  return !!plan && (plan.patches.length > 0 || Object.keys(plan.resourceOverrides).length > 0)
 }
 
 /** The config devdock points DEVSPACE_CONFIG at, or undefined for the repo's own. */
@@ -414,9 +418,6 @@ function writeOverlay(alias: string, target: string, plan: OverlayPlan): void {
     if (!ours) throw new Error(`Refusing to replace workload config ${alias}`)
   }
   const doc = parseDocument(plan.text)
-  for (const { target, group, resource, quantity } of plan.resources) {
-    doc.setIn(['dev', target, 'resources', group, resource], quantity)
-  }
   if (plan.imp) {
     const cache = guidelinesCacheDir(plan.imp.git, plan.imp.branch)
     const local = join(cache, plan.imp.subPath)
@@ -438,8 +439,11 @@ function writeOverlay(alias: string, target: string, plan: OverlayPlan): void {
     if (isSeq(doc.get('profiles'))) doc.addIn(['profiles'], cached)
     else doc.set('profiles', doc.createNode([cached]))
   }
-  if (plan.patches.length > 0) {
-    const profile = doc.createNode({ name: DEVDOCK_PROFILE, patches: plan.patches })
+  const merge = Object.keys(plan.resourceOverrides).length
+    ? { dev: plan.resourceOverrides }
+    : undefined
+  if (plan.patches.length > 0 || merge) {
+    const profile = doc.createNode({ name: DEVDOCK_PROFILE, merge, patches: plan.patches })
     if (isSeq(doc.get('profiles'))) doc.addIn(['profiles'], profile)
     else doc.set('profiles', doc.createNode([profile]))
   }

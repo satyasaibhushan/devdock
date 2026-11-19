@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import {
   lstatSync,
   mkdirSync,
@@ -12,7 +12,7 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { parse as parseYaml } from 'yaml'
+import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
 import { devspaceCommand } from './supervisor.js'
 import type { Repo } from './types.js'
 import {
@@ -76,18 +76,16 @@ describe('workload config isolation', () => {
     )
     prepareWorkloadConfig(repo)
     const alias = workloadConfigPath(repo)
-    expect(parseYaml(readFileSync(alias, 'utf8')).profiles[0].patches).toEqual([
-      {
-        op: 'add',
-        path: 'dev.api.patches',
-        value: [
-          expect.objectContaining({
-            op: 'add',
-            value: { 'cluster-autoscaler.kubernetes.io/safe-to-evict': 'false' },
-          }),
-        ],
-      },
-    ])
+    expect(parseYaml(readFileSync(alias, 'utf8')).profiles[0].patches).toContainEqual({
+      op: 'add',
+      path: 'dev.api[?(!@.patches)].patches',
+      value: [
+        expect.objectContaining({
+          op: 'add',
+          value: { 'cluster-autoscaler.kubernetes.io/safe-to-evict': 'false' },
+        }),
+      ],
+    })
     const config = join(process.env.DEVDOCK_STATE_DIR as string, 'dev-pods.json')
     writeFileSync(config, JSON.stringify({ 'service-api': { safeToEvict: true } }))
     try {
@@ -126,14 +124,16 @@ dev:
       const worker = scopeRepo(repo, 'worker')
       prepareWorkloadConfig(api)
       prepareWorkloadConfig(worker)
-      const resources = (target: Repo) =>
-        parseYaml(readFileSync(workloadConfigPath(target), 'utf8')).dev.common.resources
+      const generated = (target: Repo) =>
+        parseYaml(readFileSync(workloadConfigPath(target), 'utf8'))
       expect(devdockConfigPath(api)).toBe(workloadConfigPath(api))
-      expect(resources(api)).toEqual({
-        requests: { cpu: '1500m', memory: '1Gi' },
-        limits: { cpu: 2, memory: '4Gi' },
+      expect(devspaceCommand(api, 'dev')).toContain('-p devdock')
+      expect(generated(api).profiles[0].merge.dev.common.resources).toEqual({
+        requests: { cpu: '1500m' },
+        limits: { memory: '4Gi' },
       })
-      expect(resources(worker)).toEqual(parseYaml(source).dev.common.resources)
+      expect(generated(worker).profiles[0].merge).toBeUndefined()
+      expect(generated(api).dev.common.resources).toEqual(parseYaml(source).dev.common.resources)
       expect(readFileSync(repo.configPath, 'utf8')).toBe(source)
     } finally {
       rmSync(config)
@@ -203,12 +203,114 @@ imports:
     expect(doc.functions.prepare_local_env).toBe(
       'file="$1"\nsed -i.devdock-bak -r "s~a~b~" $file\nrm -f "$1.devdock-bak"',
     )
-    expect(doc.profiles[0].patches).toEqual([
-      expect.objectContaining({ path: 'dev.common.patches' }),
-    ])
+    expect(doc.profiles[0].patches).toContainEqual(
+      expect.objectContaining({ path: 'dev.common[?(!@.patches)].patches' }),
+    )
     expect(devspaceCommand(repo, 'dev')).toContain('-p devdock')
     expect(devspaceCommand(repo, 'dev')).toContain('DEVSPACE_CONFIG=')
   })
+  it.skipIf(spawnSync('devspace', ['version']).status !== 0)(
+    'loads an inherited dev target with its existing patches and partial resource overrides',
+    () => {
+      const repo = { ...fixture(), name: 'imported-api' }
+      writeFileSync(repo.configPath, uiConfig.replace('/ui', '/non-ui'))
+      const local = join(
+        deps,
+        'git-github-com-vmockinc-guidelines-git-master',
+        'devspace',
+        'non-ui',
+      )
+      mkdirSync(local, { recursive: true })
+      writeFileSync(
+        join(local, 'devspace.yaml'),
+        `version: v2beta1
+dev:
+  common:
+    imageSelector: app
+    resources:
+      requests: { cpu: "1", memory: 1Gi }
+      limits: { cpu: "2", memory: 2Gi }
+    patches:
+      - op: add
+        path: metadata.labels
+        value: { app: api }
+`,
+      )
+      const settings = join(process.env.DEVDOCK_STATE_DIR as string, 'dev-pods.json')
+      writeFileSync(
+        settings,
+        JSON.stringify({
+          'imported-api': { resources: { limits: { memory: '4Gi' } } },
+        }),
+      )
+      const print = (config: string) =>
+        parseYaml(
+          execFileSync('devspace', ['print', '--skip-info', '-p', 'devdock'], {
+            cwd: repo.path,
+            env: { ...process.env, DEVSPACE_CONFIG: config },
+            encoding: 'utf8',
+          }),
+        )
+      try {
+        prepareWorkloadConfig(repo)
+        const common = print(workloadConfigPath(repo)).dev.common
+        expect(common.resources).toEqual({
+          requests: { cpu: '1', memory: '1Gi' },
+          limits: { cpu: '2', memory: '4Gi' },
+        })
+        expect(common.patches[0].path).toBe('metadata.labels')
+        writeFileSync(
+          repo.configPath,
+          'version: v2beta1\nname: standalone\ndev:\n  common:\n    imageSelector: app\n',
+        )
+        const standalone = { ...repo, preferNodes: ['node-a'] }
+        prepareWorkloadConfig(standalone)
+        expect(print(workloadConfigPath(standalone)).dev.common.patches).toEqual([
+          common.patches[1],
+          expect.objectContaining({ path: 'spec.affinity' }),
+        ])
+        const patch = common.patches[1]
+        const key = 'cluster-autoscaler.kubernetes.io/safe-to-evict'
+        // Exercise the generated pod-template patch against DevSpace's real
+        // patch engine. Helm values let print carry the PodTemplateSpec shape.
+        const podShape = join(repo.path, 'pod-shape.yaml')
+        for (const annotations of [undefined, { other: 'existing' }, { [key]: 'true' }]) {
+          writeFileSync(
+            podShape,
+            stringifyYaml({
+              version: 'v2beta1',
+              name: 'probe',
+              deployments: {
+                app: {
+                  helm: {
+                    chart: { name: './chart' },
+                    values: { template: { metadata: { annotations } } },
+                  },
+                },
+              },
+              profiles: [
+                {
+                  name: 'devdock',
+                  patches: [
+                    { ...patch, path: `deployments.app.helm.values.template.${patch.path}` },
+                  ],
+                },
+              ],
+            }),
+          )
+          expect(print(podShape).deployments.app.helm.values.template.metadata.annotations).toEqual(
+            {
+              [key]: 'false',
+              ...annotations,
+            },
+          )
+        }
+      } finally {
+        rmSync(settings)
+      }
+    },
+  )
+
   it('seeds an own-image replica build from the parent cache', () => {
     const repo = fixture()
     writeFileSync(repo.configPath, `${uiConfig}vars:\n  DEVDOCK_CACHE_SEED: ns-web\n`)
@@ -290,40 +392,22 @@ deployments:
   })
   it('softly prefers nodes that already hold the image', () => {
     const podPatches = (repo: Repo) =>
-      profile(repo, 'devdock').patches.filter(
-        (p: { path: string }) => p.path === 'dev.common.patches',
+      profile(repo, 'devdock').patches.filter((p: { path: string }) =>
+        p.path.startsWith('dev.common['),
       )
-    // The repo already patches its dev pod: append to that list.
-    const withList = {
-      ...uiRepo(
-        'dev:\n  common:\n    patches:\n      - op: replace\n        path: spec.nodeSelector\n        value: {}\n',
-      ),
+    const repo = {
+      ...uiRepo('dev:\n  common:\n    workingDir: /app\n'),
       preferNodes: ['node-a', 'node-a', 'node-b'],
     }
-    prepareWorkloadConfig(withList)
-    const appended = podPatches(withList).find(
+    prepareWorkloadConfig(repo)
+    const appended = podPatches(repo).find(
       (p: { value: { path: string } }) => p.value.path === 'spec.affinity',
     )
-    expect(Array.isArray(appended.value)).toBe(false)
     expect(
       appended.value.value.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution[0]
         .preference.matchExpressions[0].values,
     ).toEqual(['node-a', 'node-b'])
-    // No list anywhere: create it.
-    const withoutList = {
-      ...uiRepo('dev:\n  common:\n    workingDir: /app\n'),
-      preferNodes: ['node-a'],
-    }
-    prepareWorkloadConfig(withoutList)
-    expect(podPatches(withoutList)[0].value).toContainEqual(
-      expect.objectContaining({ path: 'spec.affinity' }),
-    )
-    // Nothing known: no preference.
-    const none = uiRepo('dev:\n  common:\n    workingDir: /app\n')
-    prepareWorkloadConfig(none)
-    expect(podPatches(none)[0].value).not.toContainEqual(
-      expect.objectContaining({ path: 'spec.affinity' }),
-    )
+    expect(podPatches(repo).at(-1).value).toContainEqual(appended.value)
   })
   it('reuses the pull secret for dev and purge only after a recent deploy', () => {
     const repo = { ...uiRepo(), namespace: 'team' }
