@@ -11,8 +11,9 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { dirname } from 'node:path'
+import type { ReplicaRoute } from './replicaRoutes.js'
 import type { Sandbox } from './sandboxes.js'
-import type { RepoStatus, TermMode } from './types.js'
+import type { ReplicaRouteStatus, RepoStatus, TermMode } from './types.js'
 
 /** A persisted read-write grant for a repo's terminal (spec §2, §8). */
 export interface Grant {
@@ -53,6 +54,11 @@ export interface ReplicaRecord {
    *  it sticks). */
   ingressApplied?: boolean
   ingressName?: string
+  route?: ReplicaRoute
+}
+
+export interface ReplicaInfo extends Omit<ReplicaRecord, 'route'> {
+  route?: ReplicaRouteStatus
 }
 
 interface StartupPod {

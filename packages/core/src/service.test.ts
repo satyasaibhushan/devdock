@@ -2256,6 +2256,229 @@ describe('Service replicas', () => {
     return { svc, runner }
   }
 
+  const routedCluster = () => {
+    const base = cannedRunner('{"items":[]}', false)
+    const parent = {
+      metadata: { resourceVersion: '1', annotations: {} as Record<string, string> },
+      spec: {
+        type: 'ClusterIP',
+        selector: { svc: 'parent-api', app: 'parent' } as Record<string, string>,
+      },
+    }
+    const annotation = 'devdock.dev/replica-route'
+    const claim = () => parent.metadata.annotations[annotation]
+    const pods = [
+      {
+        metadata: { name: 'parent-r1-api-devspace-abc', uid: 'pod-1' },
+        status: {
+          phase: 'Running',
+          containerStatuses: [{ ready: true, restartCount: 0 }],
+          conditions: [{ type: 'Ready', status: 'True' }],
+        },
+      },
+    ]
+    let ready = false
+    let extraPod = false
+    let patchUnavailable = false
+    const success = (data?: unknown) => ({
+      code: 0,
+      stdout: data === undefined ? '' : JSON.stringify(data),
+      stderr: '',
+    })
+    const runner = vi.fn(async (cmd: string, args: string[]) => {
+      if (cmd === 'tmux' && args[0] === 'list-panes')
+        return { code: 0, stdout: ready ? 'devdock-parent-r1-api 0\n' : '', stderr: '' }
+      if (cmd === 'kubectl') {
+        if (args[0] === 'config' && args[1] === 'current-context')
+          return { code: 0, stdout: 'dev-context\n', stderr: '' }
+        if (args[0] === 'get' && args[1] === 'service') {
+          if (args[2] === 'parent-api') return success(parent)
+          if (args[2] === 'parent-r1-api')
+            return success({
+              metadata: { resourceVersion: '2' },
+              spec: { type: 'ClusterIP', selector: { svc: 'parent-r1-api' } },
+            })
+          return success()
+        }
+        if (args[0] === 'get' && args[1] === 'pods') {
+          return success({
+            items: ready
+              ? [
+                  ...pods,
+                  ...(extraPod && args.includes('-l')
+                    ? [{ metadata: { name: 'parent-api-abc', uid: 'parent' } }]
+                    : []),
+                ]
+              : [],
+          })
+        }
+        if (args[0] === 'patch' && args[1] === 'service') {
+          const ops = JSON.parse(args[args.indexOf('-p') + 1] ?? '') as {
+            op: string
+            path: string
+            value?: unknown
+          }[]
+          expect(args).toContain('dev-context')
+          if (patchUnavailable || ops[0]?.value !== parent.metadata.resourceVersion)
+            return { code: 1, stdout: '', stderr: 'patch rejected' }
+          for (const op of ops.slice(1)) {
+            if (op.op === 'remove') delete parent.metadata.annotations[annotation]
+            else if (op.path.endsWith('/selector'))
+              parent.spec.selector = op.value as Record<string, string>
+            else parent.metadata.annotations[annotation] = op.value as string
+          }
+          parent.metadata.resourceVersion = String(Number(parent.metadata.resourceVersion) + 1)
+          return success()
+        }
+      }
+      return base(cmd, args)
+    })
+    const daemon = (file = stateFile) => {
+      const svc = new Service(
+        { roots: [root], stateFile: file },
+        {
+          runner,
+          streamSpawner: fakeStreamSpawner().spawner,
+        },
+      )
+      svc.rescan()
+      vi.spyOn(svc, 'start').mockResolvedValue(success())
+      return svc
+    }
+    return {
+      daemon,
+      parent,
+      claim,
+      runner,
+      ready: () => {
+        ready = true
+      },
+      includeParentPod: (include: boolean) => {
+        extraPod = include
+      },
+      patchUnavailable: (unavailable: boolean) => {
+        patchUnavailable = unavailable
+      },
+    }
+  }
+
+  it('routes the default Service only after the replica is ready and restores the full selector on delete', async () => {
+    makeParent()
+    const cluster = routedCluster()
+    const svc = cluster.daemon()
+    const created = await svc.createReplica('parent', 'feature', { route: true })
+    expect(created.route).toEqual({
+      owner: created.id,
+      workload: 'api',
+      namespace: 'ns',
+      service: 'parent-api',
+      state: 'pending',
+    })
+    expect(cluster.parent.spec.selector).toEqual({ svc: 'parent-api', app: 'parent' })
+
+    cluster.ready()
+    cluster.includeParentPod(true)
+    await svc.reconcileAll()
+    expect(svc.listReplicas()[0]?.route?.state).toBe('pending')
+    cluster.includeParentPod(false)
+    await svc.reconcileOne(created.id)
+    expect(cluster.parent.spec.selector).toEqual({ svc: 'parent-r1-api' })
+    expect((await svc.lookupWithRoutes('parent'))?.replicaRoutes?.[0]).toMatchObject({
+      owner: created.id,
+      state: 'active',
+    })
+    await svc.deleteReplica(created.id)
+    expect(cluster.parent.spec.selector).toEqual({ svc: 'parent-api', app: 'parent' })
+    expect(cluster.claim()).toBeUndefined()
+    expect(svc.listReplicas()).toEqual([])
+  })
+
+  it('rejects concurrent claims across daemons until the owner explicitly releases the route', async () => {
+    makeParent()
+    const cluster = routedCluster()
+    const svc = cluster.daemon()
+    const other = cluster.daemon(join(root, 'peer.json'))
+    const created = await svc.createReplica('parent', 'feature', {
+      route: true,
+      requestId: 'retry',
+    })
+    await expect(svc.createReplica('parent', 'feature', { requestId: 'retry' })).rejects.toThrow(
+      'different options',
+    )
+    await expect(other.createReplica('parent', 'another', { route: true })).rejects.toThrow(
+      `owned by replica ${created.id}`,
+    )
+    expect((await other.lookupWithRoutes('parent'))?.replicaRoutes?.[0]).toMatchObject({
+      owner: created.id,
+      state: 'pending',
+    })
+    await svc.releaseReplicaRoute(created.id)
+    expect(svc.listReplicas()[0]?.route?.state).toBe('released')
+    expect((await other.createReplica('parent', 'another', { route: true })).route?.state).toBe(
+      'pending',
+    )
+  })
+
+  it.each(['expiry', 'restart'])(
+    'restores a routed Service on %s and retries failed writes',
+    async (cleanup) => {
+      makeParent()
+      const cluster = routedCluster()
+      const original = cluster.daemon()
+      const created = await original.createReplica('parent', 'feature', { route: true })
+      cluster.ready()
+      await original.reconcileOne(created.id)
+      expect(cluster.parent.spec.selector).toEqual({ svc: 'parent-r1-api' })
+
+      cluster.patchUnavailable(true)
+      const svc = cleanup === 'restart' ? cluster.daemon() : original
+      const expire = () => svc.gcReplicas(created.createdAt + 3 * 24 * 60 * 60 * 1000)
+      if (cleanup === 'expiry') expect(await expire()).toEqual([])
+      else await svc.reconcileAll()
+      expect(svc.listReplicas()[0]?.route?.state).toBe('restoring')
+      expect(cluster.claim()).toBeDefined()
+
+      cluster.patchUnavailable(false)
+      if (cleanup === 'expiry') expect(await expire()).toEqual([created.id])
+      else {
+        await svc.reconcileAll()
+        expect(svc.listReplicas()[0]?.route?.state).toBe('released')
+      }
+      expect(cluster.parent.spec.selector).toEqual({ svc: 'parent-api', app: 'parent' })
+      expect(cluster.claim()).toBeUndefined()
+    },
+  )
+
+  it('restores the Service on restart even if the local route acknowledgement was lost', async () => {
+    makeParent()
+    const cluster = routedCluster()
+    const original = cluster.daemon()
+    const created = await original.createReplica('parent', 'feature', { route: true })
+    cluster.ready()
+    await original.reconcileOne(created.id)
+    const store = new StateStore(stateFile)
+    const route = store.getReplica(created.id)?.route
+    if (!route) throw new Error('missing recovery target')
+    store.updateReplica(created.id, { route: { ...route, state: 'pending' } })
+    rmSync(replicaPath(created.id), { recursive: true, force: true })
+    await cluster.daemon().reconcileAll()
+    expect(cluster.parent.spec.selector).toEqual({ svc: 'parent-api', app: 'parent' })
+    expect(cluster.claim()).toBeUndefined()
+  })
+
+  it('never overwrites a selector changed by another operator during the session', async () => {
+    makeParent()
+    const cluster = routedCluster()
+    const svc = cluster.daemon()
+    const created = await svc.createReplica('parent', 'feature', { route: true })
+    cluster.ready()
+    await svc.reconcileOne(created.id)
+    cluster.parent.spec.selector = { svc: 'operator-selected' }
+    await svc.releaseReplicaRoute(created.id)
+    expect(cluster.parent.spec.selector).toEqual({ svc: 'operator-selected' })
+    expect(cluster.claim()).toBeUndefined()
+  })
+
   it('reuses a replica request across concurrent retries and daemon restarts', async () => {
     makeParent()
     const { svc, runner } = newService()

@@ -2,7 +2,12 @@
 import { existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import type { LifecycleAction, Service, WorkflowAction } from '@devdock/core'
+import {
+  type LifecycleAction,
+  RouteConflict,
+  type Service,
+  type WorkflowAction,
+} from '@devdock/core'
 import fastifyStatic from '@fastify/static'
 import Fastify, { type FastifyInstance, type FastifyReply } from 'fastify'
 import type { AccessGate } from './accessGate.js'
@@ -378,24 +383,28 @@ export function buildApp(
 
   app.post<{
     Params: { id: string }
-    Body: { branch?: string; ownImage?: boolean; requestId?: string }
+    Body: { branch?: string; ownImage?: boolean; requestId?: string; route?: boolean }
   }>('/repos/:id/replicas', async (req, reply) => {
     const branch = req.body?.branch
     if (typeof branch !== 'string' || !branch.trim()) {
       return reply.code(400).send({ error: 'branch required' })
+    }
+    if (req.body.route !== undefined && typeof req.body.route !== 'boolean') {
+      return reply.code(400).send({ error: 'route must be a boolean' })
     }
     try {
       return reply.code(201).send(
         await service.createReplica(req.params.id, branch, {
           ownImage: req.body?.ownImage === true,
           requestId: req.body?.requestId,
+          route: req.body?.route,
         }),
       )
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       const code = message.includes('unknown repo')
         ? 404
-        : message.includes('replica request id already belongs')
+        : err instanceof RouteConflict || message.includes('replica request id already belongs')
           ? 409
           : message.includes('replica of a replica') ||
               message.includes('invalid replica request id')
@@ -410,6 +419,16 @@ export function buildApp(
   app.delete<{ Params: { id: string } }>('/replicas/:id', async (req, reply) => {
     try {
       await service.deleteReplica(req.params.id)
+      return { ok: true }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      return reply.code(message.includes('unknown replica') ? 404 : 500).send({ error: message })
+    }
+  })
+
+  app.post<{ Params: { id: string } }>('/replicas/:id/release-route', async (req, reply) => {
+    try {
+      await service.releaseReplicaRoute(req.params.id)
       return { ok: true }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)

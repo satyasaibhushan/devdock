@@ -1,3 +1,4 @@
+import { RouteConflict } from '@devdock/core'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -731,6 +732,30 @@ describe('daemon routes', () => {
 
     const gc = await app.inject({ method: 'POST', url: '/replicas/gc' })
     expect(gc.json()).toEqual({ deleted: [] })
+  })
+
+  it('forwards an explicit route claim, maps conflicts, and releases by replica id', async () => {
+    const service = makeReplicaService()
+    const app = buildApp(service)
+    const create = vi
+      .spyOn(service, 'createReplica')
+      .mockRejectedValue(new RouteConflict('Route is owned by replica parent-r1'))
+    const release = vi.spyOn(service, 'releaseReplicaRoute').mockResolvedValue()
+    const response = await app.inject({
+      method: 'POST',
+      url: '/repos/parent/replicas',
+      payload: { branch: 'feature', route: true },
+    })
+    expect(create).toHaveBeenCalledWith('parent', 'feature', {
+      ownImage: false,
+      route: true,
+      requestId: undefined,
+    })
+    expect(response.statusCode).toBe(409)
+    expect(response.json().error).toContain('parent-r1')
+    const released = await app.inject({ method: 'POST', url: '/replicas/parent-r1/release-route' })
+    expect(released.statusCode).toBe(200)
+    expect(release).toHaveBeenCalledWith('parent-r1')
   })
 
   it('POST /repos/:id/replicas validates branch and repo, accepts single-config repos', async () => {

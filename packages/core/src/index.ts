@@ -5,6 +5,7 @@ export * from './types.js'
 export * from './workflow.js'
 export { Operations, type Operation, type OperationStage } from './operations.js'
 export { DeploymentOwnership } from './ownership.js'
+export { RouteConflict } from './replicaRoutes.js'
 export {
   lifecycleActions,
   lifecyclePlan,
@@ -13,7 +14,7 @@ export {
 } from './lifecycle.js'
 export * from './exec.js'
 export { parseIngressUrls } from './ingressUrl.js'
-export { StateStore, type Grant, type ReplicaRecord } from './stateStore.js'
+export { StateStore, type Grant, type ReplicaInfo, type ReplicaRecord } from './stateStore.js'
 export {
   nextReplicaId,
   generateReplicaConfig,

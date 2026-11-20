@@ -54,6 +54,14 @@ async function main(): Promise<never> {
     process.exit(1)
   }
 
+  if (parsed.command === 'replica') {
+    const out = parsed.json
+      ? JSON.stringify(data)
+      : typeof data.id === 'string'
+        ? data.id
+        : 'Route released'
+    emit({ out, err: '', code: 0 })
+  }
   if (parsed.command === 'run') emit(renderRun(data as unknown as RunResponse, parsed.json))
   if (parsed.command === 'wait') emit(renderWait(data as unknown as WaitResponse, parsed.json))
   emit(renderLogs(data as unknown as LogsResponse, parsed.json))

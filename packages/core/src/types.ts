@@ -170,6 +170,15 @@ export interface DeploymentInfo {
   paused?: boolean
 }
 
+export interface ReplicaRouteStatus {
+  owner: string
+  namespace: string
+  service: string
+  workload: string
+  state: 'pending' | 'active' | 'restoring' | 'released'
+  error?: string
+}
+
 /** The reconciled view of a single repo (spec §6). */
 export interface RepoState {
   daemon?: DaemonVersion
@@ -194,6 +203,7 @@ export interface RepoState {
   startupCommand?: string
   /** Commands auto-run once each pod type's `devspace dev` session is ready. */
   startupCommands?: Record<string, string>
+  replicaRoutes?: ReplicaRouteStatus[]
 }
 
 /** Terminal access mode (spec §8). */

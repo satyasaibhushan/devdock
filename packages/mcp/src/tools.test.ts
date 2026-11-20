@@ -122,6 +122,7 @@ function fakeClient(over: Partial<DaemonClient> = {}): DaemonClient {
       },
     ],
     replicaDelete: async () => {},
+    replicaReleaseRoute: async () => {},
     namespace: async () => ({ current: 'uat', known: ['uat', 'prod'] }),
     setNamespace: async (ns) => ({ current: ns, known: ['uat', ns] }),
     auth: async () => ({ oidc: true, phase: 'ok', checkedAt: 1 }),
@@ -234,6 +235,7 @@ describe('toolsForScope', () => {
       'devdock_adopt',
       'devdock_clear',
       'devdock_replica_create',
+      'devdock_replica_release_route',
       'devdock_replica_delete',
       'devdock_run',
       'devdock_exec',
@@ -491,8 +493,13 @@ describe('tool handlers', () => {
     const t = allTools(fakeClient({ replicaCreate })).find(
       (x) => x.name === 'devdock_replica_create',
     )
-    const out = await t?.handler({ repo: 'svc-a', branch: 'feature-x', requestId: 'retry-1' })
-    expect(replicaCreate).toHaveBeenCalledWith('svc-a', 'feature-x', undefined, 'retry-1')
+    const out = await t?.handler({
+      repo: 'svc-a',
+      branch: 'feature-x',
+      requestId: 'retry-1',
+      route: true,
+    })
+    expect(replicaCreate).toHaveBeenCalledWith('svc-a', 'feature-x', undefined, 'retry-1', true)
     expect(out).toContain('created svc-a-r1 from feature-x')
     expect(out).toContain('devdock_wait')
   })
@@ -526,7 +533,7 @@ describe('tool handlers', () => {
       (x) => x.name === 'devdock_replica_create',
     )
     const out = await t?.handler({ repo: 'svc-a', branch: 'feature-x', ownImage: true })
-    expect(replicaCreate).toHaveBeenCalledWith('svc-a', 'feature-x', true, undefined)
+    expect(replicaCreate).toHaveBeenCalledWith('svc-a', 'feature-x', true, undefined, undefined)
     expect(out).toContain('building its own image')
   })
 

@@ -171,7 +171,7 @@ export function allTools(client: DaemonClient): ToolDef[] {
     {
       name: 'devdock_status',
       description:
-        'Get repo and workload status, pod diagnostics when unhealthy, and the running daemon build.',
+        'Get repo and workload status, replica Service routes and their owners, pod diagnostics when unhealthy, and the running daemon build.',
       scope: 'ro',
       inputSchema: repoArg,
       handler: async (a) => JSON.stringify(await client.status(a.repo as string), null, 2),
@@ -292,7 +292,7 @@ export function allTools(client: DaemonClient): ToolDef[] {
     {
       name: 'devdock_replica_list',
       description:
-        'List replicas (ephemeral branch-pinned parallel deployments): id, parent repo, branch, age, URL path. Replicas older than 2 days are garbage-collected automatically.',
+        'List replicas (ephemeral branch-pinned parallel deployments): id, parent repo, branch, age, URL path, and Service route owner. Replicas older than 2 days are garbage-collected automatically.',
       scope: 'ro',
       inputSchema: {},
       handler: async () => {
@@ -304,7 +304,7 @@ export function allTools(client: DaemonClient): ToolDef[] {
             const age = ageH >= 24 ? `${Math.floor(ageH / 24)}d${ageH % 24}h` : `${ageH}h`
             return `${r.id}\tparent=${r.parentId}\tbranch=${r.branch}\tage=${age}\turl=/${r.id}/${
               r.ingressApplied ? '' : ' (url pending — appears once pods run)'
-            }`
+            }${r.route ? `\troute=${r.route.state} owner=${r.route.owner} service=${r.route.namespace}/${r.route.service}${r.route.error ? ` (${r.route.error})` : ''}` : ''}`
           })
           .join('\n')
       },
@@ -385,6 +385,12 @@ export function allTools(client: DaemonClient): ToolDef[] {
       inputSchema: {
         ...repoArg,
         branch: z.string().min(1).describe('local branch to pin the replica to'),
+        route: z
+          .boolean()
+          .optional()
+          .describe(
+            "Temporarily route the parent's default workload Service to this replica once ready",
+          ),
         requestId: z
           .string()
           .regex(/^[A-Za-z0-9_-]{1,128}$/)
@@ -403,12 +409,25 @@ export function allTools(client: DaemonClient): ToolDef[] {
           a.branch as string,
           a.ownImage as boolean | undefined,
           a.requestId as string | undefined,
+          a.route as boolean | undefined,
         )
         const how = r.ownImage ? 'building its own image, then deploying' : 'deploying'
+        const routeHint = r.route ? `; check devdock_status ${r.id} for route activation` : ''
         return [
-          `created ${r.id} from ${r.branch} — ${how} in the background; poll devdock_wait ${r.id}`,
+          `created ${r.id} from ${r.branch} — ${how} in the background; poll devdock_wait ${r.id}${routeHint}`,
           ...(r.warnings ?? []),
         ].join('\n')
+      },
+    },
+    {
+      name: 'devdock_replica_release_route',
+      description:
+        'Restore the parent Service selector and keep the replica running on its own URL.',
+      scope: 'rw',
+      inputSchema: { replica: z.string().describe('replica id (from devdock_replica_list)') },
+      handler: async (a) => {
+        await client.replicaReleaseRoute(a.replica as string)
+        return `released route for ${a.replica}`
       },
     },
     {

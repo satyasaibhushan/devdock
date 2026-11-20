@@ -11,7 +11,7 @@ import type {
   LogSource,
   NamespaceInfo,
   Operation,
-  ReplicaRecord,
+  ReplicaInfo,
   RepoState,
   RunOutcome,
   SandboxBuild,
@@ -133,9 +133,11 @@ export interface DaemonClient {
     branch: string,
     ownImage?: boolean,
     requestId?: string,
-  ): Promise<ReplicaRecord>
-  replicaList(): Promise<ReplicaRecord[]>
+    route?: boolean,
+  ): Promise<ReplicaInfo>
+  replicaList(): Promise<ReplicaInfo[]>
   replicaDelete(id: string): Promise<void>
+  replicaReleaseRoute(id: string): Promise<void>
   termList(): Promise<TermInfo[]>
   termOpen(opts: TermOpenOpts): Promise<TermInfo>
   termRun(tid: string, command: string, timeoutMs?: number): Promise<RunOutcome>
@@ -344,9 +346,12 @@ export function daemonClient(send: DaemonTransport, prefix = ''): DaemonClient {
     awsLogin: () => post<AuthState>('/auth/aws/login'),
     authClear: () => post<AuthState>('/auth/clear'),
     branches: (i) => request<BranchInfo[]>(`/repos/${id(i)}/branches`),
-    replicaCreate: (i, branch, ownImage, requestId) =>
-      post<ReplicaRecord>(`/repos/${id(i)}/replicas`, { branch, ownImage, requestId }),
-    replicaList: () => request<ReplicaRecord[]>('/replicas'),
+    replicaCreate: (i, branch, ownImage, requestId, route) =>
+      post<ReplicaInfo>(`/repos/${id(i)}/replicas`, { branch, ownImage, requestId, route }),
+    replicaList: () => request<ReplicaInfo[]>('/replicas'),
+    replicaReleaseRoute: async (i) => {
+      await post(`/replicas/${id(i)}/release-route`, {})
+    },
     replicaDelete: async (i) => {
       await request(`/replicas/${id(i)}`, { method: 'DELETE' })
     },
