@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 // Entry point: parse → one HTTP call → print → exit. All logic that can be
 // unit-tested lives in cli.ts; this file is the thin I/O shell around it.
-import { followTest } from './testRun.js'
 import {
   type CliRequest,
   DEFAULT_URL,
@@ -14,6 +13,7 @@ import {
   renderRun,
   renderWait,
 } from './cli.js'
+import { followTest } from './testRun.js'
 
 function emit(r: { out: string; err: string; code: number }): never {
   if (r.out) process.stdout.write(`${r.out}\n`)

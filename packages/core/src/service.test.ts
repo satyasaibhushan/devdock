@@ -2413,7 +2413,7 @@ describe('Service replicas', () => {
     await expect(other.createReplica('parent', 'another', { route: true })).rejects.toThrow(
       `owned by replica ${created.id}`,
     )
-    expect((await other.lookupWithRoutes('parent'))?.replicaRoutes?.[0]).toMatchObject({
+    expect((await other.status('parent'))?.replicaRoutes?.[0]).toMatchObject({
       owner: created.id,
       state: 'pending',
     })
