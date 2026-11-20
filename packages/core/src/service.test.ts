@@ -2280,6 +2280,7 @@ describe('Service replicas', () => {
     let ready = false
     let extraPod = false
     let patchUnavailable = false
+    let beforePatch: (() => Promise<void>) | undefined
     const success = (data?: unknown) => ({
       code: 0,
       stdout: data === undefined ? '' : JSON.stringify(data),
@@ -2319,6 +2320,7 @@ describe('Service replicas', () => {
             value?: unknown
           }[]
           expect(args).toContain('dev-context')
+          if (beforePatch) await beforePatch()
           if (patchUnavailable || ops[0]?.value !== parent.metadata.resourceVersion)
             return { code: 1, stdout: '', stderr: 'patch rejected' }
           for (const op of ops.slice(1)) {
@@ -2350,6 +2352,9 @@ describe('Service replicas', () => {
       parent,
       claim,
       runner,
+      beforePatch: (hook: () => Promise<void>) => {
+        beforePatch = hook
+      },
       ready: () => {
         ready = true
       },
@@ -2419,6 +2424,65 @@ describe('Service replicas', () => {
     )
   })
 
+  it('uses the Service version to arbitrate two simultaneous claims', async () => {
+    makeParent()
+    const cluster = routedCluster()
+    const svc = cluster.daemon()
+    let arrived = 0
+    let proceed: () => void = () => {}
+    const bothRead = new Promise<void>((resolve) => {
+      proceed = resolve
+    })
+    cluster.beforePatch(async () => {
+      arrived++
+      if (arrived === 2) proceed()
+      await bothRead
+    })
+    const results = await Promise.allSettled([
+      svc.createReplica('parent', 'first', { route: true }),
+      svc.createReplica('parent', 'second', { route: true }),
+    ])
+    const result = results.find((result) => result.status === 'fulfilled')
+    expect(result?.value.route?.state).toBe('pending')
+    expect(results.find((result) => result.status === 'rejected')?.reason.message).toContain(
+      `owned by replica ${result?.value.id}`,
+    )
+    expect(svc.listReplicas()).toEqual([result?.value])
+  })
+
+  it('reuses a routed request that retries before the cluster acknowledges it', async () => {
+    makeParent()
+    const cluster = routedCluster()
+    const svc = cluster.daemon()
+    let onPatch: () => void = () => {}
+    let proceed: () => void = () => {}
+    const patching = new Promise<void>((resolve) => {
+      onPatch = resolve
+    })
+    const acknowledged = new Promise<void>((resolve) => {
+      proceed = resolve
+    })
+    cluster.beforePatch(async () => {
+      onPatch()
+      await acknowledged
+    })
+    const options = { route: true, requestId: 'same-request' }
+    const first = svc.createReplica('parent', 'feature', options)
+    await patching
+    let retried = false
+    const retry = svc.createReplica('parent', 'feature', options).then((created) => {
+      retried = true
+      return created
+    })
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    const completedBeforeClaim = retried
+    proceed()
+    const [created, reused] = await Promise.all([first, retry])
+    expect(completedBeforeClaim).toBe(false)
+    expect(reused).toEqual(created)
+    expect(svc.listReplicas()).toHaveLength(1)
+  })
+
   it.each(['expiry', 'restart'])(
     'restores a routed Service on %s and retries failed writes',
     async (cleanup) => {
@@ -2474,7 +2538,8 @@ describe('Service replicas', () => {
     cluster.ready()
     await svc.reconcileOne(created.id)
     cluster.parent.spec.selector = { svc: 'operator-selected' }
-    await svc.releaseReplicaRoute(created.id)
+    await svc.reconcileOne(created.id)
+    expect(svc.listReplicas()[0]?.route?.state).toBe('released')
     expect(cluster.parent.spec.selector).toEqual({ svc: 'operator-selected' })
     expect(cluster.claim()).toBeUndefined()
   })

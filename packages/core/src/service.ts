@@ -1720,21 +1720,13 @@ export class Service {
     if (typeof requestId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(requestId))
       throw new Error('invalid replica request id')
     const key = `${parentId}:${requestId}`
-    const existing = this.store
-      .listReplicas()
-      .find((record) => record.parentId === parentId && record.requestId === requestId)
-    if (existing) {
-      if (
-        existing.branch !== branch.trim() ||
-        !!existing.ownImage !== !!opts.ownImage ||
-        !!existing.route !== !!opts.route
-      )
-        throw new Error('replica request id already belongs to different options')
-      return existing
-    }
-    const active = this.replicaRequests.get(key)
-    if (active) {
-      const record = await active
+    const prior =
+      this.replicaRequests.get(key) ??
+      this.store
+        .listReplicas()
+        .find((record) => record.parentId === parentId && record.requestId === requestId)
+    if (prior) {
+      const record = await prior
       if (
         record.branch !== branch.trim() ||
         !!record.ownImage !== !!opts.ownImage ||
@@ -1925,17 +1917,12 @@ export class Service {
         })
       }
       this.repos.set(id, repo)
-      for (const warning of record.warnings ?? []) this.hubFor(id).push(`! ${warning}`)
-      if (opts.ownImage) {
-        this.hubFor(id).push(
-          `✓ replica ${id} created from ${trimmedBranch} — building image, then deploying`,
-        )
-        void this.launchReplica(id, true)
-      } else {
-        this.hubFor(id).push(`✓ replica ${id} created from ${trimmedBranch} — deploying`)
-        void this.launchReplica(id, false)
-      }
-      return this.store.getReplica(id) ?? record
+      const created = this.store.getReplica(id) ?? record
+      for (const warning of created.warnings ?? []) this.hubFor(id).push(`! ${warning}`)
+      const action = created.ownImage ? 'building image, then deploying' : 'deploying'
+      this.hubFor(id).push(`✓ replica ${id} created from ${trimmedBranch} — ${action}`)
+      void this.launchReplica(created)
+      return created
     } catch (err) {
       await this.releaseReplicaRoute(id).catch(() => undefined)
       if (worktreeAdded) {
@@ -1953,16 +1940,18 @@ export class Service {
     }
   }
 
-  private async launchReplica(id: string, ownImage: boolean): Promise<void> {
+  private async launchReplica(record: ReplicaRecord): Promise<void> {
+    const { id, route } = record
     try {
-      const build = ownImage ? await this.build(id) : undefined
-      if ((!build || build.code === 0) && this.repos.has(id)) {
+      const build = record.ownImage ? await this.build(id) : undefined
+      const current = this.store.getReplica(id)
+      if ((!build || build.code === 0) && current?.createdAt === record.createdAt) {
         if ((await this.start(id)).code === 0) return
       }
     } catch {
       // The build and start verbs already report to the replica log.
     }
-    await this.releaseReplicaRoute(id).catch(() => undefined)
+    if (route) await this.replicaRoutes.release(id, route).catch(() => undefined)
   }
 
   private async releaseRouteForWorkload(id: string, workload: string | undefined): Promise<void> {
@@ -2682,8 +2671,11 @@ export class Service {
                   this.replicaRoutes.reportActivationError(id, route.token, error),
                 )
             }
-          } else if (route.state === 'active' && !target.hasSession) {
-            await this.replicaRoutes.release(id, route).catch(() => undefined)
+          } else if (route.state === 'active') {
+            const reconcile = target.hasSession
+              ? this.replicaRoutes.releaseIfChanged(id, route)
+              : this.replicaRoutes.release(id, route)
+            await reconcile.catch(() => undefined)
           }
         }
       }

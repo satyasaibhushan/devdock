@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
-import type { StateStore } from './stateStore.js'
 import type { run as runCommand } from './exec.js'
+import type { StateStore } from './stateStore.js'
 import type { PodInfo, ReplicaRouteStatus } from './types.js'
 
 const annotation = 'devdock.dev/replica-route'
@@ -188,7 +188,7 @@ export class ReplicaRoutes {
         throw new Error(result.stderr.trim() || 'Cannot verify replica Service selector')
       const observed = JSON.parse(result.stdout) as {
         items: {
-          metadata: { uid?: string; name: string }
+          metadata: { uid?: string; name: string; deletionTimestamp?: string }
           status?: {
             conditions?: { type: string; status: string }[]
           }
@@ -199,7 +199,7 @@ export class ReplicaRoutes {
         !observed.items.length ||
         observed.items.some(({ metadata }) => {
           const pod = known.get(metadata.name)
-          return !pod || pod.uid !== metadata.uid
+          return !pod || !metadata.uid || pod.uid !== metadata.uid || !!metadata.deletionTimestamp
         })
       )
         return
@@ -218,6 +218,18 @@ export class ReplicaRoutes {
       ])
       this.store.updateReplica(id, { route: { ...route, state: 'active', error: undefined } })
     })
+  }
+
+  async releaseIfChanged(id: string, route: ReplicaRoute): Promise<void> {
+    const parent = await this.read(route)
+    const claim = parent && claimOf(parent)
+    if (
+      claim?.token === route.token &&
+      claim.selected &&
+      sameSelector(parent?.spec.selector, claim.selected)
+    )
+      return
+    await this.release(id, route)
   }
 
   /** A restart has no live route tokens. Release its inherited claims before
