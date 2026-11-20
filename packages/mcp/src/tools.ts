@@ -127,7 +127,7 @@ export function allTools(client: DaemonClient): ToolDef[] {
       name: 'devdock_prerequisites',
       scope: 'rw',
       description:
-        'Run only the prerequisite commands configured locally by this machine owner. Commands and their output are not exposed; returns passed, failed or unknown. Does not deploy or repair infrastructure.',
+        'Run only the prerequisite commands configured locally by this machine owner. Commands and their output are not exposed; returns passed, failed or unknown. Includes the running daemon build and any warning about drift from main.',
       inputSchema: {
         ...repoArg,
         ...workloadArg,
@@ -170,7 +170,8 @@ export function allTools(client: DaemonClient): ToolDef[] {
     },
     {
       name: 'devdock_status',
-      description: 'Get the full reconciled state of one repo (status, workloads, pods, session).',
+      description:
+        'Get repo and workload status, pod diagnostics when unhealthy, and the running daemon build.',
       scope: 'ro',
       inputSchema: repoArg,
       handler: async (a) => JSON.stringify(await client.status(a.repo as string), null, 2),
@@ -211,7 +212,7 @@ export function allTools(client: DaemonClient): ToolDef[] {
     {
       name: 'devdock_wait',
       description:
-        'Wait for readiness instead of running sleep: ready=pod Ready, http={path,status}=HTTP status on the workload ingress path (default 200), contains=new log marker, or status=workload status. Conditions are ORed. Returns immediately if an operation failed or the target needs a lifecycle action. Pass operationId to follow a specific operation. Log watching starts now unless a cursor is given. All probes share timeoutMs.',
+        'Wait for readiness instead of running sleep: ready=pod Ready, http={path,status}=HTTP status on the workload ingress path (default 200), contains=new log marker, or status=workload status. Conditions are ORed. Returns immediately if an operation failed or the target needs a lifecycle action. Pass operationId to follow a specific operation. Log watching starts now unless a cursor is given. Readiness probes share timeoutMs. Unhealthy workloads include pod diagnostics when available.',
       scope: 'ro',
       inputSchema: {
         ...repoArg,
@@ -265,7 +266,7 @@ export function allTools(client: DaemonClient): ToolDef[] {
         })
         const tail = `${r.status ? ` status=${r.status}` : ''} elapsedMs=${r.elapsedMs}${
           r.cursor ? ` nextCursor=${r.cursor}` : ''
-        }`
+        }${r.diagnostics ? `\n${JSON.stringify(r.diagnostics, null, 2)}` : ''}`
         if (r.matched) {
           return `matched: ${r.reason}${r.line ? ` — ${r.line}` : ''}${tail}`
         }
@@ -318,7 +319,7 @@ export function allTools(client: DaemonClient): ToolDef[] {
     {
       name: 'devdock_auth_status',
       description:
-        'Kubernetes OIDC auth state (phase, token expiry, sign-in URL) plus AWS sign-in status (ok, required, pending), reason and login URL. awsLoginUrl is also set while AWS sign-in is pending. Neither sign-in opens a browser: hand the URL to the user. Poll this after devdock_auth_login or devdock_aws_login.',
+        'Kubernetes OIDC auth state (phase, token expiry, sign-in URL) plus AWS sign-in status (ok, required, pending), reason, login URL and expiry. AWS expiry and remaining minutes are included when session metadata is available. Neither sign-in opens a browser: hand the URL to the user. Poll this after devdock_auth_login or devdock_aws_login.',
       scope: 'ro',
       inputSchema: {},
       handler: async () => JSON.stringify(await client.auth(), null, 2),
@@ -404,7 +405,10 @@ export function allTools(client: DaemonClient): ToolDef[] {
           a.requestId as string | undefined,
         )
         const how = r.ownImage ? 'building its own image, then deploying' : 'deploying'
-        return `created ${r.id} from ${r.branch} — ${how} in the background; poll devdock_wait ${r.id}`
+        return [
+          `created ${r.id} from ${r.branch} — ${how} in the background; poll devdock_wait ${r.id}`,
+          ...(r.warnings ?? []),
+        ].join('\n')
       },
     },
     {

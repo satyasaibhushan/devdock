@@ -4,6 +4,12 @@
 import { type RunOptions, type RunResult, run } from './exec.js'
 import { parseIngressUrls } from './ingressUrl.js'
 import { lifecycleActions } from './lifecycle.js'
+import {
+  type ContainerStatus,
+  latestTermination,
+  podSchedulingFailure,
+  podTermination,
+} from './podDiagnostics.js'
 import type {
   DeploymentInfo,
   PodInfo,
@@ -71,6 +77,10 @@ function matchByName<T extends { name: string }>(
   )
 }
 
+export function matchesWorkloadName(name: string, workload: string, knownNames: string[]): boolean {
+  return matchByName([{ name }], workload, knownNames).length > 0
+}
+
 /** Keep only pods that belong to this repo by devspace's naming convention.
  *  Without this, an unscoped namespace query attributes every pod (e.g. a
  *  crashed `registry`) to every repo. */
@@ -101,26 +111,15 @@ export function parsePods(json: string): PodInfo[] {
   return podInfos(listItems(json) ?? [])
 }
 
-function podInfos(items: unknown[]): PodInfo[] {
+function podInfos(items: unknown[], deleting = false): PodInfo[] {
   const pods: PodInfo[] = []
   for (const item of items) {
     const meta = (
       item as { metadata?: { name?: string; uid?: string; deletionTimestamp?: string | null } }
     ).metadata
     // Lost nodes can retain ready container statuses after eviction begins.
-    if (meta?.deletionTimestamp != null) continue
+    if ((meta?.deletionTimestamp != null) !== deleting) continue
     const status = (item as { status?: Record<string, unknown> }).status ?? {}
-    type ContainerStatus = {
-      ready?: boolean
-      name: string
-      imageID?: string
-      restartCount?: number
-      state?: {
-        waiting?: { reason?: string }
-        terminated?: { exitCode?: number; reason?: string }
-      }
-      lastState?: { terminated?: { exitCode?: number; reason?: string } }
-    }
     const containers = (status.containerStatuses as ContainerStatus[] | undefined) ?? []
     const initContainers = (status.initContainerStatuses as ContainerStatus[] | undefined) ?? []
     const crashing = [...containers, ...initContainers].find(
@@ -144,6 +143,11 @@ function podInfos(items: unknown[]): PodInfo[] {
     ]
       .filter(Boolean)
       .join(': ')
+    const terminationInfo = podTermination(meta?.name ?? '<unknown>', status, [
+      ...containers,
+      ...initContainers,
+    ])
+    const schedulingFailure = podSchedulingFailure(status)
     const restartCount = containers.reduce((sum, c) => sum + (c.restartCount ?? 0), 0)
     const ready = containers.length > 0 && containers.every((c) => c.ready === true)
     const spec = (item as { spec?: { nodeName?: string } }).spec
@@ -155,6 +159,18 @@ function podInfos(items: unknown[]): PodInfo[] {
       ...(scheduled !== undefined ? { scheduled } : {}),
       ...(spec?.nodeName ? { node: spec.nodeName } : {}),
       ...(imagePulled ? { imagePulled: true } : {}),
+      ...(terminationInfo
+        ? {
+            termination: {
+              ...terminationInfo,
+              ...(meta?.deletionTimestamp && !terminationInfo.at
+                ? { at: meta.deletionTimestamp }
+                : {}),
+              ...(spec?.nodeName ? { node: spec.nodeName } : {}),
+            },
+          }
+        : {}),
+      ...(schedulingFailure ? { schedulingFailure } : {}),
       name: meta?.name ?? '<unknown>',
       ...(meta?.uid ? { uid: meta.uid } : {}),
       phase: typeof status.phase === 'string' ? status.phase : 'Unknown',
@@ -172,6 +188,7 @@ function podInfos(items: unknown[]): PodInfo[] {
         restartCount: c.restartCount ?? 0,
         ready: c.ready === true,
         init: c.init,
+        ...(c.state?.running ? { running: true } : {}),
       })),
       ...(crashing ? { crashing: true } : {}),
       ...(failureReason ? { failureReason } : {}),
@@ -223,6 +240,7 @@ export interface ClusterCache {
   pods: Map<string, PodInfo[] | null>
   deployments: Map<string, DeploymentInfo[] | null>
   ingresses: Map<string, Map<string, string>>
+  deletingPods?: Map<string, PodInfo[]>
   schedulingEvents?: Map<string, SchedulingEvent[]>
   /** Every name that can claim pods/deployments this pass (repo, member, and
    *  workload-scoped names) — lets attribution give the longest name priority. */
@@ -289,14 +307,23 @@ export class Reconciler {
       ...(sessionDead ? { sessionDead: true } : {}),
       actions: [],
     }
+    const deleting = cache.deletingPods?.get(`${repo.namespace ?? ''}|${repo.selector ?? ''}`) ?? []
+    const attributed = repo.selector ? deleting : matchPods(deleting, repo.name, cache.knownNames)
+    const lastTermination = latestTermination(
+      [...pods, ...attributed].map((pod) => pod.termination),
+    )
+    if (lastTermination) ws.lastTermination = lastTermination
+    const schedulingFailure = pods.find((pod) => pod.schedulingFailure)?.schedulingFailure
+    if (schedulingFailure) ws.schedulingFailure = schedulingFailure
     ws.actions = lifecycleActions(ws.status)
     // A failed query means the cluster view is unknown, not empty — flag it so
     // the service can hold the last known status and skip retire decisions.
     if (rawPods === null || rawDeployments === null) ws.unreachable = true
-    if (hasSession && !ws.unreachable && pods.length === 0) {
-      const dev = deployments.find(
-        (d) => d.name === `${repo.name}-devspace` && d.replicas > 0 && !d.paused,
-      )
+    if (!ws.unreachable && pods.length === 0) {
+      const active = deployments.filter((d) => d.replicas > 0 && !d.paused)
+      const dev =
+        active.find((d) => d.name === `${repo.name}-devspace`) ??
+        (hasSession ? undefined : active[0])
       if (dev) {
         const failure = await this.fetchSchedulingFailure(repo, cache, dev.name, sessionStartedAt)
         if (failure) ws.schedulingFailure = failure
@@ -376,6 +403,10 @@ export class Reconciler {
       const items = r?.code === 0 ? listItems(r.stdout) : null
       pods = items && podInfos(items)
       cache.pods.set(key, pods)
+      if (items) {
+        cache.deletingPods ??= new Map()
+        cache.deletingPods.set(key, podInfos(items, true))
+      }
     }
     if (pods === null) return null
     // Attribute pods to this repo by name (devspace names pods after the

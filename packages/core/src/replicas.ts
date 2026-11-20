@@ -36,12 +36,32 @@ export const CACHE_SEED_VAR = 'DEVDOCK_CACHE_SEED'
  *  pins a tag derived from its own name and builds it via deploy first. */
 export function generateReplicaConfig(
   parentYaml: string,
-  opts: { replicaId: string; workloadType?: string; imageTag?: string; cacheSeed?: string },
+  opts: {
+    replicaId: string
+    workloadType?: string
+    imageTag?: string
+    cacheSeed?: string
+    useGuidelinesEnv?: boolean
+  },
 ): string {
   const doc = parseDocument(parentYaml)
   const parentName = doc.get('name')
   const replicaName = opts.workloadType ? `${opts.replicaId}-${opts.workloadType}` : opts.replicaId
   doc.setIn(['name'], replicaName)
+  if (typeof parentName === 'string') {
+    const path = ['vars', 'ENVS_S3_KEY']
+    const key = doc.getIn(path)
+    const setting = isMap(key) && key.has('value') ? 'value' : 'default'
+    const defaultKey = isMap(key) ? key.get(setting) : key
+    if (typeof defaultKey === 'string') {
+      doc.setIn(
+        isMap(key) ? [...path, setting] : path,
+        defaultKey.replaceAll('${DEVSPACE_NAME}', parentName),
+      )
+    } else if (key === undefined && opts.useGuidelinesEnv) {
+      doc.setIn(path, `\${TEAM_NAME}/uat-us/${parentName}/.env`)
+    }
+  }
   doc.setIn(['vars', 'INGRESS_PATH'], opts.replicaId)
   if (opts.imageTag !== undefined) doc.setIn(['vars', 'IMAGE_TAG'], opts.imageTag)
   // An own-image replica's first build seeds its layer cache from the parent's

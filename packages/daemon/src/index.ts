@@ -1,6 +1,9 @@
 // @devdock/daemon — the only brain. Composes the core Service with HTTP + WS.
+import { execFileSync } from 'node:child_process'
+import { existsSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import {
   AwsCreds,
   Service,
@@ -19,6 +22,33 @@ import { attachWs } from './wsServer.js'
 const PORT = Number(process.env.DEVDOCK_PORT ?? 7717)
 const HOST = process.env.DEVDOCK_HOST ?? '127.0.0.1'
 const SOCKET = process.env.DEVDOCK_SOCKET || undefined
+
+function installedBuild() {
+  try {
+    const [sha, builtAt, repoPath] = readFileSync(
+      new URL('../../../build-info', import.meta.url),
+      'utf8',
+    ).split('\n')
+    if (sha && builtAt && repoPath) return { sha, builtAt, repoPath }
+  } catch {
+    // An installed release has its own metadata. Source runs use the checkout.
+  }
+  const root = new URL('../../../', import.meta.url)
+  if (!existsSync(new URL('pnpm-workspace.yaml', root))) return
+  const repoPath = fileURLToPath(root)
+  try {
+    const sha = execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd: repoPath,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 2_000,
+    }).trim()
+    const builtAt = statSync(new URL(import.meta.url)).mtime.toISOString()
+    return { sha, builtAt, repoPath }
+  } catch {
+    return undefined
+  }
+}
 
 async function main() {
   for (const w of missingToolWarnings(await checkTools())) {
@@ -39,6 +69,7 @@ async function main() {
       roots,
       stateFile: join(homedir(), '.devdock', 'state.json'),
       instanceId: instances.identity.id,
+      daemonBuild: installedBuild(),
     },
     process.env.DEVDOCK_AWS_AUTH === 'external'
       ? { awsCreds: new AwsCreds({ oidcConfigPath: null }) }

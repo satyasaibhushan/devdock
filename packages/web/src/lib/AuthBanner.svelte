@@ -21,7 +21,9 @@
   let busy = $state(false)
 
   const kube = $derived(auth.oidc && auth.phase !== 'ok' && auth.phase !== 'unknown')
-  const awsLoginUrl = $derived(auth.aws?.loginUrl ?? auth.awsLoginUrl)
+  const awsLoginUrl = $derived(
+    auth.aws?.state === 'pending' ? (auth.aws.loginUrl ?? auth.awsLoginUrl) : auth.awsLoginUrl,
+  )
   const aws = $derived(auth.aws?.state === 'required' || awsLoginUrl !== undefined)
   const loginUrl = $derived(auth.loginUrl ?? awsLoginUrl)
   const pending = $derived(auth.phase === 'logging_in' || awsLoginUrl !== undefined)

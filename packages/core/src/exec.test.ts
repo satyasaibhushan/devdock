@@ -62,3 +62,11 @@ describe('runStream', () => {
     expect(lines.join('\n')).toContain('command not found')
   })
 })
+
+it('kills subprocesses holding the output streams open on a bounded print', async () => {
+  const result = await run('sh', ['-c', 'sleep 5 & wait'], {
+    timeoutMs: 50,
+    killProcessGroup: true,
+  })
+  expect(result.timedOut).toBe(true)
+}, 2_000)

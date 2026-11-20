@@ -1,10 +1,12 @@
+import { createHash } from 'node:crypto'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { AwsCreds } from './awsCreds.js'
+import { AwsCreds, ssoSessionExpiry } from './awsCreds.js'
 import type { RunResult } from './exec.js'
 import { TokenEndpointError, tokenGrant } from './oidc.js'
+import { Supervisor } from './supervisor.js'
 
 // The shape `aws-cli-oidc setup` writes. Port 0 → the callback server picks an
 // ephemeral port, so interactive-flow tests never collide with a real 8010.
@@ -107,13 +109,13 @@ describe('AwsCreds', () => {
     const { fetchFn } = fakeFetch({})
     const creds = make(fetchFn)
     const required = { state: 'required', message: 'no AWS sign-in saved' }
-    expect(creds.status()).toEqual(required)
+    expect(creds.status()).toMatchObject(required)
     for (const contents of ['not json', '{}', '{"refreshToken":""}', '{"refreshToken":" "}']) {
       writeFileSync(tokenFile, contents)
-      expect(creds.status()).toEqual(required)
+      expect(creds.status()).toMatchObject(required)
     }
     writeFileSync(tokenFile, JSON.stringify({ refreshToken: 'rt-1' }))
-    expect(creds.status()).toEqual({ state: 'ok' })
+    expect(creds.status().state).toBe('ok')
     expect(fetchFn).not.toHaveBeenCalled()
   })
 
@@ -129,9 +131,13 @@ describe('AwsCreds', () => {
     const browser = watchSignIn(creds)
     try {
       expect(await warming).toEqual({ ok: true })
-      expect(creds.status()).toEqual({ state: 'ok' })
+      expect(creds.status().state).toBe('ok')
+      expect(creds.status()).toMatchObject({
+        expiresAt: expect.any(String),
+        remainingMinutes: expect.any(Number),
+      })
       rmSync(tokenFile)
-      expect(creds.status()).toEqual({ state: 'ok' }) // the credential is still fresh
+      expect(creds.status().state).toBe('ok') // the credential is still fresh
     } finally {
       browser.stop()
     }
@@ -162,18 +168,18 @@ describe('AwsCreds', () => {
       message:
         'AWS refresh token rejected after 3h: OIDC token grant failed: HTTP 400 invalid_grant: Refresh Token has expired',
     }
-    expect(creds.status()).toEqual(required)
-    expect(creds.status()).toEqual(required)
+    expect(creds.status()).toMatchObject(required)
+    expect(creds.status()).toMatchObject(required)
     expect(log).toHaveBeenCalledTimes(1)
     expect(log).toHaveBeenCalledWith(required.message)
     const browser = watchSignIn(creds)
     try {
       expect(await creds.login()).toEqual({ ok: false, message: 'role denied' })
-      expect(creds.status()).toEqual(required)
+      expect(creds.status()).toMatchObject(required)
       expect(JSON.parse(readFileSync(tokenFile, 'utf8')).refreshToken).toBe('rt-live')
       denyRole = false
       expect(await creds.login()).toEqual({ ok: true })
-      expect(creds.status()).toEqual({ state: 'ok' })
+      expect(creds.status().state).toBe('ok')
       expect(log).toHaveBeenCalledTimes(1)
     } finally {
       browser.stop()
@@ -187,7 +193,7 @@ describe('AwsCreds', () => {
     const creds = make(fetchFn, { loginTimeoutMs: 150, failCooldownMs: 60_000 })
     const failed = await creds.warm()
     expect(failed.ok).toBe(false)
-    expect(creds.status()).toEqual({ state: 'required', message: failed.message })
+    expect(creds.status()).toMatchObject({ state: 'required', message: failed.message })
     expect(failed.message).toContain('AWS sign-in did not complete in time')
     expect(creds.loginUrl()).toBeUndefined()
     expect(await creds.warm()).toEqual(failed)
@@ -198,11 +204,71 @@ describe('AwsCreds', () => {
       expect(creds.login()).toBe(login)
       expect(creds.warm()).toBe(login)
       expect(await login).toEqual({ ok: true })
-      expect(creds.status()).toEqual({ state: 'ok' })
+      expect(creds.status().state).toBe('ok')
       expect(grants).toHaveLength(1)
     } finally {
       browser.stop()
     }
+  })
+
+  it('suppresses credential-invoking print calls and retains the one URL after timeout', async () => {
+    writeFileSync(tokenFile, JSON.stringify({ refreshToken: 'expired' }))
+    const { fetchFn } = fakeFetch({ token: () => json({ error: 'invalid_grant' }, 400) })
+    const creds = make(fetchFn, { loginTimeoutMs: 250 })
+    let finish: (result: RunResult) => void = () => {}
+    const runner = vi.fn(
+      () =>
+        new Promise<RunResult>((resolve) => {
+          finish = resolve
+        }),
+    )
+    const supervisor = new Supervisor(runner, undefined, creds)
+    const repo = {
+      id: 'app',
+      name: 'app',
+      path: dir,
+      configPath: join(dir, 'devspace.yaml'),
+      session: 'devdock-app',
+      ports: [],
+    }
+    const print = supervisor.print(repo)
+    const concurrentPrint = supervisor.print(repo)
+    const queued = supervisor.print({ ...repo, name: 'other' })
+    await vi.waitFor(() => expect(runner).toHaveBeenCalledTimes(1))
+
+    const warming = creds.warm()
+    await vi.waitFor(() => expect(creds.status().state).toBe('pending'))
+    const url = creds.status().loginUrl
+    expect(url).toBeTruthy()
+    for (let n = 0; n < 3; n++) {
+      expect((await supervisor.print(repo)).stderr).toContain(url)
+      expect((await supervisor.sandbox(repo, 'print')).stderr).toContain(url)
+      expect(creds.status().loginUrl).toBe(url)
+    }
+    finish({ code: -1, stdout: '', stderr: '', timedOut: true })
+    expect((await print).stderr).toContain(url)
+    expect(await concurrentPrint).toEqual(await print)
+    expect((await queued).stderr).toContain(url)
+    expect((await warming).ok).toBe(false)
+    expect(creds.status()).toMatchObject({
+      state: 'required',
+      loginUrl: url,
+      loginExpiresAt: expect.any(String),
+    })
+    expect((await supervisor.print(repo)).stderr).toContain(url)
+    expect(runner).toHaveBeenCalledTimes(1)
+  })
+
+  it('reads expiry from the selected SSO session cache only', () => {
+    const key = createHash('sha1').update('dev').digest('hex')
+    const expiresAt = '2027-02-03T04:05:06Z'
+    writeFileSync(
+      configPath,
+      '[profile devspace]\nsso_session = dev\n[profile other]\nsso_session = other\n',
+    )
+    writeFileSync(join(dir, `${key}.json`), JSON.stringify({ expiresAt }))
+    expect(ssoSessionExpiry(configPath, dir, 'devspace')).toBe(Date.parse(expiresAt))
+    expect(ssoSessionExpiry(configPath, dir, 'other')).toBeUndefined()
   })
 
   it('mints silently via the refresh token grant — no browser', async () => {
@@ -401,7 +467,7 @@ describe('AwsCreds', () => {
       const fetchFn = vi.fn() as unknown as typeof fetch
       const creds = new AwsCreds({ oidcConfigPath: path, tokenFile, fetchFn })
       expect(creds.configured()).toBe(false)
-      expect(creds.status()).toEqual({ state: 'ok' })
+      expect(creds.status().state).toBe('ok')
       expect(await creds.warm()).toEqual({ ok: true })
       expect((await creds.credential()).ok).toBe(false)
       expect(fetchFn).not.toHaveBeenCalled()

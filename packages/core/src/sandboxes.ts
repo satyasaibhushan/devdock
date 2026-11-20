@@ -253,7 +253,7 @@ interface SandboxDeps {
   kubectl: Runner
   supervisor: Supervisor
   instanceId: string
-  repos: () => Repo[]
+  repos: (id?: string) => Repo[]
   namespace: () => Promise<string>
   assertAvailable: (repo: Repo, namespace: string) => Promise<void>
   authorize: (repo: string, build?: boolean) => Promise<void>
@@ -309,7 +309,7 @@ export class Sandboxes {
     this.save(s)
   }
   private repo(m: SandboxMemberInput): Repo {
-    const parent = this.deps.repos().find((r) => r.id === m.repo && !r.parentId)
+    const parent = this.deps.repos(m.repo).find((r) => r.id === m.repo && !r.parentId)
     if (!parent) throw new Error(`unknown repo: ${m.repo}`)
     if (!startupPodTypes(parent).includes(m.workload))
       throw new Error(`unknown workload: ${m.workload}`)

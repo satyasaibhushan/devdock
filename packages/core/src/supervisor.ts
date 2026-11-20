@@ -2,7 +2,15 @@
 // Each `devspace dev` runs inside its own named tmux session so it survives
 // daemon restarts and the daemon never blocks on it (spec §5).
 import { randomUUID } from 'node:crypto'
-import { type RunResult, loginShell, loginShellArgs, run, runStream } from './exec.js'
+import type { AwsCreds } from './awsCreds.js'
+import {
+  type RunOptions,
+  type RunResult,
+  loginShell,
+  loginShellArgs,
+  run,
+  runStream,
+} from './exec.js'
 import type { Repo } from './types.js'
 import {
   CACHED_PULL_SECRET_PROFILE,
@@ -10,11 +18,12 @@ import {
   canReusePullSecret,
   devdockConfigPath,
   hasDevdockProfile,
+  prepareEnvSyncConfig,
   prepareWorkloadConfig,
 } from './workloadConfig.js'
 
 /** Injectable command runner — defaults to the real `run`; swapped in tests. */
-export type Runner = (cmd: string, args: string[], opts?: { cwd?: string }) => Promise<RunResult>
+export type Runner = (cmd: string, args: string[], opts?: RunOptions) => Promise<RunResult>
 
 /** Runner that also emits output lines as they arrive (defaults to `runStream`). */
 export type StreamRunner = (
@@ -112,8 +121,15 @@ export function verbLabel(repo: Repo, verb: string): string {
 export class Supervisor {
   private readonly runner: Runner
   private readonly streamRunner: StreamRunner
+  private readonly printing = new Map<string, Promise<RunResult>>()
+  private printBackoffUntil = 0
+  private printTail: Promise<void> = Promise.resolve()
 
-  constructor(runner?: Runner, streamRunner?: StreamRunner) {
+  constructor(
+    runner?: Runner,
+    streamRunner?: StreamRunner,
+    private readonly awsCreds?: AwsCreds,
+  ) {
     this.runner = runner ?? run
     // An injected plain runner (tests) doubles as the stream runner — output
     // then arrives only in the RunResult, which is fine for canned fakes.
@@ -191,16 +207,40 @@ export class Supervisor {
     return r.code === 0 && r.stdout.trim() === '1'
   }
 
-  sandbox(
+  async sandbox(
     repo: Repo,
     action: 'sync' | 'deploy' | 'reset' | 'print' | 'image' | 'architecture',
     awake = false,
     skipBuild = false,
   ): Promise<RunResult> {
-    prepareWorkloadConfig(repo)
+    if (action === 'print') {
+      return this.printConfig(
+        this.sandboxTarget(repo, awake),
+        'print --skip-info -p persistent -p sandbox',
+      )
+    }
+    if (action === 'sync') await prepareEnvSyncConfig(repo, this.runner)
+    else prepareWorkloadConfig(repo)
+    const verb =
+      action === 'sync'
+        ? 'run-pipeline sync-env'
+        : action === 'reset'
+          ? 'run-pipeline sandbox-reset'
+          : action === 'image'
+            ? 'run-pipeline sandbox-image'
+            : action === 'architecture'
+              ? 'run-pipeline sandbox-architecture'
+              : `deploy -p persistent -p sandbox${skipBuild ? ' --skip-build' : ''}`
+    return this.runner(loginShell, [
+      loginShellArgs,
+      devspaceCommand(this.sandboxTarget(repo, awake), verb),
+    ])
+  }
+
+  private sandboxTarget(repo: Repo, awake: boolean): Repo {
     const replicas = awake ? '1' : '0'
     const type = repo.varDefaults?.WORKLOAD_TYPE
-    const target = {
+    return {
       ...repo,
       varDefaults: {
         ...repo.varDefaults,
@@ -210,19 +250,6 @@ export class Supervisor {
         CRON_PERSISTENT_REPLICAS: type === 'cron' ? replicas : '0',
       },
     }
-    const verb =
-      action === 'sync'
-        ? 'run-pipeline sync-env'
-        : action === 'reset'
-          ? 'run-pipeline sandbox-reset'
-          : action === 'print'
-            ? 'print --skip-info -p persistent -p sandbox'
-            : action === 'image'
-              ? 'run-pipeline sandbox-image'
-              : action === 'architecture'
-                ? 'run-pipeline sandbox-architecture'
-                : `deploy -p persistent -p sandbox${skipBuild ? ' --skip-build' : ''}`
-    return this.runner(loginShell, [loginShellArgs, devspaceCommand(target, verb)])
   }
 
   /** Build & deploy without entering dev mode: `devspace deploy`, through a
@@ -237,8 +264,71 @@ export class Supervisor {
   /** The effective config `devspace dev` would run with (imports merged,
    *  profiles applied, vars resolved), invoked exactly like the other verbs. */
   print(repo: Repo): Promise<RunResult> {
+    return this.printConfig(repo, 'print --skip-info')
+  }
+
+  private async printConfig(repo: Repo, verb: string): Promise<RunResult> {
+    const deferred = this.printDeferred()
+    if (deferred) return deferred
+    const key = JSON.stringify([
+      repo.configPath,
+      repo.name,
+      repo.namespace,
+      repo.varDefaults,
+      repo.devspaceTemplateName,
+      verb,
+    ])
+    const pending = this.printing.get(key)
+    if (pending) return pending
+    // Different configs cannot share output, but still share the AWS profile.
+    const print = this.printTail.then(() => this.runPrint(repo, verb))
+    this.printTail = print.then(
+      () => undefined,
+      () => undefined,
+    )
+    this.printing.set(key, print)
+    try {
+      return await print
+    } finally {
+      this.printing.delete(key)
+    }
+  }
+
+  private printDeferred(): RunResult | undefined {
+    const status = this.awsCreds?.status()
+    if (status?.state === 'pending' || status?.state === 'required') {
+      return {
+        code: 1,
+        stdout: '',
+        stderr: [status.message ?? 'AWS sign-in pending', status.loginUrl]
+          .filter(Boolean)
+          .join('\n'),
+      }
+    }
+    if (Date.now() < this.printBackoffUntil) {
+      return { code: 1, stdout: '', stderr: 'DevSpace print is backing off after a timeout' }
+    }
+  }
+
+  private async runPrint(repo: Repo, verb: string): Promise<RunResult> {
+    const deferred = this.printDeferred()
+    if (deferred) return deferred
     prepareWorkloadConfig(repo)
-    return this.runner(loginShell, [loginShellArgs, devspaceCommand(repo, 'print --skip-info')])
+    const result = await this.runner(loginShell, [loginShellArgs, devspaceCommand(repo, verb)], {
+      timeoutMs: 15_000,
+      killProcessGroup: true,
+    })
+    if (!result.timedOut) return result
+    const loginUrl = this.awsCreds?.status().loginUrl
+    const stderr = [
+      'devspace print timed out',
+      result.stderr.trim(),
+      loginUrl && !result.stderr.includes(loginUrl) ? loginUrl : undefined,
+    ]
+      .filter(Boolean)
+      .join('\n')
+    this.printBackoffUntil = Date.now() + 15_000
+    return { ...result, stdout: '', stderr }
   }
 
   /** Tear down: kill the tmux session first — devdock's own `devspace dev`
