@@ -20,6 +20,10 @@ import type {
   SandboxUpdate,
   SandboxView,
   TermInfo,
+  TestOutput,
+  TestOutputStream,
+  TestRun,
+  TestRunOptions,
   WaitResult,
   WorkflowAction,
   WorkloadRunResult,
@@ -138,6 +142,9 @@ export interface DaemonClient {
   replicaList(): Promise<ReplicaInfo[]>
   replicaDelete(id: string): Promise<void>
   replicaReleaseRoute(id: string): Promise<void>
+  startTest(id: string, options: TestRunOptions): Promise<TestRun>
+  testStatus(id: string): Promise<TestRun>
+  testOutput(id: string, stream: TestOutputStream, offset?: number): Promise<TestOutput>
   termList(): Promise<TermInfo[]>
   termOpen(opts: TermOpenOpts): Promise<TermInfo>
   termRun(tid: string, command: string, timeoutMs?: number): Promise<RunOutcome>
@@ -349,6 +356,10 @@ export function daemonClient(send: DaemonTransport, prefix = ''): DaemonClient {
     replicaCreate: (i, branch, ownImage, requestId, route) =>
       post<ReplicaInfo>(`/repos/${id(i)}/replicas`, { branch, ownImage, requestId, route }),
     replicaList: () => request<ReplicaInfo[]>('/replicas'),
+    startTest: (i, options) => post(`/repos/${id(i)}/test`, options),
+    testStatus: (i) => request(`/tests/${id(i)}`),
+    testOutput: (i, stream, offset = 0) =>
+      request(`/tests/${id(i)}/output?stream=${stream}&offset=${offset}`),
     replicaReleaseRoute: async (i) => {
       await post(`/replicas/${id(i)}/release-route`, {})
     },

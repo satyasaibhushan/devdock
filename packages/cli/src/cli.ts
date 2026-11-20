@@ -15,6 +15,10 @@ Usage:
   devdock replica create <repo> <branch> [--route] [--own-image] [--request-id <id>] [--json]
   devdock replica release-route <replica>
 
+  devdock test <repo> [--ref <ref> | --worktree <path>]
+      --profile <php-7.1|php-8.1|php-8.5>  --command <command>  --timeout-ms <n>  --json
+      Run in a disposable Docker container and exit with the suite's exit code.
+
   devdock run  <repo> <command>   run a command in the workload's pod; exits with
                                   the command's REAL exit code (124 = timed out,
                                   125 = infra error: no pod / auth / connectivity)
@@ -41,7 +45,7 @@ export interface CliRequest {
 }
 
 export interface ParsedCli {
-  command: 'run' | 'wait' | 'logs' | 'replica'
+  command: 'run' | 'wait' | 'logs' | 'replica' | 'test'
   request: CliRequest
   json: boolean
 }
@@ -144,6 +148,40 @@ export function parseCli(argv: string[]): ParsedCli {
       },
     }
   }
+  if (command === 'test') {
+    const { values, positionals } = parseArgs({
+      args: rest,
+      allowPositionals: true,
+      options: {
+        ref: { type: 'string' },
+        worktree: { type: 'string' },
+        profile: { type: 'string' },
+        command: { type: 'string' },
+        'timeout-ms': { type: 'string' },
+        json: { type: 'boolean' },
+      },
+    })
+    const [repo] = positionals
+    if (!repo || positionals.length !== 1) throw new UsageError('test needs exactly one repo')
+    if (values.ref !== undefined && values.worktree !== undefined)
+      throw new UsageError('Choose --ref or --worktree')
+    return {
+      command,
+      json: values.json === true,
+      request: {
+        method: 'POST',
+        path: `/repos/${encodeURIComponent(repo)}/test`,
+        body: compact({
+          ref: values.ref,
+          worktree: values.worktree,
+          profile: values.profile,
+          command: values.command,
+          timeoutMs: positiveInt('timeout-ms', values['timeout-ms']),
+        }),
+      },
+    }
+  }
+
   if (command === 'run') {
     const { values, positionals } = parseArgs({
       args: rest,

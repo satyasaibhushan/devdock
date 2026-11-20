@@ -2,7 +2,14 @@
 // (verbs, exec, namespace/auth mutation, terminals) only when the server runs
 // with rw scope — this is the "ro/rw via token scope" gate. Each tool is a
 // thin call into the daemon client.
-import type { LogSource, RepoState, WorkflowAction } from '@devdock/core'
+import { StringDecoder } from 'node:string_decoder'
+import {
+  type LogSource,
+  PHP_TEST_PROFILES,
+  type RepoState,
+  type TestOutputStream,
+  type WorkflowAction,
+} from '@devdock/core'
 import { z } from 'zod'
 import type { DaemonClient, MoveFollowUp, RepoVerb, VerbResult } from './client.js'
 import { sandboxTools } from './sandboxTools.js'
@@ -75,6 +82,13 @@ const VERBS: Array<{ verb: RepoVerb; description: string }> = [
     description: 'Reset a crashed dev pod without purge or rebuild (image stays as deployed).',
   },
 ]
+
+function incompleteUtf8Bytes(bytes: Buffer): number {
+  for (let i = bytes.length - 1; i >= Math.max(0, bytes.length - 3); i--) {
+    if (((bytes[i] ?? 0) & 0xc0) !== 0x80) return bytes.length - i
+  }
+  return 0
+}
 
 /** All tool definitions, regardless of scope. */
 export function allTools(client: DaemonClient): ToolDef[] {
@@ -175,6 +189,34 @@ export function allTools(client: DaemonClient): ToolDef[] {
       scope: 'ro',
       inputSchema: repoArg,
       handler: async (a) => JSON.stringify(await client.status(a.repo as string), null, 2),
+    },
+    {
+      name: 'devdock_test_result',
+      description:
+        'Read an isolated test run and exit code. Select stdout or stderr to read an output page, and use nextOffset to continue.',
+      scope: 'ro',
+      inputSchema: {
+        run: z.string().uuid(),
+        stream: z.enum(['stdout', 'stderr']).optional(),
+        offset: z.number().int().nonnegative().optional(),
+      },
+      handler: async (a) => {
+        const id = a.run as string
+        const status = await client.testStatus(id)
+        if (a.stream === undefined) return JSON.stringify(status, null, 2)
+        const page = await client.testOutput(
+          id,
+          a.stream as TestOutputStream,
+          a.offset as number | undefined,
+        )
+        const bytes = Buffer.from(page.data, 'base64')
+        const decoder = new StringDecoder('utf8')
+        const output = page.eof ? decoder.end(bytes) : decoder.write(bytes)
+        // Request any unfinished UTF-8 code point again with the next page.
+        const tail = decoder.end()
+        const nextOffset = page.nextOffset - (tail ? incompleteUtf8Bytes(bytes) : 0)
+        return JSON.stringify({ ...status, output, nextOffset, eof: page.eof }, null, 2)
+      },
     },
     {
       name: 'devdock_logs',
@@ -440,6 +482,39 @@ export function allTools(client: DaemonClient): ToolDef[] {
         await client.replicaDelete(a.replica as string)
         return `deleted ${a.replica}`
       },
+    },
+    {
+      name: 'devdock_test',
+      description:
+        'Run a PHP suite in a disposable Docker container on the daemon host. Returns a run id immediately. Use devdock_test_result for the exit code and full output. The source is HEAD by default. The suite runs without network access.',
+      scope: 'rw',
+      inputSchema: {
+        ...repoArg,
+        ref: z.string().min(1).optional().describe('Git ref on the daemon host'),
+        worktree: z
+          .string()
+          .min(1)
+          .optional()
+          .describe('Absolute path to a worktree of this repo on the daemon host'),
+        profile: z.enum(PHP_TEST_PROFILES).optional(),
+        command: z
+          .string()
+          .min(1)
+          .max(8192)
+          .optional()
+          .describe('Shell command in the test container; defaults to PHPUnit'),
+        timeoutMs: z.number().int().positive().max(3_600_000).optional(),
+      },
+      handler: async (a) =>
+        JSON.stringify(
+          await client.startTest(a.repo as string, {
+            ref: a.ref as string | undefined,
+            worktree: a.worktree as string | undefined,
+            profile: a.profile as string | undefined,
+            command: a.command as string | undefined,
+            timeoutMs: a.timeoutMs as number | undefined,
+          }),
+        ),
     },
     {
       name: 'devdock_run',

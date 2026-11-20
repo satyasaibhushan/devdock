@@ -6,6 +6,9 @@ import {
   type LifecycleAction,
   RouteConflict,
   type Service,
+  TestRunBusyError,
+  TestRunInputError,
+  type TestRunOptions,
   type WorkflowAction,
 } from '@devdock/core'
 import fastifyStatic from '@fastify/static'
@@ -457,6 +460,50 @@ export function buildApp(
     sandboxRoutes(sandboxApp, service)
   })
   sandboxLinkRoute(app, service)
+
+  app.post<{ Params: { id: string }; Body: TestRunOptions }>(
+    '/repos/:id/test',
+    async (req, reply) => {
+      try {
+        return reply.code(202).send(service.startTest(req.params.id, req.body ?? {}))
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        const code =
+          err instanceof TestRunInputError
+            ? 400
+            : err instanceof TestRunBusyError
+              ? 409
+              : message.includes('unknown repo')
+                ? 404
+                : 500
+        return reply.code(code).send({ error: message })
+      }
+    },
+  )
+
+  app.get<{ Params: { id: string } }>('/tests/:id', async (req, reply) => {
+    const status = service.testRuns.status(req.params.id)
+    return status ?? reply.code(404).send({ error: 'unknown test run' })
+  })
+
+  app.get<{
+    Params: { id: string }
+    Querystring: { stream?: string; offset?: string }
+  }>('/tests/:id/output', async (req, reply) => {
+    const stream = req.query.stream ?? 'stdout'
+    const offset = Number(req.query.offset ?? 0)
+    if (
+      (stream !== 'stdout' && stream !== 'stderr') ||
+      !Number.isSafeInteger(offset) ||
+      offset < 0
+    ) {
+      return reply
+        .code(400)
+        .send({ error: 'Expected stdout or stderr and a non-negative byte offset' })
+    }
+    const output = service.testRuns.output(req.params.id, stream, offset)
+    return output ?? reply.code(404).send({ error: 'unknown test run' })
+  })
 
   // One-shot command in the workload's pod with a REAL exit code (kubectl
   // exec) — the agent-loop counterpart to /exec's fire-and-forget send-keys.

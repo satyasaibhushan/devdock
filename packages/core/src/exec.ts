@@ -1,6 +1,7 @@
 // Thin promise wrapper around child_process — devdock shells out to
 // trusted CLIs (devspace, kubectl, tmux) rather than reimplementing them.
 import { type ChildProcess, spawn } from 'node:child_process'
+import { closeSync, openSync } from 'node:fs'
 import { env } from 'node:process'
 
 /** The user's login shell. devdock shells out to `devspace`, which in turn
@@ -35,6 +36,8 @@ export interface RunOptions {
   /** Cap each captured stream to this many bytes, keeping the TAIL — the end
    *  of a test run or stack trace is the informative part. */
   maxOutputBytes?: number
+  /** Send both streams directly to private log files instead of buffering. */
+  outputFiles?: { stdout: string; stderr: string }
 }
 
 /** Run a command to completion and capture its output. Never rejects — a
@@ -43,7 +46,27 @@ export interface RunOptions {
 export function run(cmd: string, args: string[], opts: RunOptions = {}): Promise<RunResult> {
   return new Promise((resolve) => {
     const processGroup = opts.killProcessGroup && process.platform !== 'win32'
-    const child = spawn(cmd, args, { cwd: opts.cwd, env: opts.env, detached: processGroup })
+    let out: number | undefined
+    let err: number | undefined
+    let child: ChildProcess
+    try {
+      if (opts.outputFiles) {
+        out = openSync(opts.outputFiles.stdout, 'a', 0o600)
+        err = openSync(opts.outputFiles.stderr, 'a', 0o600)
+      }
+      child = spawn(cmd, args, {
+        cwd: opts.cwd,
+        env: opts.env,
+        detached: processGroup,
+        stdio: opts.outputFiles ? ['ignore', out, err] : 'pipe',
+      })
+    } catch (error) {
+      resolve({ code: 125, stdout: '', stderr: String(error) })
+      return
+    } finally {
+      if (out !== undefined) closeSync(out)
+      if (err !== undefined) closeSync(err)
+    }
     let stdout = ''
     let stderr = ''
     let timedOut = false

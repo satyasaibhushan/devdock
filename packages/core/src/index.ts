@@ -7,6 +7,15 @@ export { Operations, type Operation, type OperationStage } from './operations.js
 export { DeploymentOwnership } from './ownership.js'
 export { RouteConflict } from './replicaRoutes.js'
 export {
+  TestRunBusyError,
+  TestRunInputError,
+  type TestOutput,
+  type TestOutputStream,
+  type TestRun,
+  type TestRunOptions,
+} from './testRuns.js'
+export { PHP_TEST_PROFILES } from './testProfiles.js'
+export {
   lifecycleActions,
   lifecyclePlan,
   type LifecycleAction,

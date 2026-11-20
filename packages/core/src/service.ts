@@ -61,6 +61,7 @@ import {
 import { type ReplicaInfo, type ReplicaRecord, StateStore } from './stateStore.js'
 import { type SessionState, type StreamRunner, Supervisor, verbLabel } from './supervisor.js'
 import { type RunOutcome, type TermInfo, type TermKind, TermRegistry } from './termRegistry.js'
+import { type TestRunOptions, TestRuns } from './testRuns.js'
 import type {
   DeploymentInfo,
   PodInfo,
@@ -316,6 +317,7 @@ export class Service {
   private readonly shellWatches = new Map<string, NodeJS.Timeout>()
   private readonly creatingReplicas = new Set<string>()
   private readonly replicaRoutes: ReplicaRoutes
+  readonly testRuns: TestRuns
   private readonly replicaRequests = new Map<string, Promise<ReplicaRecord>>()
   private timer?: NodeJS.Timeout
   private authTimer?: NodeJS.Timeout
@@ -397,6 +399,7 @@ export class Service {
     this.streamSpawner = deps.streamSpawner ?? spawnStream
     this.store = new StateStore(this.opts.stateFile)
     this.replicaRoutes = new ReplicaRoutes(this.store, this.kubectl)
+    this.testRuns = new TestRuns(`${this.opts.stateFile}.tests`, this.runner)
     this.operations = new Operations(`${this.opts.stateFile}.operations`)
     this.sandboxes = new Sandboxes({
       store: this.store,
@@ -1640,6 +1643,10 @@ export class Service {
       state.repo.id,
       startupPodType(state.repo, state.repo.defaultWorkload),
     )
+  }
+
+  startTest(id: string, options: TestRunOptions) {
+    return this.testRuns.start(this.repoOrThrow(id), options)
   }
 
   // ---- replicas: ephemeral branch-pinned parallel deployments (spec: replicas) ----
@@ -3501,6 +3508,7 @@ export class Service {
     // from tick one instead of racing kubelogins at boot.
     await this.auth.init().catch(() => undefined)
     this.rescan()
+    void this.testRuns.recover().catch((error: unknown) => console.error(error))
     await this.reconcileAll()
     this.stopped = false
     await this.sandboxes.recover()

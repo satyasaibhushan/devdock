@@ -1,4 +1,4 @@
-import { RouteConflict } from '@devdock/core'
+import { RouteConflict, TestRunInputError } from '@devdock/core'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -779,6 +779,46 @@ describe('daemon routes', () => {
       payload: { branch: 'main' },
     })
     expect(unknown.statusCode).toBe(404)
+  })
+
+  it('starts a background test run and serves its status and paged output', async () => {
+    const service = makeReplicaService()
+    const app = buildApp(service)
+    const id = '0f9f2b5f-1f61-417a-a790-66231e7e5bd5'
+    const record = { id, repo: 'parent', state: 'running' as const, startedAt: 0 }
+    const startTest = vi.spyOn(service, 'startTest').mockReturnValue(record)
+    vi.spyOn(service.testRuns, 'status').mockReturnValue({
+      ...record,
+      state: 'finished',
+      exitCode: 7,
+    })
+    const output = vi
+      .spyOn(service.testRuns, 'output')
+      .mockReturnValue({ data: 'dGVzdA==', nextOffset: 8, eof: true })
+    const started = await app.inject({
+      method: 'POST',
+      url: '/repos/parent/test',
+      payload: { ref: 'feature', profile: 'php-8.1' },
+    })
+    expect(started.statusCode).toBe(202)
+    expect(started.json()).toEqual(record)
+    expect(startTest).toHaveBeenCalledWith('parent', { ref: 'feature', profile: 'php-8.1' })
+    expect((await app.inject({ method: 'GET', url: `/tests/${id}` })).json()).toMatchObject({
+      exitCode: 7,
+    })
+    expect(
+      (
+        await app.inject({ method: 'GET', url: `/tests/${id}/output?stream=stderr&offset=4` })
+      ).json(),
+    ).toMatchObject({ data: 'dGVzdA==', nextOffset: 8, eof: true })
+    expect(output).toHaveBeenCalledWith(id, 'stderr', 4)
+    expect(
+      (await app.inject({ method: 'GET', url: `/tests/${id}/output?offset=-1` })).statusCode,
+    ).toBe(400)
+    startTest.mockImplementation(() => {
+      throw new TestRunInputError('invalid profile')
+    })
+    expect((await app.inject({ method: 'POST', url: '/repos/parent/test' })).statusCode).toBe(400)
   })
 
   it('POST /repos/:id/wait resolves on status and 400s with no condition', async () => {
