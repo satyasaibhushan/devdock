@@ -137,6 +137,12 @@ esac
     expect(mcpLauncher).toContain('/releases/')
     expect(existsSync(mcpLink)).toBe(true)
     const release = dirname(dirname(mcpLauncher))
+    expect(readFileSync(join(release, 'build-info'), 'utf8').split('\n')).toEqual([
+      'local',
+      expect.stringMatching(/^\d{4}-\d{2}-\d{2}T.*Z$/),
+      repo,
+      '',
+    ])
     expect(existsSync(join(release, 'packages', 'mcp', 'dist', 'index.js'))).toBe(true)
     expect(
       existsSync(
@@ -262,6 +268,9 @@ describe('systemd installer', () => {
     })
     const release = readlinkSync(join(m.installRoot, 'current'))
     expect(release).toContain('/releases/')
+    expect(readFileSync(join(release, 'build-info'), 'utf8')).toMatch(
+      /^local\n\d{4}-\d{2}-\d{2}T.*Z\n/,
+    )
     expect(existsSync(join(release, 'packages', 'daemon', 'dist', 'index.js'))).toBe(true)
     const unit = readFileSync(m.unit, 'utf8')
     expect(unit).toContain(

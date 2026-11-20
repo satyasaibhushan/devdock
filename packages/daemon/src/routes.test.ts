@@ -82,6 +82,44 @@ it('development socket allows repository operations but denies host shells and p
 })
 
 describe('daemon routes', () => {
+  it('reports the running daemon build and a non-blocking main drift warning', async () => {
+    const daemonBuild = { sha: 'a'.repeat(40), builtAt: '2026-11-20T16:00:00Z', repoPath: root }
+    const mainSha = 'b'.repeat(40)
+    const runner = vi.fn(async (cmd: string, args: string[]) => {
+      if (cmd === 'git' && args.includes('rev-parse'))
+        return { code: 0, stdout: mainSha, stderr: '' }
+      if (cmd === 'git' && args.includes('rev-list')) return { code: 0, stdout: '3', stderr: '' }
+      return { code: 0, stdout: '{"items":[]}', stderr: '' }
+    })
+    const svc = new Service(
+      { roots: [root], stateFile: join(root, 'state.json'), daemonBuild },
+      { runner },
+    )
+    svc.rescan()
+    const app = buildApp(svc)
+    try {
+      const expected = {
+        sha: daemonBuild.sha,
+        builtAt: daemonBuild.builtAt,
+        mainSha,
+        commitsBehind: 3,
+        warning: 'Daemon is 3 commits behind main. Run the DevDock install script.',
+      }
+      expect((await app.inject('/repos/svc-a')).json().daemon).toEqual(expected)
+      const response = await app.inject({
+        method: 'POST',
+        url: '/repos/svc-a/prerequisites',
+        payload: { action: 'start' },
+      })
+      expect(response.json()).toEqual([
+        expect.objectContaining({ status: 'passed', daemon: expected, detail: expected.warning }),
+      ])
+      expect(await svc.prerequisites('svc-a', 'start')).toEqual([])
+    } finally {
+      await app.close()
+    }
+  })
+
   it('returns an operation receipt without waiting for deployment and exposes the same ID on reads', async () => {
     const { svc } = makeService()
     let finish!: (result: RunResult) => void

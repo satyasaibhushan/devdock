@@ -107,9 +107,10 @@ done
 "$NODE_BIN" --input-type=module --eval 'await import(process.argv[1])' "$STAGED_DAEMON_MCP"
 "$NODE_BIN" --input-type=module --eval 'await import(process.argv[1])' "$STAGED_MCP_SERVER"
 
-REVISION="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || printf 'local')"
-RELEASE_ID="$(date -u +%Y%m%dT%H%M%SZ)-$REVISION-$$"
+REVISION="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || printf 'local')"
+RELEASE_ID="$(date -u +%Y%m%dT%H%M%SZ)-${REVISION:0:12}-$$"
 RELEASE="$RELEASES/$RELEASE_ID"
+printf '%s\n%s\n%s\n' "$REVISION" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$REPO_ROOT" > "$STAGING/build-info"
 mv "$STAGING" "$RELEASE"
 STAGING=""
 DAEMON_JS="$RELEASE/packages/daemon/dist/index.js"

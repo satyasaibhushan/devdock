@@ -70,6 +70,27 @@ describe('generateReplicaConfig', () => {
     expect(js.vars.IMAGE_TAG).toBe('saibhushan-career-service-agents-api')
   })
 
+  it('syncs env using the parent DevSpace name for the imported S3 key', () => {
+    const config = parseYaml(
+      generateReplicaConfig(MEMBER_CONFIG, {
+        replicaId: 'career-service-agents-r1',
+        workloadType: 'api',
+        useGuidelinesEnv: true,
+      }),
+    )
+    expect(config.name).toBe('career-service-agents-r1-api')
+    expect(config.vars.ENVS_S3_KEY).toBe('${TEAM_NAME}/uat-us/career-service-agents-api/.env')
+  })
+
+  it('preserves a custom env key and replaces its source name only', () => {
+    const input = MEMBER_CONFIG.replace(
+      '  TEAM_NAME:',
+      '  ENVS_S3_KEY:\n    value: custom/${DEVSPACE_NAME}/.env\n  TEAM_NAME:',
+    )
+    const config = parseYaml(generateReplicaConfig(input, { replicaId: 'copy' }))
+    expect(config.vars.ENVS_S3_KEY).toEqual({ value: 'custom/career-service-agents-api/.env' })
+  })
+
   it('leaves everything else untouched, comments included', () => {
     expect(js.vars.WORKLOAD_TYPE).toBe('api')
     expect(js.vars.DEVSPACE_BINARY_DIR).toEqual({ source: 'env', default: './../../' })

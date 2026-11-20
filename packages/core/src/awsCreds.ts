@@ -48,6 +48,9 @@ export interface AwsSignInStatus {
   state: 'ok' | 'required' | 'pending'
   message?: string
   loginUrl?: string
+  loginExpiresAt?: string
+  expiresAt?: string
+  remainingMinutes?: number
 }
 
 /** A credential_process payload — what `/aws/credential` serves. */
@@ -113,6 +116,8 @@ export class AwsCreds {
   private lastFailMessage: string | undefined
   private inflight: Promise<WarmResult> | null = null
   private pendingLoginUrl: string | undefined
+  private lastLoginUrl: string | undefined
+  private loginExpiresAt: number | undefined
   private signInRequiredMessage: string | undefined
 
   constructor(opts: AwsCredsOptions = {}) {
@@ -138,21 +143,39 @@ export class AwsCreds {
   }
 
   status(): AwsSignInStatus {
-    if (!this.configured()) return { state: 'ok' }
+    const configured = this.configured()
+    const expiry = expiryStatus(
+      configured
+        ? parseExpiry(this.cred?.Expiration)
+        : ssoSessionExpiry(
+            process.env.AWS_CONFIG_FILE ?? join(homedir(), '.aws', 'config'),
+            join(homedir(), '.aws', 'sso', 'cache'),
+            process.env.AWS_PROFILE ?? process.env.AWS_DEFAULT_PROFILE ?? 'default',
+          ),
+    )
+    const login = {
+      ...(this.lastLoginUrl ? { loginUrl: this.lastLoginUrl } : {}),
+      ...(this.loginExpiresAt
+        ? { loginExpiresAt: new Date(this.loginExpiresAt).toISOString() }
+        : {}),
+    }
     if (this.pendingLoginUrl) {
       return {
         state: 'pending',
         message: this.signInRequiredMessage,
+        ...expiry,
+        ...login,
         loginUrl: this.pendingLoginUrl,
       }
     }
-    if (this.signInRequiredMessage) {
-      return { state: 'required', message: this.signInRequiredMessage }
+    const failure =
+      this.signInRequiredMessage ??
+      (Date.now() - this.lastFailAt < this.failCooldownMs ? this.lastFailMessage : undefined)
+    if (failure) return { state: 'required', message: failure, ...expiry, ...login }
+    if (configured && !this.fresh() && !this.loadRefreshToken()) {
+      return { state: 'required', message: 'no AWS sign-in saved', ...expiry }
     }
-    if (!this.fresh() && !this.loadRefreshToken()) {
-      return { state: 'required', message: 'no AWS sign-in saved' }
-    }
-    return { state: 'ok' }
+    return { state: 'ok', ...expiry }
   }
 
   /** Explicit retries share the current mint but bypass a previous failure's cooldown. */
@@ -198,6 +221,9 @@ export class AwsCreds {
     this.cred = undefined
     this.expiresAt = 0
     this.lastFailAt = 0
+    this.signInRequiredMessage = undefined
+    this.lastLoginUrl = undefined
+    this.loginExpiresAt = undefined
   }
 
   // ---- internals ----
@@ -217,6 +243,8 @@ export class AwsCreds {
       this.lastFailAt = 0
       this.lastFailMessage = undefined
       this.signInRequiredMessage = undefined
+      this.lastLoginUrl = undefined
+      this.loginExpiresAt = undefined
       return { ok: true }
     } catch (err) {
       this.lastFailAt = Date.now()
@@ -307,6 +335,8 @@ export class AwsCreds {
           )
           if (ok && got) {
             clearTimeout(timer)
+            this.lastLoginUrl = undefined
+            this.loginExpiresAt = undefined
             resolve(got)
           }
         })
@@ -321,6 +351,8 @@ export class AwsCreds {
         state,
       })}`
       this.pendingLoginUrl = url
+      this.lastLoginUrl = url
+      this.loginExpiresAt = Date.now() + this.loginTimeoutMs
       const tokens = await tokenGrant(this.fetchFn, ep.token, {
         grant_type: 'authorization_code',
         client_id: cfg.clientId,
@@ -462,4 +494,43 @@ function need(xml: string, tag: string): string {
   const v = xmlValue(xml, tag)
   if (!v) throw new Error(`STS response is missing ${tag}`)
   return v
+}
+
+function parseExpiry(value: unknown): number | undefined {
+  if (typeof value !== 'string') return undefined
+  const parsed = Date.parse(value.replace(/UTC$/, 'Z'))
+  return Number.isFinite(parsed) ? parsed : undefined
+}
+
+function expiryStatus(expiresAt: number | undefined) {
+  if (expiresAt === undefined) return {}
+  return {
+    expiresAt: new Date(expiresAt).toISOString(),
+    remainingMinutes: Math.max(0, Math.floor((expiresAt - Date.now()) / 60_000)),
+  }
+}
+
+/** Read expiry for the selected AWS CLI profile without invoking a credential process. */
+export function ssoSessionExpiry(configPath: string, cacheDir: string, profile: string) {
+  try {
+    const section = profile === 'default' ? 'default' : `profile ${profile}`
+    let current = ''
+    const settings = new Map<string, string>()
+    for (const line of readFileSync(configPath, 'utf8').split(/\r?\n/)) {
+      const header = /^\s*\[([^\]]+)\]\s*$/.exec(line)
+      if (header) current = header[1] ?? ''
+      if (current !== section) continue
+      const entry = /^\s*(sso_session|sso_start_url)\s*=\s*(.+?)\s*$/.exec(line)
+      if (entry?.[1] && entry[2]) settings.set(entry[1], entry[2])
+    }
+    const identity = settings.get('sso_session') ?? settings.get('sso_start_url')
+    if (!identity) return undefined
+    const key = createHash('sha1').update(identity).digest('hex')
+    const token = JSON.parse(readFileSync(join(cacheDir, `${key}.json`), 'utf8')) as {
+      expiresAt?: unknown
+    }
+    return parseExpiry(token.expiresAt)
+  } catch {
+    return undefined
+  }
 }

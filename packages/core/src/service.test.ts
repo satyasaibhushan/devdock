@@ -1,10 +1,12 @@
 import { createHash } from 'node:crypto'
 import {
   appendFileSync,
+  chmodSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -13,7 +15,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { parse as parseYaml } from 'yaml'
 import type { AuthManager } from './auth.js'
 import type { AwsCreds } from './awsCreds.js'
-import { type RunResult, loginShell } from './exec.js'
+import { type RunResult, loginShell, run } from './exec.js'
 import type { SpawnFn } from './logTailer.js'
 import { Operations } from './operations.js'
 import { PtyBroker } from './ptyBroker.js'
@@ -82,7 +84,7 @@ function fakeStreamSpawner() {
 describe('Service', () => {
   it.each([
     {
-      label: 'a live worktree',
+      label: 'a live worktree sharing its Helm release',
       peerName: 'svc-a',
       namespace: 'ns',
       release: 'shared-api',
@@ -121,7 +123,7 @@ describe('Service', () => {
       keep: false,
     },
   ])(
-    'stops a workload beside $label',
+    'stopping entry A leaves entry B untouched beside $label',
     async ({ peerName, namespace, release, live, claimed, keep }) => {
       const config = (name: string, ns: string, releaseName: string) =>
         `name: ${name}\nnamespace: ${ns}\nvars:\n  WORKLOAD_TYPE: api\ndeployments:\n  api:\n    helm:\n      releaseName: ${releaseName}\n`
@@ -170,6 +172,13 @@ describe('Service', () => {
         svc.logs('svc-a').some((line) => line.includes('shared-api') && line.includes('worktree')),
       ).toBe(keep)
       expect(runner).not.toHaveBeenCalledWith('tmux', ['kill-session', '-t', '=devdock-worktree'])
+      if (keep) {
+        expect(runner).not.toHaveBeenCalledWith('helm', expect.arrayContaining(['uninstall']))
+        expect(runner).not.toHaveBeenCalledWith(
+          'kubectl',
+          expect.arrayContaining(['delete', 'deployment']),
+        )
+      }
     },
   )
 
@@ -677,6 +686,55 @@ describe('Service', () => {
     nowSpy.mockRestore()
   })
 
+  it('includes the last termination, node memory, and RSS in status and wait', async () => {
+    const pods = JSON.stringify({
+      items: [
+        {
+          metadata: { name: 'svc-a-devspace-1' },
+          spec: { nodeName: 'node-a' },
+          status: {
+            phase: 'Running',
+            containerStatuses: [
+              {
+                name: 'php',
+                ready: false,
+                state: { running: {} },
+                lastState: { terminated: { exitCode: 137, reason: 'OOMKilled' } },
+              },
+            ],
+          },
+        },
+      ],
+    })
+    const base = cannedRunner(pods, true)
+    const runner = vi.fn(async (cmd: string, args: string[]) => {
+      if (cmd === 'kubectl' && args[1] === 'node') return { code: 0, stdout: '16Gi', stderr: '' }
+      if (cmd === 'kubectl' && args[0] === 'exec')
+        return { code: 0, stdout: 'Name:\tphp\nPid:\t3\nVmRSS:\t555 kB\n', stderr: '' }
+      return base(cmd, args)
+    })
+    const svc = new Service(
+      { roots: [root], stateFile },
+      { runner, streamSpawner: fakeStreamSpawner().spawner },
+    )
+    svc.rescan()
+    const diagnostics = {
+      lastTermination: { reason: 'OOMKilled', exitCode: 137 },
+      node: 'node-a',
+      nodeAllocatableMemory: '16Gi',
+      processRss: {
+        pod: 'svc-a-devspace-1',
+        container: 'php',
+        top: [{ pid: 3, name: 'php', rssKiB: 555 }],
+      },
+    }
+    expect((await svc.status('svc-a'))?.workloads[0]?.diagnostics).toMatchObject(diagnostics)
+    expect(await svc.wait('svc-a', { ready: true, timeoutMs: 10, pollMs: 5 })).toMatchObject({
+      reason: 'timeout',
+      diagnostics,
+    })
+  })
+
   it('reports the current scheduler reason for an empty rollout and still retries the rollout', async () => {
     const start = 1_800_000_000_000
     const now = vi.spyOn(Date, 'now').mockReturnValue(start + 10_000)
@@ -1029,6 +1087,43 @@ describe('Service', () => {
     expect(state?.status).toBe('STOPPED')
     expect(svc.listRepos().map((r) => r.id)).toEqual(['svc-a', 'svc-b'])
     expect(await svc.lookup('nope')).toBeUndefined()
+  })
+
+  it('discovers a new checkout when validating a sandbox member', async () => {
+    const svc = new Service(
+      { roots: [root], stateFile },
+      { runner: cannedRunner('{"items":[]}', false) },
+    )
+    svc.rescan()
+    mkdirSync(join(root, 'svc-new'))
+    writeFileSync(join(root, 'svc-new', 'devspace.yaml'), 'name: svc-new\n')
+    await expect(
+      svc.createSandbox({
+        key: 'new-sandbox',
+        actor: 'test',
+        members: [
+          { repo: 'svc-new', workload: 'api' },
+          { repo: 'missing', workload: 'api' },
+        ],
+      }),
+    ).rejects.toThrow('unknown repo: missing')
+  })
+
+  it('discovers every new checkout on the next repo list', async () => {
+    const svc = new Service(
+      { roots: [root], stateFile },
+      { runner: cannedRunner('{"items":[]}', false) },
+    )
+    svc.rescan()
+    for (const name of ['svc-b', 'svc-c']) {
+      mkdirSync(join(root, name))
+      writeFileSync(join(root, name, 'devspace.yaml'), `name: ${name}\n`)
+    }
+    expect((await svc.listWithOwnership()).map((state) => state.repo.id)).toEqual([
+      'svc-a',
+      'svc-b',
+      'svc-c',
+    ])
   })
 
   it('throttles the filesystem scan unknown repo ids trigger', async () => {
@@ -1841,6 +1936,7 @@ describe('Service', () => {
   it('refuses start/build while the AWS credential cannot be warmed', async () => {
     const runner = cannedRunner('{"items":[]}', false)
     const awsCreds = {
+      status: () => ({ state: 'ok' }),
       configured: () => true,
       fresh: () => false,
       warm: async () => ({ ok: false, message: 'AWS sign-in did not complete in time' }),
@@ -1860,6 +1956,7 @@ describe('Service', () => {
     const runner = cannedRunner('{"items":[]}', false)
     const warm = vi.fn(async () => ({ ok: true }))
     const awsCreds = {
+      status: () => ({ state: 'ok' }),
       configured: () => true,
       fresh: () => false,
       warm,
@@ -2222,6 +2319,27 @@ describe('Service replicas', () => {
     expect((await svc.createReplica('parent', 'third')).id).toBe('parent-r4')
   })
 
+  it('makes a replica worktree and its build inputs readable after a restrictive checkout', async () => {
+    const base = cannedRunner('{"items":[]}', false)
+    const runner = vi.fn(async (cmd: string, args: string[]) => {
+      if (cmd === 'git' && args[2] === 'worktree' && args[3] === 'add') {
+        const path = args[5] as string
+        mkdirSync(path, { mode: 0o700 })
+        writeFileSync(join(path, 'composer.json'), '{}', { mode: 0o600 })
+        mkdirSync(join(path, 'scripts'))
+        chmodSync(join(path, 'scripts'), 0o700)
+        writeFileSync(join(path, 'scripts', 'entrypoint'), '#!/bin/sh', { mode: 0o700 })
+      }
+      if (cmd === 'chmod') return run(cmd, args)
+      return base(cmd, args)
+    })
+    const { svc } = newService(runner)
+    const replica = await svc.createReplica('svc-a', 'feature')
+    expect(statSync(replica.path).mode & 0o777).toBe(0o755)
+    expect(statSync(join(replica.path, 'composer.json')).mode & 0o777).toBe(0o644)
+    expect(statSync(join(replica.path, 'scripts', 'entrypoint')).mode & 0o777).toBe(0o755)
+  })
+
   it('rejects replica-of-replica and blank branches', async () => {
     makeParent()
     const { svc } = newService()
@@ -2363,6 +2481,7 @@ describe('Service replicas', () => {
     let releaseStart = () => {}
     let warms = 0
     const awsCreds = {
+      status: () => ({ state: 'ok' }),
       configured: () => false,
       fresh: () => true,
       // create's own gate passes; the background start parks on the second.
@@ -2631,6 +2750,7 @@ describe('Service.wait', () => {
       kubectlAllowed: () => true,
     } as unknown as AuthManager
     const awsCreds = {
+      status: () => ({ state: 'ok' }),
       configured: () => false,
       fresh: () => true,
       warm: async () => ({ ok: !(denied && gate === 'aws') }),

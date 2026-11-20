@@ -417,6 +417,22 @@ describe('tool handlers', () => {
     expect(output).not.toContain('timeout:')
   })
 
+  it('includes the diagnostics returned by wait', async () => {
+    const wait = async () => ({
+      matched: false,
+      reason: 'timeout' as const,
+      elapsedMs: 100,
+      diagnostics: {
+        lastTermination: { pod: 'svc-a-55', reason: 'OOMKilled' },
+        nodeAllocatableMemory: '16Gi',
+      },
+    })
+    const t = allTools(fakeClient({ wait })).find((x) => x.name === 'devdock_wait')
+    const output = await t?.handler({ repo: 'svc-a', ready: true })
+    expect(output).toContain('OOMKilled')
+    expect(output).toContain('16Gi')
+  })
+
   it('verbs pass the workload through and report ok', async () => {
     const verb = vi.fn(async () => ok)
     const t = allTools(fakeClient({ verb })).find((x) => x.name === 'devdock_restart')
@@ -479,6 +495,21 @@ describe('tool handlers', () => {
     expect(replicaCreate).toHaveBeenCalledWith('svc-a', 'feature-x', undefined, 'retry-1')
     expect(out).toContain('created svc-a-r1 from feature-x')
     expect(out).toContain('devdock_wait')
+  })
+
+  it('reports replica image warnings to the caller', async () => {
+    const client = fakeClient()
+    const t = allTools(
+      fakeClient({
+        replicaCreate: async (id, branch) => ({
+          ...(await client.replicaCreate(id, branch)),
+          warnings: ['Parent image predates the Dockerfile. Set ownImage=true to rebuild it.'],
+        }),
+      }),
+    ).find((x) => x.name === 'devdock_replica_create')
+    expect(await t?.handler({ repo: 'svc-a', branch: 'feature' })).toContain(
+      'Parent image predates the Dockerfile',
+    )
   })
 
   it('replica_create passes ownImage through and mentions the image build', async () => {

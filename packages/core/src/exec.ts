@@ -30,6 +30,7 @@ export interface RunOptions {
   cwd?: string
   /** Kill the process after this many ms. */
   timeoutMs?: number
+  killProcessGroup?: boolean
   env?: NodeJS.ProcessEnv
   /** Cap each captured stream to this many bytes, keeping the TAIL — the end
    *  of a test run or stack trace is the informative part. */
@@ -41,7 +42,8 @@ export interface RunOptions {
  *  are both reported in the result so one absent CLI can't crash the daemon. */
 export function run(cmd: string, args: string[], opts: RunOptions = {}): Promise<RunResult> {
   return new Promise((resolve) => {
-    const child = spawn(cmd, args, { cwd: opts.cwd, env: opts.env })
+    const processGroup = opts.killProcessGroup && process.platform !== 'win32'
+    const child = spawn(cmd, args, { cwd: opts.cwd, env: opts.env, detached: processGroup })
     let stdout = ''
     let stderr = ''
     let timedOut = false
@@ -51,7 +53,13 @@ export function run(cmd: string, args: string[], opts: RunOptions = {}): Promise
     if (opts.timeoutMs) {
       timer = setTimeout(() => {
         timedOut = true
-        child.kill('SIGKILL')
+        if (processGroup && child.pid) {
+          try {
+            process.kill(-child.pid, 'SIGKILL')
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ESRCH') child.kill('SIGKILL')
+          }
+        } else child.kill('SIGKILL')
       }, opts.timeoutMs)
     }
 

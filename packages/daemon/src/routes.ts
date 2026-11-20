@@ -291,11 +291,23 @@ export function buildApp(
     async (req, reply) => {
       if (!workflowActions.has(req.body?.action ?? ''))
         return reply.code(400).send({ error: 'Invalid workflow action' })
-      return service.prerequisites(
+      const checks = await service.prerequisites(
         req.params.id,
         req.body.action as WorkflowAction,
         req.body.workload,
       )
+      const daemon = await service.versionInfo()
+      if (!daemon) return checks
+      return [
+        ...checks,
+        {
+          id: 'devdock-daemon',
+          label: 'DevDock daemon version',
+          status: 'passed',
+          detail: daemon.warning ?? `DevDock daemon ${daemon.sha} built ${daemon.builtAt}`,
+          daemon,
+        },
+      ]
     },
   )
   app.get<{ Querystring: { repo?: string } }>('/operations', async (req) =>
@@ -332,7 +344,7 @@ export function buildApp(
   )
 
   app.get<{ Params: { id: string } }>('/repos/:id', async (req, reply) => {
-    const state = await service.lookup(req.params.id)
+    const state = await service.status(req.params.id)
     if (!state) return reply.code(404).send({ error: 'unknown repo' })
     return state
   })

@@ -1,5 +1,6 @@
-import { execFileSync, spawnSync } from 'node:child_process'
+import { execFileSync, spawn, spawnSync } from 'node:child_process'
 import {
+  existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -13,7 +14,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
-import { devspaceCommand } from './supervisor.js'
+import { Supervisor, devspaceCommand } from './supervisor.js'
 import type { Repo } from './types.js'
 import {
   devdockConfigPath,
@@ -187,6 +188,77 @@ imports:
     )
     expect(devspaceCommand(repo, 'deploy -p persistent -p sandbox')).not.toContain('-p devdock')
   })
+  it('uses the portable sed rewrite during the first env sync with no dependency directory', async () => {
+    const repo = fixture()
+    const cold = join(repo.path, 'cold')
+    const original = process.env.DEVDOCK_DEVSPACE_DEPENDENCIES
+    process.env.DEVDOCK_DEVSPACE_DEPENDENCIES = cold
+    try {
+      writeFileSync(repo.configPath, uiConfig)
+      const supervisor = new Supervisor(async (cmd, args) => {
+        if (cmd === 'git') {
+          expect(args[0]).toBe('clone')
+          const dir = join(args.at(-1) as string, 'devspace', 'ui')
+          mkdirSync(dir, { recursive: true })
+          writeFileSync(
+            join(dir, 'devspace.yaml'),
+            `version: v2beta1\nfunctions:\n  prepare_local_env: |-\n    sed -i '' 's/a/b/' "$1"\n`,
+          )
+        } else {
+          expect(args[1]).toContain('run-pipeline sync-env')
+          const doc = parseYaml(readFileSync(workloadConfigPath(repo), 'utf8'))
+          const env = join(repo.path, '.env')
+          writeFileSync(env, 'a')
+          execFileSync('sh', ['-ec', doc.functions.prepare_local_env, 'test', env])
+          expect(readFileSync(env, 'utf8')).toBe('b')
+          expect(existsSync(`${env}.devdock-bak`)).toBe(false)
+        }
+        return { code: 0, stdout: '', stderr: '' }
+      })
+      expect(existsSync(cold)).toBe(false)
+      expect((await supervisor.sandbox(repo, 'sync')).code).toBe(0)
+    } finally {
+      process.env.DEVDOCK_DEVSPACE_DEPENDENCIES = original
+    }
+  })
+
+  it('shares one ECR docker login across concurrent deploys', async () => {
+    const repo = fixture()
+    writeFileSync(repo.configPath, uiConfig)
+    prepareWorkloadConfig(repo)
+    const doc = parseYaml(readFileSync(workloadConfigPath(repo), 'utf8'))
+    const bin = join(repo.path, 'bin')
+    mkdirSync(bin)
+    writeFileSync(
+      join(bin, 'aws'),
+      '#!/bin/sh\n[ "$1" = configure ] && exit 0\necho login >> "$HOME/aws-calls"\nsleep 0.2\necho password\n',
+      { mode: 0o755 },
+    )
+    writeFileSync(
+      join(bin, 'docker'),
+      '#!/bin/sh\nread -r password\n[ "$password" = password ]\n',
+      {
+        mode: 0o755,
+      },
+    )
+    const runLogin = () =>
+      new Promise((resolve) => {
+        const child = spawn('sh', ['-ec', doc.functions.docker_login_to_ecr], {
+          env: {
+            ...process.env,
+            HOME: repo.path,
+            PATH: `${bin}:${process.env.PATH}`,
+            AWS_DEVSPACE_PROFILE_NAME: 'dev',
+            AWS_REGION: 'us-east-1',
+            AWS_ECR_DEVSPACE_REPO: 'example.test',
+          },
+        })
+        child.once('close', resolve)
+      })
+    expect(await Promise.all([runLogin(), runLogin()])).toEqual([0, 0])
+    expect(readFileSync(join(repo.path, 'aws-calls'), 'utf8')).toBe('login\n')
+  })
+
   it('reads the guidelines from the local checkout when there is one', () => {
     const repo = fixture()
     writeFileSync(repo.configPath, uiConfig.replace('/ui', '/non-ui'))
@@ -243,14 +315,18 @@ dev:
           'imported-api': { resources: { limits: { memory: '4Gi' } } },
         }),
       )
-      const print = (config: string) =>
-        parseYaml(
-          execFileSync('devspace', ['print', '--skip-info', '-p', 'devdock'], {
+      const print = (config: string) => {
+        const output = execFileSync(
+          'devspace',
+          ['print', '--skip-info', '-p', 'devdock', '--kubeconfig', '/dev/null'],
+          {
             cwd: repo.path,
             env: { ...process.env, DEVSPACE_CONFIG: config },
             encoding: 'utf8',
-          }),
+          },
         )
+        return parseYaml(output.slice(output.search(/^version:/m)))
+      }
       try {
         prepareWorkloadConfig(repo)
         const common = print(workloadConfigPath(repo)).dev.common

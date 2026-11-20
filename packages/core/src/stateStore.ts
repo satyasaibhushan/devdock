@@ -48,6 +48,7 @@ export interface ReplicaRecord {
   /** The replica builds its own image from its branch (deploy-then-dev)
    *  instead of reusing the parent's. */
   ownImage?: boolean
+  warnings?: string[]
   /** Whether the URL alias Ingress has been applied (retried each pass until
    *  it sticks). */
   ingressApplied?: boolean

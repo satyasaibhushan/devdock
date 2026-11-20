@@ -8,17 +8,30 @@ import { basename, dirname, join } from 'node:path'
 import { AuthManager, type AuthState } from './auth.js'
 import { type AwsCredential, AwsCreds } from './awsCreds.js'
 import { CrashWatch } from './crashWatch.js'
+import { type DaemonBuild, daemonVersion } from './daemonVersion.js'
 import { environmentWarning } from './environmentWarning.js'
-import { type RunResult, run, runStream, spawnStream } from './exec.js'
+import { type RunOptions, type RunResult, run, runStream, spawnStream } from './exec.js'
 import { clusterIPService, helmReleaseNames } from './helmRelease.js'
 import { type LifecycleAction, lifecyclePlan } from './lifecycle.js'
 import { decodeCursor, encodeCursor, readFileSlice } from './logQuery.js'
 import { LogHub, LogTailer, type SpawnFn, cleanLine } from './logTailer.js'
 import { type Operation, type OperationStage, Operations } from './operations.js'
 import { DeploymentOwnership } from './ownership.js'
+import {
+  latestTermination,
+  rssContainer,
+  terminationEvent,
+  topProcessRss,
+} from './podDiagnostics.js'
 import { PtyBroker } from './ptyBroker.js'
-import { type ClusterCache, Reconciler, newClusterCache } from './reconciler.js'
+import {
+  type ClusterCache,
+  Reconciler,
+  matchesWorkloadName,
+  newClusterCache,
+} from './reconciler.js'
 import { duplicateRepoWarning, parseDevspaceConfig, scanRepos, sessionName } from './registry.js'
+import { replicaImageWarnings } from './replicaImage.js'
 import {
   aliasIngressManifest,
   generateReplicaConfig,
@@ -47,7 +60,16 @@ import {
 import { type ReplicaRecord, StateStore } from './stateStore.js'
 import { type SessionState, type StreamRunner, Supervisor, verbLabel } from './supervisor.js'
 import { type RunOutcome, type TermInfo, type TermKind, TermRegistry } from './termRegistry.js'
-import type { DeploymentInfo, PodInfo, Repo, RepoState, RepoStatus, TermMode } from './types.js'
+import type {
+  DeploymentInfo,
+  PodInfo,
+  Repo,
+  RepoState,
+  RepoStatus,
+  TermMode,
+  WorkloadDiagnostics,
+  WorkloadState,
+} from './types.js'
 import { WAIT_STATUSES, WaitCrashTracker, waitBlocked } from './wait.js'
 import {
   type CheckResult,
@@ -56,7 +78,11 @@ import {
   loadWorkflowConfig,
   verifyEndpoint,
 } from './workflow.js'
-import { canReusePullSecret, markPullSecretRefreshed } from './workloadConfig.js'
+import {
+  canReusePullSecret,
+  guidelinesTemplate,
+  markPullSecretRefreshed,
+} from './workloadConfig.js'
 import {
   assembleState,
   resolveWorkload,
@@ -71,6 +97,7 @@ export interface ServiceOptions {
   stateFile?: string
   reconcileMs?: number
   instanceId?: string
+  daemonBuild?: DaemonBuild
 }
 
 /** Grace after DevSpace reports the shell open before sending the startup
@@ -186,6 +213,7 @@ export interface WaitResult {
   /** The workload's status at resolution time. */
   status?: RepoStatus
   elapsedMs: number
+  diagnostics?: WorkloadDiagnostics
   /** Where log-watching stopped — pass to the next wait/logs call. */
   cursor?: string
 }
@@ -217,11 +245,7 @@ export interface ServiceDeps {
   supervisor?: Supervisor
   reconciler?: Reconciler
   broker?: PtyBroker
-  runner?: (
-    cmd: string,
-    args: string[],
-    opts?: { cwd?: string; timeoutMs?: number; maxOutputBytes?: number },
-  ) => Promise<RunResult>
+  runner?: (cmd: string, args: string[], opts?: RunOptions) => Promise<RunResult>
   /** Spawner for streaming children (kubectl logs -f, tail -F). Tests inject a fake. */
   streamSpawner?: SpawnFn
   /** Kubernetes OIDC login owner — injectable so tests can pin auth phases. */
@@ -232,7 +256,8 @@ export interface ServiceDeps {
 
 export class Service {
   readonly events = new EventEmitter()
-  private readonly opts: Required<Omit<ServiceOptions, 'instanceId'>>
+  private readonly opts: Required<Omit<ServiceOptions, 'instanceId' | 'daemonBuild'>>
+  private readonly daemonBuild?: DaemonBuild
   private readonly ownership?: DeploymentOwnership
   private readonly instanceId?: string
   private readonly replicaInstanceSuffix: string
@@ -282,6 +307,7 @@ export class Service {
   private readonly sessionHelmReleases = new Map<string, { target: string; names: string[] }>()
   /** Node of each workload's most recent DevSpace pod (in-memory). */
   private readonly lastDevNodes = new Map<string, string>()
+  private readonly lastPodNodes = new Map<string, { namespace?: string; node: string }>()
   /** When a pending startup command first saw its session pods ready. */
   private readonly startingPods = new Set<string>()
   private readonly startupReadySince = new Map<string, number>()
@@ -308,6 +334,7 @@ export class Service {
   private readonly pendingTermOpens = new Map<string, Promise<TermInfo>>()
 
   constructor(opts: ServiceOptions = {}, deps: ServiceDeps = {}) {
+    this.daemonBuild = opts.daemonBuild
     this.replicaInstanceSuffix = opts.instanceId ? `-${opts.instanceId.slice(0, 8)}` : ''
     this.opts = {
       roots: opts.roots ?? [],
@@ -358,7 +385,7 @@ export class Service {
     this.kubectl = gatedRunner
     this.instanceId = opts.instanceId
     if (opts.instanceId) this.ownership = new DeploymentOwnership(opts.instanceId, gatedRunner)
-    this.supervisor = deps.supervisor ?? new Supervisor(gatedRunner, streamRunner)
+    this.supervisor = deps.supervisor ?? new Supervisor(gatedRunner, streamRunner, this.awsCreds)
     this.reconciler = deps.reconciler ?? new Reconciler(gatedRunner)
     this.broker = deps.broker ?? new PtyBroker()
     // The service's own kubectl uses are `kubectl config …` (local, no API
@@ -374,7 +401,11 @@ export class Service {
       kubectl: this.kubectl,
       supervisor: this.supervisor,
       instanceId: opts.instanceId ?? '',
-      repos: () => [...this.repos.values()],
+      repos: (id) => {
+        if (id) this.discoverOnMiss(id)
+        else this.discoverNewRepos()
+        return this.listRepos()
+      },
       namespace: () => this.contextNamespace(),
       emit: (sandbox) => this.events.emit('sandbox', sandbox),
       authorize: async (id, build = true) => {
@@ -756,26 +787,24 @@ export class Service {
     })
   }
 
-  /** Discovery otherwise runs only at startup, so a checkout cloned later would
-   *  read as unknown until restart. On a miss, scan the roots and adopt just
-   *  that repo: a full rescan would swap the map under a running reconcile. */
-  private discoverOnMiss(id: string): Repo | undefined {
-    const known = this.repos.get(id)
-    if (known) return known
-    const replicas = this.store.listReplicas()
-    // A replica record owns its id even when its checkout is missing.
-    if (replicas.some((rec) => rec.id === id)) return undefined
-    // The scan is synchronous; a caller polling a stale id must not block the loop on every call.
+  /** Discover new checkouts without replacing entries a running reconcile uses. */
+  private discoverNewRepos(): void {
     const now = Date.now()
-    if (now - this.missScanAt < MISS_SCAN_INTERVAL_MS) return undefined
+    if (now - this.missScanAt < MISS_SCAN_INTERVAL_MS) return
     this.missScanAt = now
-    const found = this.scanRoots(replicas, (warning) => console.warn(warning)).find(
-      (r) => r.id === id,
+    const replicas = this.store.listReplicas()
+    const reserved = new Set(replicas.map((rec) => rec.id))
+    const found = this.scanRoots(replicas, (warning) => console.warn(warning)).filter(
+      (repo) => !this.repos.has(repo.id) && !reserved.has(repo.id),
     )
-    if (!found) return undefined
-    this.store.rememberRepoPaths([found])
-    this.repos.set(id, found)
-    return found
+    if (!found.length) return
+    this.store.rememberRepoPaths(found)
+    for (const repo of found) this.repos.set(repo.id, repo)
+  }
+
+  private discoverOnMiss(id: string): Repo | undefined {
+    if (!this.repos.has(id)) this.discoverNewRepos()
+    return this.repos.get(id)
   }
 
   /** `get`, but a repo cloned since startup is discovered and reconciled once
@@ -787,6 +816,99 @@ export class Service {
     return this.reconcileOne(id)
   }
 
+  async status(id: string): Promise<RepoState | undefined> {
+    const state = await this.lookup(id)
+    if (!state) return
+    const [daemon, workloads] = await Promise.all([
+      this.versionInfo(),
+      Promise.all(
+        state.workloads.map(async (workload) => {
+          const { repo, key } = this.scoped(id, workload.type || undefined)
+          const diagnostics = await this.workloadDiagnostics(repo, key, workload)
+          return diagnostics ? { ...workload, diagnostics } : workload
+        }),
+      ),
+    ])
+    return { ...state, workloads, ...(daemon ? { daemon } : {}) }
+  }
+
+  private async workloadDiagnostics(
+    repo: Repo,
+    key: string,
+    ws: WorkloadState,
+  ): Promise<WorkloadDiagnostics | undefined> {
+    if (ws.unreachable) return
+    const remembered = this.lastPodNodes.get(key)
+    const active = ws.hasSession || ws.sessionDead || ws.deployments.some((d) => d.replicas > 0)
+    const lost = ws.pods.length === 0 && (active || !!ws.lastTermination || !!remembered)
+    const unhealthy = ws.status === 'CRASHED' || ws.pods.some((pod) => !pod.ready)
+    if (!lost && !unhealthy && !ws.schedulingFailure) return
+
+    const target = ws.pods.find((pod) => pod.phase === 'Running' && rssContainer(pod))
+    const container = target && rssContainer(target)
+    const incidentNode = ws.pods.find((pod) => pod.name === ws.lastTermination?.pod)?.node
+    const node =
+      ws.lastTermination?.node ??
+      incidentNode ??
+      target?.node ??
+      ws.pods.find((pod) => pod.node)?.node ??
+      (remembered?.namespace === repo.namespace ? remembered?.node : undefined)
+    const ns = repo.namespace ? ['-n', repo.namespace] : []
+    const query = (args: string[]) =>
+      this.kubectl('kubectl', args, { timeoutMs: 3_000, maxOutputBytes: 256 * 1024 }).catch(
+        () => undefined,
+      )
+    const [events, memory, rss] = await Promise.all([
+      query(['get', 'events', ...ns, '--field-selector', 'involvedObject.kind=Pod', '-o', 'json']),
+      node
+        ? query(['get', 'node', node, '-o', 'jsonpath={.status.allocatable.memory}'])
+        : undefined,
+      target && container
+        ? query([
+            'exec',
+            ...ns,
+            target.name,
+            '-c',
+            container,
+            '--',
+            'sh',
+            '-c',
+            "if command -v grep >/dev/null; then grep -h -E '^(Name|Pid|VmRSS):' /proc/[0-9]*/status 2>/dev/null; else cat /proc/[0-9]*/status 2>/dev/null; fi",
+          ])
+        : undefined,
+    ])
+    let lastTermination = ws.lastTermination
+    if (events?.code === 0) {
+      try {
+        const items = (JSON.parse(events.stdout) as { items?: unknown[] }).items
+        const known = this.knownClusterNames()
+        const event = terminationEvent(items ?? [], (name) =>
+          matchesWorkloadName(name, repo.name, known),
+        )
+        // A live pod's status is better evidence than a historical event of unknown age.
+        lastTermination = lastTermination ?? event
+      } catch {
+        // Diagnostic reads are best-effort.
+      }
+    }
+    const top = rss?.stdout ? topProcessRss(rss.stdout) : []
+    const nodeAllocatableMemory = memory?.code === 0 ? memory.stdout.trim() : undefined
+    const diagnostics: WorkloadDiagnostics = {
+      ...(lastTermination ? { lastTermination } : {}),
+      ...(ws.schedulingFailure ? { schedulingFailure: ws.schedulingFailure } : {}),
+      ...(node ? { node } : {}),
+      ...(nodeAllocatableMemory ? { nodeAllocatableMemory } : {}),
+      ...(top.length && target && container
+        ? { processRss: { pod: target.name, container, top } }
+        : {}),
+    }
+    if (Object.keys(diagnostics).length) return diagnostics
+  }
+
+  async versionInfo() {
+    if (this.daemonBuild) return daemonVersion(this.daemonBuild, this.runner)
+  }
+
   listRepos(): Repo[] {
     return [...this.repos.values()]
   }
@@ -796,6 +918,15 @@ export class Service {
   }
 
   async listWithOwnership() {
+    this.discoverNewRepos()
+    const missing = this.listRepos().filter((repo) => !this.states.has(repo.id))
+    if (missing.length) {
+      const sessions = await this.supervisor.sessionStates()
+      const cache = newClusterCache()
+      for (const repo of missing) {
+        if (!this.states.has(repo.id)) await this.reconcileOne(repo.id, cache, sessions)
+      }
+    }
     const namespace = (await this.contextNamespace()) || 'default'
     return Promise.all(
       this.list().map(async (state) => {
@@ -947,6 +1078,14 @@ export class Service {
    *  refreshes it silently through the OIDC refresh token — a browser sign-in
    *  happens only when that token is gone/expired, and single-flight even then. */
   private async ensureAwsCreds(key: string): Promise<RunResult | null> {
+    const pending = this.awsCreds.status()
+    if (pending.state === 'pending') {
+      return {
+        code: 1,
+        stdout: '',
+        stderr: ['aws auth: sign-in pending', pending.loginUrl].filter(Boolean).join('\n'),
+      }
+    }
     const quiet = !this.awsCreds.configured() || this.awsCreds.fresh()
     const hub = this.hubFor(key)
     if (!quiet) hub.push('! AWS credential being refreshed')
@@ -957,7 +1096,8 @@ export class Service {
     }
     const detail = r.message ?? 'aws login required'
     hub.push(`✗ ${detail}`)
-    return { code: 1, stdout: '', stderr: `aws auth: ${detail}` }
+    const url = this.awsCreds.status().loginUrl
+    return { code: 1, stdout: '', stderr: [`aws auth: ${detail}`, url].filter(Boolean).join('\n') }
   }
 
   async start(id: string, workload?: string, automatic = false): Promise<RunResult> {
@@ -1183,7 +1323,10 @@ export class Service {
 
   private async releaseNames(repo: Repo): Promise<string[]> {
     const printed = await this.supervisor.print(repo)
-    if (printed.code !== 0) throw new Error(`Cannot resolve Helm releases for ${repo.id}`)
+    if (printed.code !== 0)
+      throw new Error(
+        `Cannot resolve Helm releases for ${repo.id}: ${printed.stderr.trim() || printed.code}`,
+      )
     const names = helmReleaseNames(printed.stdout)
     return names.length ? names : [repo.name]
   }
@@ -1623,7 +1766,9 @@ export class Service {
       if (parent.members?.length) {
         for (const member of parent.members) {
           const type = member.workloadType ?? member.id
-          const generated = generateReplicaConfig(readFileSync(member.configPath, 'utf8'), {
+          const yaml = readFileSync(member.configPath, 'utf8')
+          const generated = generateReplicaConfig(yaml, {
+            useGuidelinesEnv: !!guidelinesTemplate(yaml),
             replicaId: id,
             workloadType: type,
             // Default: the parent's tag — code arrives via sync, so the
@@ -1648,7 +1793,9 @@ export class Service {
           parent.codeArea === 'frontend'
             ? `${namespace ?? ''}-${parent.name}`
             : `${namespace ?? ''}-${parent.name}-\${WORKLOAD_TYPE}`
-        const generated = generateReplicaConfig(readFileSync(parent.configPath, 'utf8'), {
+        const yaml = readFileSync(parent.configPath, 'utf8')
+        const generated = generateReplicaConfig(yaml, {
+          useGuidelinesEnv: !!guidelinesTemplate(yaml),
           replicaId: id,
           imageTag: ownTag ?? parentTag,
           ...(ownTag ? { cacheSeed: parentTag } : {}),
@@ -1659,6 +1806,11 @@ export class Service {
         configPaths.push(configPath)
       }
       assertParentConfigsUnchanged()
+      const permissions = await this.runner('chmod', ['-R', 'go+rX', wt])
+      if (permissions.code !== 0)
+        throw new Error(
+          `Cannot make replica checkout readable: ${permissions.stderr.trim() || permissions.code}`,
+        )
       this.store.copyStartup(parentId, id) // inherit `python main.py` etc.
       const record: ReplicaRecord = {
         ...(opts.requestId ? { requestId: opts.requestId } : {}),
@@ -1673,7 +1825,19 @@ export class Service {
       if (opts.ownImage) record.ownImage = true
       const repo = this.materializeReplica(record)
       if (!repo) throw new Error('generated replica configs failed to parse')
-      await this.assertReplicaIsolated(repo, id)
+      const configs = await this.assertReplicaIsolated(repo, id)
+      if (!opts.ownImage) {
+        const warnings = new Set(
+          (
+            await Promise.all(
+              configs.map(({ scoped, effective }) =>
+                replicaImageWarnings(scoped, effective, this.runner).catch(() => []),
+              ),
+            )
+          ).flat(),
+        )
+        if (warnings.size) record.warnings = [...warnings]
+      }
       // Every helm release the deploy can create, remembered for uninstall on
       // delete (uninstall is best-effort, so a superset is harmless).
       record.releases = [
@@ -1684,6 +1848,7 @@ export class Service {
       ]
       this.store.addReplica(record) // persisted before start — restart-safe
       this.repos.set(id, repo)
+      for (const warning of record.warnings ?? []) this.hubFor(id).push(`! ${warning}`)
       if (opts.ownImage) {
         this.hubFor(id).push(
           `✓ replica ${id} created from ${trimmedBranch} — building image, then deploying`,
@@ -1712,7 +1877,8 @@ export class Service {
    *  checks what DevSpace itself resolves (imports, profiles, vars), so a
    *  config shape generation misses fails here instead of syncing over the
    *  parent's checkout. */
-  private async assertReplicaIsolated(repo: Repo, id: string): Promise<void> {
+  private async assertReplicaIsolated(repo: Repo, id: string) {
+    const configs: Array<{ scoped: Repo; effective: string }> = []
     for (const type of workloadTypes(repo)) {
       const scoped = scopeRepo(repo, type)
       const printed = await this.supervisor.print(scoped)
@@ -1720,11 +1886,15 @@ export class Service {
         printed.code === 0
           ? replicaIsolationProblems(printed.stdout, id)
           : [`devspace print failed: ${printed.stderr.trim() || `exit ${printed.code}`}`]
-      if (!problems.length) continue
+      if (!problems.length) {
+        configs.push({ scoped, effective: printed.stdout })
+        continue
+      }
       throw new Error(
         `Refusing replica ${id}: cannot prove ${scoped.name} only targets its own workloads (${problems.join('; ')}). Make the parent's DevSpace selectors and release names derive from \${DEVSPACE_NAME} or \${WORKLOAD_NAME}.`,
       )
     }
+    return configs
   }
 
   /** Delete a replica: stop its workloads, remove its alias ingress and its
@@ -2016,6 +2186,7 @@ export class Service {
       this.transitions,
       this.noPodsSince,
       this.emptyDevRollouts,
+      this.lastPodNodes,
       this.sessionHelmReleases,
       this.reconnects,
       this.pendingTermOpens,
@@ -2269,7 +2440,7 @@ export class Service {
       const dev = ws.deployments.find(
         (deployment) => deployment.name === `${scoped.name}-devspace` && deployment.replicas > 0,
       )
-      if (recovering && dev && ws.schedulingFailure) {
+      if (recovering && dev && ws.pods.length === 0 && ws.schedulingFailure) {
         const previous = this.states.get(id)?.workloads.find((w) => w.type === ws.type)
         if (previous?.schedulingFailure !== ws.schedulingFailure) {
           const message = `${dev.name} has no pods. FailedScheduling: ${ws.schedulingFailure}`
@@ -2323,6 +2494,15 @@ export class Service {
       }
       workloads.push(ws)
 
+      const previous = this.states.get(id)?.workloads.find((w) => w.type === ws.type)
+      if (!ws.unreachable && (ws.pods.length === 0 || ws.pods.some((pod) => !pod.ready))) {
+        const incident = latestTermination([previous?.lastTermination, ws.lastTermination])
+        if (incident) ws.lastTermination = incident
+      }
+      const podNode =
+        ws.pods.find((pod) => pod.name === ws.lastTermination?.pod)?.node ??
+        ws.pods.find((pod) => pod.node)?.node
+      if (podNode) this.lastPodNodes.set(key, { node: podNode, namespace: scoped.namespace })
       const devNode = ws.pods.find((p) => p.name.includes('-devspace') && p.node)?.node
       if (devNode) this.lastDevNodes.set(key, devNode)
       if (!exists && this.store.getStartupPod(key)) this.store.setStartupPod(key, undefined)
@@ -2831,6 +3011,16 @@ export class Service {
   /** Conditions are OR'd. Poll locally until matched, blocked, or the deadline.
    * Without a cursor, log watching starts at this call's first observation. */
   async wait(id: string, opts: WaitOptions): Promise<WaitResult> {
+    const result = await this.waitForCondition(id, opts)
+    const state = this.states.get(id)
+    if (!state) return result
+    const { type, key, repo } = this.scoped(id, opts.workload)
+    const workload = state.workloads.find((w) => w.type === (type ?? ''))
+    const diagnostics = workload && (await this.workloadDiagnostics(repo, key, workload))
+    return diagnostics ? { ...result, diagnostics } : result
+  }
+
+  private async waitForCondition(id: string, opts: WaitOptions): Promise<WaitResult> {
     if (!opts.contains && !opts.status && !opts.ready && !opts.http)
       throw new Error('wait needs at least one condition: contains, status, ready, or http')
     const wantStatus = opts.status?.toUpperCase()
@@ -3136,7 +3326,11 @@ export class Service {
   // ---- kubernetes auth (owned by AuthManager, surfaced over /auth) ----
   authState(): AuthState {
     const aws = this.awsCreds.status()
-    return { ...this.auth.snapshot(), aws, awsLoginUrl: aws.loginUrl }
+    return {
+      ...this.auth.snapshot(),
+      aws,
+      awsLoginUrl: aws.state === 'pending' ? aws.loginUrl : undefined,
+    }
   }
 
   /** Kick off one explicit login without holding the HTTP request open. The

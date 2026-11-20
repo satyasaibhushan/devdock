@@ -1,4 +1,5 @@
 // Shared domain types for @devdock/core.
+import type { DaemonVersion } from './daemonVersion.js'
 import type { LifecycleAction } from './lifecycle.js'
 
 /** Reconciled lifecycle state of a repo's workload (see spec §6).
@@ -91,8 +92,10 @@ export interface WorkloadState {
   pods: PodInfo[]
   deployments: DeploymentInfo[]
   hasSession: boolean
-  /** The latest scheduler message for this session's empty DevSpace rollout. */
+  /** The latest scheduler message for this workload. */
   schedulingFailure?: string
+  lastTermination?: PodTermination
+  diagnostics?: WorkloadDiagnostics
   /** The managed session's process exited, even if its pod can still run. */
   sessionDead?: boolean
   /** Lifecycle actions valid for this exact reconciled state. */
@@ -113,14 +116,46 @@ export interface PodInfo {
   crashing?: boolean
   /** Current container failure and its most recent termination, when reported. */
   failureReason?: string
+  termination?: PodTermination
+  schedulingFailure?: string
   name: string
   phase: string
   ready: boolean
   logContainer?: string
-  containers?: { name: string; restartCount: number; ready: boolean; init: boolean }[]
+  containers?: {
+    name: string
+    restartCount: number
+    ready: boolean
+    init: boolean
+    running?: boolean
+  }[]
   restartCount: number
   /** Node the pod is scheduled on. */
   node?: string
+}
+
+export interface PodTermination {
+  pod: string
+  reason: string
+  container?: string
+  message?: string
+  exitCode?: number
+  node?: string
+  at?: string
+}
+
+export interface ProcessRss {
+  pid: number
+  name: string
+  rssKiB: number
+}
+
+export interface WorkloadDiagnostics {
+  lastTermination?: PodTermination
+  schedulingFailure?: string
+  node?: string
+  nodeAllocatableMemory?: string
+  processRss?: { pod: string; container: string; top: ProcessRss[] }
 }
 
 /** A deployment object observed in the cluster — exists even when scaled to zero. */
@@ -137,6 +172,7 @@ export interface DeploymentInfo {
 
 /** The reconciled view of a single repo (spec §6). */
 export interface RepoState {
+  daemon?: DaemonVersion
   repo: Repo
   /** Aggregate status across workloads — the most attention-worthy one (see
    *  `aggregateStatus`). For single-workload repos this is just its status. */
