@@ -75,6 +75,7 @@ describe('launchd installer', () => {
 
     executable(join(bin, 'pnpm'), FAKE_PNPM)
     executable(join(bin, 'node'), '#!/usr/bin/env bash\nexit 0\n')
+    executable(join(bin, 'plutil'), '#!/usr/bin/env bash\n[[ "$1" == -lint && -s "$2" ]]\n')
     executable(
       join(bin, 'launchctl'),
       `#!/usr/bin/env bash

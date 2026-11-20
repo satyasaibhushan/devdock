@@ -114,8 +114,9 @@ export function guidelinesCacheDir(git: string, branch: string): string {
 
 interface OverlayPlan {
   text: string
-  imp: GuidelinesImport
+  imp?: GuidelinesImport
   patches: Patch[]
+  resourceOverrides: Record<string, { resources: DevResources }>
   /** The template mints an ECR pull secret on every config load. */
   pullSecrets: boolean
 }
@@ -128,29 +129,57 @@ function overlayPlan(repo: Repo): OverlayPlan | undefined {
     return undefined
   }
   const imp = guidelinesImport(text)
-  if (!imp) return undefined
   const seed = cacheSeed(text)
-  const patches = TUNING[imp.template].map((patch) => {
+  const patches = (imp ? TUNING[imp.template] : []).map((patch) => {
     const value = patch.value as { args?: string[] } | undefined
     if (seed === undefined || patch.path !== 'images.app.buildKit' || !value?.args) return patch
     const from = `--cache-from=type=registry,ref=\${AWS_ECR_DEVSPACE_REPO}:${seed}`
     return { ...patch, value: { ...value, args: [...value.args, from] } }
   })
   const repoDoc = (parseYamlSafe(text) ?? {}) as ConfigShape
-  const template = parseYamlSafe(
-    readOptional(join(guidelinesCacheDir(imp.git, imp.branch), imp.subPath, 'devspace.yaml')),
-  ) as ConfigShape | undefined
+  const template = imp
+    ? (parseYamlSafe(
+        readOptional(join(guidelinesCacheDir(imp.git, imp.branch), imp.subPath, 'devspace.yaml')),
+      ) as ConfigShape | undefined)
+    : undefined
   patches.push(...localChartPatches(template, repoDoc))
-  if (imp.template === 'ui') patches.push(...noSyncWaitPatches(repoDoc))
-  patches.push(...preferNodePatches(repo.preferNodes, repoDoc, template))
-  const pullSecrets = template?.pullSecrets !== undefined || repoDoc.pullSecrets !== undefined
-  return { text, imp, patches, pullSecrets }
+  if (imp?.template === 'ui') patches.push(...noSyncWaitPatches(repoDoc))
+  const targets = { ...(template?.dev ?? (imp ? { common: {} } : {})), ...repoDoc.dev }
+  const settings = devPodSettings(repo)
+  const resourceOverrides: OverlayPlan['resourceOverrides'] = {}
+  const resources = readResourceOverrides(settings.resources, repo.name)
+  for (const name of Object.keys(targets)) {
+    if (Object.keys(resources).length) resourceOverrides[name] = { resources }
+    const podPatches: Patch[] = []
+    if (settings.safeToEvict !== true) {
+      podPatches.push({
+        op: 'add',
+        path: "metadata[?(!@.annotations['cluster-autoscaler.kubernetes.io/safe-to-evict'])].annotations",
+        value: { 'cluster-autoscaler.kubernetes.io/safe-to-evict': 'false' },
+      })
+    }
+    if (name === 'common' && repo.preferNodes?.length)
+      podPatches.push(preferredNodePatch(repo.preferNodes))
+    if (!podPatches.length) continue
+
+    // DevSpace applies profiles after resolving imports. Check the effective
+    // target before creating or appending to its patch list.
+    const path = `dev.${name}`
+    patches.push(
+      ...podPatches.map((value) => ({ op: 'add', path: `${path}[?(@.patches)].patches`, value })),
+      { op: 'add', path: `${path}[?(!@.patches)].patches`, value: podPatches },
+    )
+  }
+  if (!imp && !patches.length && !Object.keys(resourceOverrides).length) return undefined
+  const pullSecrets =
+    !!imp && (template?.pullSecrets !== undefined || repoDoc.pullSecrets !== undefined)
+  return { text, imp, patches, resourceOverrides, pullSecrets }
 }
 
 type ConfigShape = {
   pullSecrets?: unknown
   deployments?: Record<string, { helm?: { chart?: { git?: unknown } } }>
-  dev?: Record<string, { sync?: unknown[]; patches?: unknown[] }>
+  dev?: Record<string, { sync?: unknown[] }>
 }
 
 function parseYamlSafe(text: string | undefined): unknown {
@@ -201,15 +230,9 @@ function noSyncWaitPatches(repo: ConfigShape): Patch[] {
 }
 
 /** Softly prefer nodes that already pulled the image: a dev pod on a fresh node
- *  paid a 25-40s pull. Appends to the dev target's pod patches, creating the
- *  list when neither the repo nor the template has one. */
-function preferNodePatches(
-  nodes: string[] | undefined,
-  repo: ConfigShape,
-  template: ConfigShape | undefined,
-): Patch[] {
-  if (!nodes?.length) return []
-  const affinity = {
+ *  paid a 25-40s pull. */
+function preferredNodePatch(nodes: string[]): Patch {
+  return {
     op: 'add',
     path: 'spec.affinity',
     value: {
@@ -227,11 +250,39 @@ function preferNodePatches(
       },
     },
   }
-  const common = repo.dev?.common ?? template?.dev?.common
-  if (!common) return []
-  return Array.isArray(common.patches)
-    ? [{ op: 'add', path: 'dev.common.patches', value: affinity }]
-    : [{ op: 'add', path: 'dev.common.patches', value: [affinity] }]
+}
+
+type DevResources = Partial<
+  Record<'requests' | 'limits', Partial<Record<'cpu' | 'memory', string>>>
+>
+
+interface DevPodSettings {
+  safeToEvict?: boolean
+  resources?: DevResources
+}
+
+/** Workload names match the scoped name shown in the devspace config. */
+function devPodSettings(repo: Repo): DevPodSettings {
+  const file = join(process.env.DEVDOCK_STATE_DIR ?? join(homedir(), '.devdock'), 'dev-pods.json')
+  const text = readOptional(file)
+  if (text === undefined) return {}
+  const settings = JSON.parse(text) as Record<string, DevPodSettings>
+  return Object.hasOwn(settings, repo.name) ? (settings[repo.name] ?? {}) : {}
+}
+
+function readResourceOverrides(overrides: DevResources | undefined, name: string): DevResources {
+  const resources: DevResources = {}
+  for (const group of ['requests', 'limits'] as const) {
+    for (const resource of ['cpu', 'memory'] as const) {
+      const quantity = overrides?.[group]?.[resource]
+      if (quantity === undefined) continue
+      if (typeof quantity !== 'string' || !quantity.trim())
+        throw new Error(`Invalid dev pod resource quantity for ${name}: ${group}.${resource}`)
+      resources[group] ??= {}
+      resources[group][resource] = quantity
+    }
+  }
+  return resources
 }
 
 function helmChartsDir(): string {
@@ -287,7 +338,8 @@ export function canReusePullSecret(repo: Repo): boolean {
 
 /** Whether the overlay carries a `devdock` profile to activate. */
 export function hasDevdockProfile(repo: Repo): boolean {
-  return (overlayPlan(repo)?.patches.length ?? 0) > 0
+  const plan = overlayPlan(repo)
+  return !!plan && (plan.patches.length > 0 || Object.keys(plan.resourceOverrides).length > 0)
 }
 
 /** The config devdock points DEVSPACE_CONFIG at, or undefined for the repo's own. */
@@ -314,8 +366,12 @@ export function prepareWorkloadConfig(repo: Repo): void {
       symlinkSync(target, alias)
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
-      if (!isLink(alias) || readlinkSync(alias) !== target)
-        throw new Error(`Refusing to replace workload config ${alias}`)
+      if (!(isLink(alias) && readlinkSync(alias) === target)) {
+        if (isLink(alias) || !readFileSync(alias, 'utf8').startsWith(GENERATED))
+          throw new Error(`Refusing to replace workload config ${alias}`)
+        unlinkSync(alias)
+        symlinkSync(target, alias)
+      }
     }
   }
 
@@ -362,17 +418,19 @@ function writeOverlay(alias: string, target: string, plan: OverlayPlan): void {
     if (!ours) throw new Error(`Refusing to replace workload config ${alias}`)
   }
   const doc = parseDocument(plan.text)
-  const cache = guidelinesCacheDir(plan.imp.git, plan.imp.branch)
-  const local = join(cache, plan.imp.subPath)
-  if (existsSync(join(local, 'devspace.yaml'))) {
-    doc.setIn(['imports', plan.imp.index], doc.createNode({ path: local }))
-    refreshGuidelines(cache)
+  if (plan.imp) {
+    const cache = guidelinesCacheDir(plan.imp.git, plan.imp.branch)
+    const local = join(cache, plan.imp.subPath)
+    if (existsSync(join(local, 'devspace.yaml'))) {
+      doc.setIn(['imports', plan.imp.index], doc.createNode({ path: local }))
+      refreshGuidelines(cache)
+    }
+    if (!doc.hasIn(['functions', 'docker_login_to_ecr']))
+      doc.setIn(['functions', 'docker_login_to_ecr'], ECR_LOGIN)
+    const envRewrite = portableEnvRewrite(local)
+    if (envRewrite && !doc.hasIn(['functions', 'prepare_local_env']))
+      doc.setIn(['functions', 'prepare_local_env'], envRewrite)
   }
-  if (!doc.hasIn(['functions', 'docker_login_to_ecr']))
-    doc.setIn(['functions', 'docker_login_to_ecr'], ECR_LOGIN)
-  const envRewrite = portableEnvRewrite(local)
-  if (envRewrite && !doc.hasIn(['functions', 'prepare_local_env']))
-    doc.setIn(['functions', 'prepare_local_env'], envRewrite)
   if (plan.pullSecrets) {
     const cached = doc.createNode({
       name: CACHED_PULL_SECRET_PROFILE,
@@ -381,8 +439,11 @@ function writeOverlay(alias: string, target: string, plan: OverlayPlan): void {
     if (isSeq(doc.get('profiles'))) doc.addIn(['profiles'], cached)
     else doc.set('profiles', doc.createNode([cached]))
   }
-  if (plan.patches.length > 0) {
-    const profile = doc.createNode({ name: DEVDOCK_PROFILE, patches: plan.patches })
+  const merge = Object.keys(plan.resourceOverrides).length
+    ? { dev: plan.resourceOverrides }
+    : undefined
+  if (plan.patches.length > 0 || merge) {
+    const profile = doc.createNode({ name: DEVDOCK_PROFILE, merge, patches: plan.patches })
     if (isSeq(doc.get('profiles'))) doc.addIn(['profiles'], profile)
     else doc.set('profiles', doc.createNode([profile]))
   }

@@ -10,6 +10,7 @@ import { type AwsCredential, AwsCreds } from './awsCreds.js'
 import { CrashWatch } from './crashWatch.js'
 import { environmentWarning } from './environmentWarning.js'
 import { type RunResult, run, runStream, spawnStream } from './exec.js'
+import { clusterIPService, helmReleaseNames } from './helmRelease.js'
 import { type LifecycleAction, lifecyclePlan } from './lifecycle.js'
 import { decodeCursor, encodeCursor, readFileSlice } from './logQuery.js'
 import { LogHub, LogTailer, type SpawnFn, cleanLine } from './logTailer.js'
@@ -39,13 +40,14 @@ import {
   devSessionPods,
   devSessionReady,
   initialSyncDone,
-  shellOpened,
+  shellPod,
+  shellPromptReady,
   startProgress,
 } from './startProgress.js'
 import { type ReplicaRecord, StateStore } from './stateStore.js'
 import { type SessionState, type StreamRunner, Supervisor, verbLabel } from './supervisor.js'
 import { type RunOutcome, type TermInfo, type TermKind, TermRegistry } from './termRegistry.js'
-import type { PodInfo, Repo, RepoState, RepoStatus, TermMode } from './types.js'
+import type { DeploymentInfo, PodInfo, Repo, RepoState, RepoStatus, TermMode } from './types.js'
 import { WAIT_STATUSES, WaitCrashTracker, waitBlocked } from './wait.js'
 import {
   type CheckResult,
@@ -81,6 +83,7 @@ const STARTUP_NO_SYNC_GRACE_MS = 30_000
  *  before the session is retired as stale. A single empty/failed kubectl read
  *  must never retire a healthy session. */
 const STALE_NO_POD_SESSION_MS = 30 * 60 * 1000
+const EMPTY_DEV_ROLLOUT_MS = 5 * 60 * 1000
 /** Auto-reconnect pacing for a dead dev session whose pod still runs: at most
  *  one attempt per cooldown, giving up after the cap until the workload holds
  *  RUNNING_MANAGED for RECONNECT_RESET_MS (or a manual stop/clear intervenes),
@@ -266,14 +269,21 @@ export class Service {
    *  timer counts the *condition's* duration, not the session's age. Reset by
    *  any pass that sees pods or couldn't see the cluster at all. */
   private readonly noPodsSince = new Map<string, number>()
+  private readonly emptyDevRollouts = new Map<
+    string,
+    { target: string; since: number; attempted: boolean }
+  >()
   /** Auto-reconnect bookkeeping for dead sessions whose pod still runs. */
   private readonly reconnects = new Map<string, { attempts: number; lastAt: number }>()
   private readonly pausedSessions = new Set<string>()
   private readonly sessionGenerations = new Map<string, number>()
   private readonly readyPodGenerations = new Map<string, string>()
+  /** Effective release names are stable for a running DevSpace session. */
+  private readonly sessionHelmReleases = new Map<string, { target: string; names: string[] }>()
   /** Node of each workload's most recent DevSpace pod (in-memory). */
   private readonly lastDevNodes = new Map<string, string>()
   /** When a pending startup command first saw its session pods ready. */
+  private readonly startingPods = new Set<string>()
   private readonly startupReadySince = new Map<string, number>()
   /** Fast re-checks for a pending startup between the 5s reconcile ticks. */
   private readonly shellWatches = new Map<string, NodeJS.Timeout>()
@@ -991,6 +1001,7 @@ export class Service {
     writeFileSync(pipeFile, '') // fresh run, fresh file — old output doesn't linger
     this.logGens.set(key, (this.logGens.get(key) ?? 0) + 1) // invalidate old f: cursors
     hub.push(`$ ${verbLabel(repo, 'dev')}`)
+    this.sessionHelmReleases.delete(key)
     const r = await this.supervisor.start(
       { ...repo, preferNodes: this.imageNodes(id, workload) },
       pipeFile,
@@ -1013,7 +1024,12 @@ export class Service {
       // Queued in the store: the ready-wait spans the whole deploy (minutes),
       // and a daemon restart in that window must not eat the command.
       const startup = this.store.getStartup(id, startupPodType(base, type))
-      if (startup) this.store.setPendingStartup(key, startup)
+      const previousPod = this.store.getStartupPod(key)
+      if (automatic && previousPod) {
+        // The new tmux log starts at byte zero. Its shell can reattach to the
+        // same container and screen session, where startup already ran.
+        this.store.setStartupPod(key, { ...previousPod, shellOffset: 0 })
+      } else if (startup) this.store.setPendingStartup(key, startup)
     } else {
       for (const line of nonEmptyLines(r.stderr)) hub.push(line)
       hub.push(`✗ devspace dev failed to start (exit ${r.code})`)
@@ -1087,6 +1103,7 @@ export class Service {
     this.sessionGenerations.set(key, (this.sessionGenerations.get(key) ?? 0) + 1)
     this.reconnects.delete(key)
     this.noPodsSince.delete(key)
+    this.emptyDevRollouts.delete(key)
     this.store.setPendingStartup(key, undefined)
     const result = await this.supervisor.stopSession(repo)
     if (result.code !== 0) return result
@@ -1100,33 +1117,115 @@ export class Service {
   }
 
   async stop(id: string, workload?: string): Promise<RunResult> {
-    const { repo, key } = this.scoped(id, workload)
+    const { repo: scoped, key } = this.scoped(id, workload)
     this.operationStage(id, workload, 'stopping')
     const denied = await this.ensureAuth(key)
     if (denied) return denied
-    await this.claimOwnership(repo)
+    const namespace = scoped.namespace || (await this.contextNamespace()) || 'default'
+    const repo = { ...scoped, namespace }
+    const sessions = await this.supervisor.sessionStates()
+    const shared = await this.sharedRelease(
+      key,
+      namespace,
+      sessions,
+      async () => {
+        const names = await this.releaseNames(repo)
+        const type = repo.varDefaults?.WORKLOAD_TYPE ?? repo.workloadType
+        // The non-api fallback also uninstalls the release named after the project.
+        return type && type !== 'api' ? [...names, repo.name] : names
+      },
+      repo.name,
+    )
+    if (!shared) await this.claimOwnership(repo)
+    this.pausedSessions.add(key)
+    this.sessionGenerations.set(key, (this.sessionGenerations.get(key) ?? 0) + 1)
     this.recordLifecycle(id, workload)
     this.noPodsSince.delete(key)
+    this.emptyDevRollouts.delete(key)
     this.reconnects.delete(key)
     this.tailers.get(key)?.stop()
     this.tailers.delete(key)
-    const r = await this.narrate(key, verbLabel(repo, 'purge'), (onLine) =>
-      this.supervisor.kill(repo, onLine),
-    )
-    if (r.code === 0) {
-      await this.uninstallLeftoverRelease(repo, key)
-      // Nothing of this workload runs any more, so any instance may deploy it next.
-      await this.releaseOwnership(repo).catch((error: unknown) =>
-        this.hubFor(key).push(
-          `! ownership kept: ${error instanceof Error ? error.message : String(error)}`,
-        ),
+    let r: RunResult
+    if (shared) {
+      const message = `Skipping purge of Helm release ${shared.release} in ${namespace}: ${shared.workload} is active or holds its deployment claim.`
+      this.hubFor(key).push(message)
+      const ours = !(await this.claimedElsewhere(repo))
+      if (!shared.sameProject && ours && sessions.has(repo.session)) {
+        // DevSpace resets pods recorded for this project without running the purge pipeline.
+        r = await this.narrate(key, verbLabel(repo, 'reset pods'), (onLine) =>
+          this.supervisor.clear(repo, onLine),
+        )
+      } else {
+        // Worktrees of one project can share both the replacement pod and its lock.
+        await this.supervisor.abandonSession(repo)
+        r = { code: 0, stdout: message, stderr: '' }
+      }
+    } else {
+      r = await this.narrate(key, verbLabel(repo, 'purge'), (onLine) =>
+        this.supervisor.kill(repo, onLine),
       )
+      if (r.code === 0) {
+        await this.uninstallLeftoverRelease(repo, key)
+        // Nothing of this workload runs any more, so any instance may deploy it next.
+        await this.releaseOwnership(repo).catch((error: unknown) =>
+          this.hubFor(key).push(
+            `! ownership kept: ${error instanceof Error ? error.message : String(error)}`,
+          ),
+        )
+      }
     }
     this.piped.delete(key)
     this.store.setSessionNamespace(key, undefined) // session gone → pin released
     this.store.setPendingStartup(key, undefined) // canceled start must not fire later
     await this.reconcileOne(id)
     return r
+  }
+
+  private async releaseNames(repo: Repo): Promise<string[]> {
+    const printed = await this.supervisor.print(repo)
+    if (printed.code !== 0) throw new Error(`Cannot resolve Helm releases for ${repo.id}`)
+    const names = helmReleaseNames(printed.stdout)
+    return names.length ? names : [repo.name]
+  }
+
+  private async sharedRelease(
+    key: string,
+    namespace: string,
+    sessions: Map<string, SessionState>,
+    releaseNames: () => Promise<string[]>,
+    project?: string,
+  ): Promise<{ release: string; workload: string; sameProject: boolean } | undefined> {
+    const candidates = []
+    for (const [id, base] of this.repos) {
+      if (id === key) continue
+      for (const type of workloadTypes(base)) {
+        const candidateKey = workloadKey(id, type)
+        if (candidateKey === key) continue
+        const candidate = this.pinned(scopeRepo(base, type), candidateKey)
+        if ((candidate.namespace || namespace) !== namespace) continue
+        candidates.push({ candidate, candidateKey })
+      }
+    }
+    if (!candidates.length) return
+    const owners = await this.ownership?.owners(namespace, true)
+    const active = candidates.filter(({ candidate }) => {
+      const session = sessions.get(candidate.session)
+      const holder = owners?.[candidate.name]
+      // Our claim is keyed by project name, so aliases with the same name
+      // can only be distinguished by their local session.
+      return (
+        (session && !session.dead) ||
+        (holder && !(candidate.name === project && holder === this.instanceId))
+      )
+    })
+    if (!active.length) return
+    const releases = await releaseNames()
+    const sameProject = active.some(({ candidate }) => candidate.name === project)
+    for (const { candidate, candidateKey } of active) {
+      const names = await this.releaseNames({ ...candidate, namespace })
+      const release = names.find((name) => releases.includes(name))
+      if (release) return { release, workload: candidateKey, sameProject }
+    }
   }
 
   /** The shared purge pipeline removes a non-api workload with
@@ -1172,6 +1271,7 @@ export class Service {
     if (denied) return denied
     await this.claimOwnership(repo)
     this.noPodsSince.delete(key)
+    this.emptyDevRollouts.delete(key)
     this.reconnects.delete(key)
     this.tailers.get(key)?.stop()
     this.tailers.delete(key)
@@ -1665,6 +1765,18 @@ export class Service {
       // Older records lack `releases`; their config dirs carry the names.
       const releases = rec.releases ?? rec.configPaths.map((cfg) => basename(dirname(cfg)))
       for (const release of releases) {
+        const shared = await this.sharedRelease(
+          id,
+          rec.namespace,
+          await this.supervisor.sessionStates(),
+          async () => [release],
+        )
+        if (shared) {
+          this.hubFor(id).push(
+            `Skipping uninstall of Helm release ${release} in ${rec.namespace}: ${shared.workload} is active or holds its deployment claim.`,
+          )
+          continue
+        }
         await this.kubectl('helm', ['uninstall', release, '-n', rec.namespace]).catch(
           () => undefined,
         )
@@ -1903,6 +2015,8 @@ export class Service {
       this.watchers,
       this.transitions,
       this.noPodsSince,
+      this.emptyDevRollouts,
+      this.sessionHelmReleases,
       this.reconnects,
       this.pendingTermOpens,
     ] as Map<string, unknown>[]) {
@@ -1958,15 +2072,13 @@ export class Service {
     return this.namespaceInfo()
   }
 
-  /** Run the queued startup command in the dev session after a short grace, so
-   *  the keystrokes land at the in-container shell `devspace dev` opens. */
-  /** The shell opens a couple of seconds after the pod is ready; poll for it
-   *  instead of waiting up to a full reconcile tick. Bounded by the no-sync grace. */
-  private watchShell(id: string, key: string): void {
+  /** Poll faster than reconcile while a new shell is opening. */
+  private watchShell(id: string, key: string, isOpen: () => boolean): void {
     if (this.shellWatches.has(key)) return
+    const deadline = Date.now() + STARTUP_NO_SYNC_GRACE_MS
     const timer = setInterval(() => {
-      if (this.stopped || !this.store.getPendingStartup(key)) return this.stopShellWatch(key)
-      if (this.devShellOpen(key)) {
+      if (this.stopped || Date.now() > deadline) return this.stopShellWatch(key)
+      if (isOpen()) {
         this.stopShellWatch(key)
         void this.reconcileOne(id).catch(() => undefined)
       }
@@ -1980,36 +2092,108 @@ export class Service {
     this.shellWatches.delete(key)
   }
 
-  /** DevSpace opens the session's shell only after the initial sync, so typing
-   *  the startup command earlier lands in deploy output. Configs without a sync
-   *  never log one; give those a fixed grace after their pods are ready. */
-  private devShellOpen(key: string): boolean {
-    const since = this.startupReadySince.get(key) ?? Date.now()
-    this.startupReadySince.set(key, since)
-    if (Date.now() - since >= STARTUP_NO_SYNC_GRACE_MS) return true
-    const path = this.devLogPath(key)
-    const size = existsSync(path) ? statSync(path).size : 0
-    // Only the tail can hold a fresh sync line; the log is truncated per start.
-    const slice = readFileSlice(path, Math.max(0, size - 256 * 1024))
-    return slice !== undefined && shellOpened(slice.lines)
+  private scheduleStartup(
+    scoped: Repo,
+    key: string,
+    command: string,
+    generation: string,
+    openOffset: () => number | undefined,
+    initial: boolean,
+  ): void {
+    const sessionGeneration = this.sessionGenerations.get(key)
+    this.startingPods.add(key)
+    const timer = setTimeout(async () => {
+      try {
+        if (
+          this.stopped ||
+          this.pausedSessions.has(key) ||
+          this.sessionGenerations.get(key) !== sessionGeneration ||
+          this.readyPodGenerations.get(key) !== generation ||
+          (initial && this.store.getPendingStartup(key) !== command)
+        )
+          return
+        const shellOffset = openOffset()
+        if (shellOffset === undefined) return
+        const hub = this.hubFor(key)
+        hub.push(`$ ${command}  (startup)`)
+        const r = await this.supervisor.startup(scoped, command)
+        if (r.code !== 0) {
+          hub.push(`✗ could not send startup command (exit ${r.code})`)
+          return
+        }
+        this.store.setStartupPod(key, { generation, shellOffset })
+        if (initial && this.store.getPendingStartup(key) === command)
+          this.store.setPendingStartup(key, undefined)
+      } catch {
+        this.hubFor(key).push('✗ could not send startup command to the dev session')
+      } finally {
+        this.startingPods.delete(key)
+      }
+    }, STARTUP_RUN_DELAY_MS)
+    timer.unref()
   }
 
-  private scheduleStartup(scoped: Repo, key: string, command: string): void {
-    const sessionGeneration = this.sessionGenerations.get(key)
-    const podGeneration = this.readyPodGenerations.get(key)
-    setTimeout(() => {
-      if (
-        this.pausedSessions.has(key) ||
-        this.sessionGenerations.get(key) !== sessionGeneration ||
-        this.readyPodGenerations.get(key) !== podGeneration
-      )
-        return
-      const hub = this.hubFor(key)
-      hub.push(`$ ${command}  (startup)`)
-      void this.supervisor.exec(scoped, command).then((r) => {
-        if (r.code !== 0) hub.push(`✗ startup command exited ${r.code}`)
+  private reconcileStartup(
+    id: string,
+    key: string,
+    scoped: Repo,
+    pods: PodInfo[],
+    command: string | undefined,
+  ): void {
+    const ready = pods.filter((pod) => pod.ready)
+    const generation = ready.length
+      ? JSON.stringify([
+          scoped.namespace,
+          ready.map((pod) => [pod.name, pod.uid, pod.restartCount]).sort(),
+        ])
+      : undefined
+    if (this.readyPodGenerations.get(key) !== generation) {
+      this.stopShellWatch(key)
+      this.startupReadySince.delete(key)
+    }
+    if (!generation) {
+      this.readyPodGenerations.delete(key)
+      return
+    }
+    this.readyPodGenerations.set(key, generation)
+
+    const pending = this.store.getPendingStartup(key)
+    const last = this.store.getStartupPod(key)
+    if (last?.generation === generation && !pending) return
+    const path = this.devLogPath(key)
+    if (!pending && (!last || !command)) {
+      // Adopt an already-running session without typing into its terminal.
+      this.store.setStartupPod(key, {
+        generation,
+        shellOffset: readFileSlice(path, 0)?.nextOffset ?? 0,
       })
-    }, STARTUP_RUN_DELAY_MS)
+      return
+    }
+
+    const startup = pending ?? command
+    if (!startup || this.startingPods.has(key)) return
+    const since = this.startupReadySince.get(key) ?? Date.now()
+    this.startupReadySince.set(key, since)
+    const openOffset = (): number | undefined => {
+      const output = readFileSlice(path, pending ? 0 : (last?.shellOffset ?? 0), 256 * 1024)
+      if (pending) {
+        if (shellPromptReady(output?.lines ?? []) || Date.now() - since >= STARTUP_NO_SYNC_GRACE_MS)
+          return output?.nextOffset ?? 0
+      } else if (output) {
+        // A ready replacement alone cannot tell us which pod receives tmux
+        // input. Require a new terminal banner naming this ready pod.
+        const attached = shellPod(output.lines)
+        if (ready.some((pod) => pod.name === attached) && shellPromptReady(output.lines))
+          return output.nextOffset
+      }
+      return undefined
+    }
+    const offset = openOffset()
+    if (offset === undefined) this.watchShell(id, key, () => openOffset() !== undefined)
+    else {
+      this.stopShellWatch(key)
+      this.scheduleStartup(scoped, key, startup, generation, openOffset, !!pending)
+    }
   }
 
   // ---- reconciliation (spec §6) ----
@@ -2060,6 +2244,7 @@ export class Service {
         cc,
         type ?? repo.defaultWorkload ?? '',
         sessionDead,
+        session?.createdAt,
       )
 
       // While a multi-step verb (restart) is in flight, force the transient
@@ -2078,7 +2263,31 @@ export class Service {
         if (prev && prev.status !== 'RESTARTING') ws.status = prev.status
       }
 
-      if (!transition && this.shouldRetireNoPodSession(ws, session, key)) {
+      // A Pending pod is already in the scheduler's hands. Only an empty
+      // DevSpace deployment with positive desired replicas needs a new rollout.
+      const recovering = exists && !transition && !ws.unreachable && !this.pausedSessions.has(key)
+      const dev = ws.deployments.find(
+        (deployment) => deployment.name === `${scoped.name}-devspace` && deployment.replicas > 0,
+      )
+      if (recovering && dev && ws.schedulingFailure) {
+        const previous = this.states.get(id)?.workloads.find((w) => w.type === ws.type)
+        if (previous?.schedulingFailure !== ws.schedulingFailure) {
+          const message = `${dev.name} has no pods. FailedScheduling: ${ws.schedulingFailure}`
+          this.hubFor(key).push(`! ${message}`)
+          const op = this.operations.active(id, type ?? '')
+          if (op) this.operations.update(op.id, {}, message)
+        }
+      }
+      await this.recoverEmptyRollout(
+        scoped,
+        key,
+        session,
+        recovering && ws.pods.length === 0 && !dev?.paused && dev?.actualReplicas === 0
+          ? dev
+          : undefined,
+      )
+
+      if (!transition && !dev && this.shouldRetireNoPodSession(ws, session, key)) {
         const target = ws.deployments.length > 0 ? 'DEPLOYED' : 'STOPPED'
         this.hubFor(key).push(
           `! stale dev session retired: no matching pods; reconciled to ${target.toLowerCase()}`,
@@ -2100,6 +2309,10 @@ export class Service {
         // in CRASHED — devspace reattaches to the existing dev pod.
         if (this.scheduleReconnect(id, type, key)) ws.status = 'RESTARTING'
       }
+      if (!hasSession) this.sessionHelmReleases.delete(key)
+      if (session && ws.status === 'RUNNING_MANAGED' && !ws.unreachable) {
+        await this.repairApiService(scoped, key, session).catch(() => undefined)
+      }
       if (transition) ws.status = transition
 
       // A workload that has run managed for a while proved the reconnect took —
@@ -2110,48 +2323,16 @@ export class Service {
       }
       workloads.push(ws)
 
-      // A live DevSpace session can survive a replacement pod or container.
-      // The old app process cannot: re-arm its configured command once for
-      // the new ready generation, without restarting or deploying the parent.
-      // Only the session's own pods count: after a deploy the Helm pod is ready
-      // first, and its swap for the DevSpace pod is not a restart of the app.
-      const sessionPods = devSessionPods(ws.pods)
       const devNode = ws.pods.find((p) => p.name.includes('-devspace') && p.node)?.node
       if (devNode) this.lastDevNodes.set(key, devNode)
-      const readyGeneration = sessionPods
-        .filter((pod) => pod.ready)
-        .map((pod) => `${pod.name}:${pod.restartCount}`)
-        .sort()
-        .join(',')
-      if (ws.status === 'RUNNING_MANAGED' && readyGeneration) {
-        const previousGeneration = this.readyPodGenerations.get(key)
-        this.readyPodGenerations.set(key, readyGeneration)
-        if (
-          previousGeneration !== undefined &&
-          previousGeneration !== readyGeneration &&
-          !this.store.getPendingStartup(key)
-        ) {
-          const startup = this.store.getStartup(id, startupPodType(repo, type))
-          if (startup) this.store.setPendingStartup(key, startup)
-        }
-      } else if (!exists) {
-        this.readyPodGenerations.delete(key)
-      }
-
-      // Once the dev session's pod is up, fire any queued startup command into
-      // the session (the initial dev pod) — one shot per start.
-      const pending = this.store.getPendingStartup(key)
-      if (ws.status === 'RUNNING_MANAGED' && sessionPods.some((pod) => pod.ready) && pending) {
-        if (this.devShellOpen(key)) {
-          this.stopShellWatch(key)
-          this.startupReadySince.delete(key)
-          this.store.setPendingStartup(key, undefined)
-          this.scheduleStartup(scoped, key, pending)
-        } else this.watchShell(id, key)
-      } else {
-        this.startupReadySince.delete(key)
-        this.stopShellWatch(key)
-      }
+      if (!exists && this.store.getStartupPod(key)) this.store.setStartupPod(key, undefined)
+      this.reconcileStartup(
+        id,
+        key,
+        scoped,
+        ws.status === 'RUNNING_MANAGED' && !ws.unreachable ? devSessionPods(ws.pods) : [],
+        this.store.getStartup(id, startupPodType(repo, type)),
+      )
       if (exists) {
         // The session is present (alive or a dead/crashed shell). Keep its pane
         // mirrored to the on-disk dev log — a forensic record of the session
@@ -2186,6 +2367,68 @@ export class Service {
         await this.applyReplicaIngress(repo, rec).catch(() => undefined)
     }
     return state
+  }
+
+  private async repairApiService(repo: Repo, key: string, session: SessionState): Promise<void> {
+    const type =
+      repo.varDefaults?.WORKLOAD_TYPE ??
+      repo.workloadType ??
+      (repo.codeArea === 'backend' ? 'api' : undefined)
+    if (type !== 'api' || this.pausedSessions.has(key)) return
+    const generation = this.sessionGenerations.get(key)
+    const namespace = repo.namespace || (await this.contextNamespace()) || 'default'
+    const target = `${repo.configPath}:${namespace}:${session.createdAt ?? ''}`
+    let releases = this.sessionHelmReleases.get(key)
+    if (releases?.target !== target) {
+      releases = { target, names: await this.releaseNames({ ...repo, namespace }) }
+      this.sessionHelmReleases.set(key, releases)
+    }
+    for (const name of releases.names) {
+      const service = await this.kubectl(
+        'kubectl',
+        ['get', 'service', name, '-n', namespace, '-o', 'json'],
+        { timeoutMs: 10_000 },
+      )
+      if (service.code !== 0) continue
+      const live = JSON.parse(service.stdout) as {
+        metadata?: { resourceVersion?: string }
+        spec?: { type?: string; externalName?: string }
+      } | null
+      const version = live?.metadata?.resourceVersion
+      if (live?.spec?.type !== 'ExternalName' || !version) continue
+
+      const manifest = await this.kubectl('helm', ['get', 'manifest', name, '-n', namespace], {
+        timeoutMs: 10_000,
+      })
+      if (manifest.code !== 0) continue
+      const desired = clusterIPService(manifest.stdout, name, namespace)
+      if (!desired) continue
+      if (
+        this.stopped ||
+        this.pausedSessions.has(key) ||
+        generation !== this.sessionGenerations.get(key)
+      )
+        return
+
+      // Reject stale reads if Helm or another reconcile touched the Service.
+      const patch = [
+        { op: 'test', path: '/metadata/resourceVersion', value: version },
+        { op: 'test', path: '/spec/type', value: 'ExternalName' },
+        ...(live.spec.externalName !== undefined
+          ? [{ op: 'remove', path: '/spec/externalName' }]
+          : []),
+        { op: 'add', path: '/spec/type', value: 'ClusterIP' },
+        { op: 'add', path: '/spec/selector', value: desired.selector },
+        { op: 'add', path: '/spec/ports', value: desired.ports },
+      ]
+      const repaired = await this.kubectl(
+        'kubectl',
+        ['patch', 'service', name, '-n', namespace, '--type=json', '-p', JSON.stringify(patch)],
+        { timeoutMs: 10_000 },
+      )
+      if (repaired.code === 0)
+        this.hubFor(key).push(`✓ repaired Service ${namespace}/${name} to ClusterIP`)
+    }
   }
 
   /** Every name that can claim pods this pass — repo names plus their
@@ -2257,6 +2500,49 @@ export class Service {
     return (
       session.createdAt !== undefined && Date.now() - session.createdAt >= STALE_NO_POD_SESSION_MS
     )
+  }
+
+  private async recoverEmptyRollout(
+    repo: Repo,
+    key: string,
+    session: SessionState | undefined,
+    deployment: DeploymentInfo | undefined,
+  ): Promise<void> {
+    if (!deployment || this.stopped) {
+      this.emptyDevRollouts.delete(key)
+      return
+    }
+    const now = Date.now()
+    const target = JSON.stringify([repo.namespace, deployment.name, session?.createdAt])
+    const previous = this.emptyDevRollouts.get(key)
+    if (previous?.target !== target) {
+      this.emptyDevRollouts.set(key, { target, since: now, attempted: false })
+      return
+    }
+    if (previous.attempted || now - previous.since < EMPTY_DEV_ROLLOUT_MS) return
+
+    const namespace = repo.namespace || (await this.contextNamespace()) || 'default'
+    if (this.ownership && !(await this.ownership.owns(repo, namespace).catch(() => false))) return
+    if (
+      this.stopped ||
+      this.transitions.has(key) ||
+      this.pausedSessions.has(key) ||
+      this.emptyDevRollouts.get(key) !== previous ||
+      previous.attempted
+    )
+      return
+    previous.attempted = true
+
+    const hub = this.hubFor(key)
+    hub.push(
+      `! restarting rollout for ${deployment.name}: desired replicas but no pods for five minutes`,
+    )
+    const result = await this.kubectl(
+      'kubectl',
+      ['rollout', 'restart', `deployment/${deployment.name}`, '-n', namespace],
+      { timeoutMs: 15_000 },
+    ).catch(() => undefined)
+    if (result?.code !== 0) hub.push(`✗ rollout restart failed for ${deployment.name}`)
   }
 
   /** Kick off an auto-reconnect for a dead dev session whose pod still runs.

@@ -212,13 +212,17 @@ describe('parseDeployments', () => {
   it('reads name and replica counts, defaulting absent fields to 0', () => {
     const json = JSON.stringify({
       items: [
-        { metadata: { name: 'svc-devspace' }, spec: { replicas: 1 }, status: { readyReplicas: 1 } },
+        {
+          metadata: { name: 'svc-devspace' },
+          spec: { replicas: 1 },
+          status: { readyReplicas: 1, replicas: 1 },
+        },
         { metadata: { name: 'svc' }, spec: { replicas: 0 }, status: {} },
       ],
     })
     expect(parseDeployments(json)).toEqual([
-      { name: 'svc-devspace', replicas: 1, readyReplicas: 1 },
-      { name: 'svc', replicas: 0, readyReplicas: 0 },
+      { name: 'svc-devspace', replicas: 1, readyReplicas: 1, actualReplicas: 1 },
+      { name: 'svc', replicas: 0, readyReplicas: 0, actualReplicas: 0 },
     ])
   })
   it('tolerates junk', () => {

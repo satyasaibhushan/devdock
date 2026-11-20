@@ -91,6 +91,8 @@ export interface WorkloadState {
   pods: PodInfo[]
   deployments: DeploymentInfo[]
   hasSession: boolean
+  /** The latest scheduler message for this session's empty DevSpace rollout. */
+  schedulingFailure?: string
   /** The managed session's process exited, even if its pod can still run. */
   sessionDead?: boolean
   /** Lifecycle actions valid for this exact reconciled state. */
@@ -104,6 +106,7 @@ export interface WorkloadState {
 
 /** A pod observed in the cluster during reconciliation. */
 export interface PodInfo {
+  uid?: string
   scheduled?: boolean
   imagePulled?: boolean
   /** A current container failure, not historical restart counts. */
@@ -127,6 +130,9 @@ export interface DeploymentInfo {
   replicas: number
   /** Ready replicas (status.readyReplicas). */
   readyReplicas: number
+  /** Replicas reported by the deployment controller. */
+  actualReplicas?: number
+  paused?: boolean
 }
 
 /** The reconciled view of a single repo (spec §6). */

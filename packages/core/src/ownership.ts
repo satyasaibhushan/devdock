@@ -15,9 +15,9 @@ export class DeploymentOwnership {
   private snapshots = new Map<string, { expires: number; value: Promise<Record<string, string>> }>()
 
   /** Read claims without acquiring them. Cache and coalesce namespace reads for UI polling. */
-  owners(namespace: string): Promise<Record<string, string>> {
+  owners(namespace: string, fresh = false): Promise<Record<string, string>> {
     const cached = this.snapshots.get(namespace)
-    if (cached && cached.expires > Date.now()) return cached.value
+    if (!fresh && cached && cached.expires > Date.now()) return cached.value
     const value = this.runner(
       'kubectl',
       [
@@ -47,6 +47,15 @@ export class DeploymentOwnership {
     private readonly instanceId: string,
     private readonly runner: OwnershipRunner,
   ) {}
+
+  async owns(repo: Repo, namespace: string): Promise<boolean> {
+    const result = await this.read(repo.name, namespace)
+    if (result.code !== 0 || !result.stdout.trim()) return false
+    const { data } = JSON.parse(result.stdout) as {
+      data?: { deployment?: string; instance?: string }
+    }
+    return data?.deployment === repo.name && data.instance === this.instanceId
+  }
 
   async claim(repo: Repo): Promise<void> {
     if (!repo.namespace) throw new Error('Deployment ownership requires an explicit namespace')

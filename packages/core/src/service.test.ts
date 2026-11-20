@@ -80,6 +80,191 @@ function fakeStreamSpawner() {
 }
 
 describe('Service', () => {
+  it.each([
+    {
+      label: 'a live worktree',
+      peerName: 'svc-a',
+      namespace: 'ns',
+      release: 'shared-api',
+      live: true,
+      keep: true,
+    },
+    {
+      label: 'a claimed deployment',
+      peerName: 'different-project',
+      namespace: 'ns',
+      release: 'shared-api',
+      claimed: true,
+      keep: true,
+    },
+    {
+      label: 'a live unrelated release',
+      peerName: 'different-project',
+      namespace: 'ns',
+      release: 'other-api',
+      live: true,
+      keep: false,
+    },
+    {
+      label: 'the same release in another namespace',
+      peerName: 'svc-a',
+      namespace: 'other',
+      release: 'shared-api',
+      live: true,
+      keep: false,
+    },
+    {
+      label: 'an inactive worktree',
+      peerName: 'svc-a',
+      namespace: 'ns',
+      release: 'shared-api',
+      keep: false,
+    },
+  ])(
+    'stops a workload beside $label',
+    async ({ peerName, namespace, release, live, claimed, keep }) => {
+      const config = (name: string, ns: string, releaseName: string) =>
+        `name: ${name}\nnamespace: ${ns}\nvars:\n  WORKLOAD_TYPE: api\ndeployments:\n  api:\n    helm:\n      releaseName: ${releaseName}\n`
+      writeFileSync(join(root, 'svc-a', 'devspace.yaml'), config('svc-a', 'ns', 'shared-api'))
+      mkdirSync(join(root, 'worktree'))
+      writeFileSync(join(root, 'worktree', 'devspace.yaml'), config(peerName, namespace, release))
+
+      const base = cannedRunner('{"items":[]}', false)
+      let localSession = true
+      const owner = 'aaaaaaaa-1111-4111-8111-111111111111'
+      const claim = `devdock-owner-${createHash('sha256').update(peerName).digest('hex').slice(0, 32)}`
+      const runner = vi.fn(async (cmd: string, args: string[]) => {
+        if (cmd === 'tmux' && args[0] === 'list-panes')
+          return {
+            code: 0,
+            stdout:
+              (localSession ? 'devdock-svc-a 0\n' : '') + (live ? 'devdock-worktree 0\n' : ''),
+            stderr: '',
+          }
+        if (cmd === 'tmux' && args[0] === 'kill-session' && args[2] === '=devdock-svc-a')
+          localSession = false
+        if (cmd === 'kubectl' && args[0] === 'get' && args[1] === 'configmaps')
+          return { code: 0, stdout: claimed ? `${claim}\t${peerName}\t${owner}\n` : '', stderr: '' }
+        if (cmd === 'kubectl' && args[0] === 'get' && args[1] === 'configmap')
+          return { code: 0, stdout: '', stderr: '' }
+        return base(cmd, args)
+      })
+      const svc = new Service(
+        {
+          roots: [root],
+          stateFile,
+          instanceId: claimed ? 'bbbbbbbb-2222-4222-8222-222222222222' : undefined,
+        },
+        { runner, streamSpawner: fakeStreamSpawner().spawner },
+      )
+      svc.rescan()
+
+      expect((await svc.stop('svc-a')).code).toBe(0)
+      expect(localSession).toBe(false)
+      expect(
+        runner.mock.calls.some(
+          ([cmd, args]) => cmd === loginShell && args[1]?.includes('devspace purge'),
+        ),
+      ).toBe(!keep)
+      expect(
+        svc.logs('svc-a').some((line) => line.includes('shared-api') && line.includes('worktree')),
+      ).toBe(keep)
+      expect(runner).not.toHaveBeenCalledWith('tmux', ['kill-session', '-t', '=devdock-worktree'])
+    },
+  )
+
+  it.each(['start', 'build_start'] as const)(
+    'repairs an API Service after %s and heals subsequent drift',
+    async (action) => {
+      writeFileSync(
+        join(root, 'svc-a', 'devspace.yaml'),
+        'name: svc-a\nnamespace: ns\nvars:\n  WORKLOAD_TYPE: api\ndeployments:\n  api:\n    helm:\n      releaseName: shared-api\n',
+      )
+      const ready = cannedRunner(
+        JSON.stringify({
+          items: [
+            {
+              metadata: { name: 'svc-a-devspace-abc-123' },
+              status: { phase: 'Running', containerStatuses: [{ name: 'api', ready: true }] },
+            },
+          ],
+        }),
+        true,
+      )
+      const stopped = cannedRunner('{"items":[]}', false)
+      let session = false
+      let external = true
+      let desiredType = 'ClusterIP'
+      let customPorts = action === 'build_start'
+      const patchCalls: object[][] = []
+      const runner = vi.fn(async (cmd: string, args: string[]) => {
+        if (cmd === 'tmux' && args[0] === 'new-session') session = true
+        if (cmd === 'kubectl' && args[0] === 'get' && args[1] === 'service') {
+          expect(args.slice(2)).toEqual(['shared-api', '-n', 'ns', '-o', 'json'])
+          return {
+            code: 0,
+            stdout: JSON.stringify({
+              metadata: { resourceVersion: '123' },
+              spec: external
+                ? { type: 'ExternalName', externalName: 'shared-api.uat-us.svc.cluster.local' }
+                : { type: 'ClusterIP' },
+            }),
+            stderr: '',
+          }
+        }
+        if (cmd === 'helm' && args[0] === 'get' && args[1] === 'manifest') {
+          expect(args.slice(2)).toEqual(['shared-api', '-n', 'ns'])
+          return {
+            code: 0,
+            stdout: `---\nkind: Deployment\nmetadata: {name: shared-api}\n---\nkind: Service\nmetadata: {name: shared-api}\nspec:\n  type: ${desiredType}\n  selector: {svc: shared-api}\n${customPorts ? '  ports: [{name: http, port: 8080, targetPort: web}]\n' : ''}`,
+            stderr: '',
+          }
+        }
+        if (cmd === 'kubectl' && args[0] === 'patch' && args[1] === 'service') {
+          expect(args.slice(2, -1)).toEqual(['shared-api', '-n', 'ns', '--type=json', '-p'])
+          patchCalls.push(JSON.parse(args.at(-1) ?? ''))
+          external = false
+        }
+        return (session ? ready : stopped)(cmd, args)
+      })
+      const svc = new Service(
+        { roots: [root], stateFile },
+        { runner, streamSpawner: fakeStreamSpawner().spawner },
+      )
+      svc.rescan()
+      await svc.reconcileOne('svc-a')
+      expect(patchCalls).toHaveLength(0)
+      if (action === 'start') expect((await svc.start('svc-a')).code).toBe(0)
+      else expect((await svc.lifecycle('svc-a', action)).code).toBe(0)
+
+      const ports = customPorts
+        ? [{ name: 'http', port: 8080, targetPort: 'web' }]
+        : [{ port: 80, targetPort: 80 }]
+      expect(patchCalls).toEqual([
+        [
+          { op: 'test', path: '/metadata/resourceVersion', value: '123' },
+          { op: 'test', path: '/spec/type', value: 'ExternalName' },
+          { op: 'remove', path: '/spec/externalName' },
+          { op: 'add', path: '/spec/type', value: 'ClusterIP' },
+          { op: 'add', path: '/spec/selector', value: { svc: 'shared-api' } },
+          { op: 'add', path: '/spec/ports', value: ports },
+        ],
+      ])
+      expect(svc.logs('svc-a')).toContain('✓ repaired Service ns/shared-api to ClusterIP')
+      await svc.reconcileOne('svc-a')
+      expect(patchCalls).toHaveLength(1)
+
+      external = true
+      desiredType = 'ExternalName'
+      await svc.reconcileOne('svc-a')
+      expect(patchCalls).toHaveLength(1)
+      desiredType = 'ClusterIP'
+      customPorts = false
+      await svc.reconcileOne('svc-a')
+      expect(patchCalls).toHaveLength(2)
+    },
+  )
+
   it('starts and rescans with duplicates while retaining the registered path across restarts', async () => {
     const known = join(root, 'svc-a')
     const ignored = join(root, 'a', 'svc-a')
@@ -490,6 +675,163 @@ describe('Service', () => {
     expect(svc.get('svc-a')?.hasSession).toBe(false)
     expect(runner).toHaveBeenCalledWith('tmux', ['kill-session', '-t', '=devdock-svc-a'])
     nowSpy.mockRestore()
+  })
+
+  it('reports the current scheduler reason for an empty rollout and still retries the rollout', async () => {
+    const start = 1_800_000_000_000
+    const now = vi.spyOn(Date, 'now').mockReturnValue(start + 10_000)
+    const deployment = 'svc-a-devspace'
+    const base = cannedRunner(
+      '{"items":[]}',
+      true,
+      JSON.stringify({
+        items: [{ metadata: { name: deployment }, spec: { replicas: 1 }, status: {} }],
+      }),
+    )
+    const event = (pod: string, message: string, time: number, reason = 'FailedScheduling') => ({
+      involvedObject: { kind: 'Pod', name: pod },
+      reason,
+      message,
+      lastTimestamp: new Date(time).toISOString(),
+    })
+    let podAppeared = false
+    const runner = vi.fn(async (cmd: string, args: string[]) => {
+      if (cmd === 'tmux' && args[0] === 'list-panes')
+        return { code: 0, stdout: `devdock-svc-a 0 ${start / 1000}\n`, stderr: '' }
+      if (cmd === 'kubectl' && args[0] === 'get' && args[1] === 'events') {
+        expect(args).toContain('reason=FailedScheduling')
+        expect(args.slice(-2)).toEqual(['-n', 'ns'])
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            items: [
+              event(`${deployment}-rs-deleted`, 'Insufficient memory', start + 2000),
+              event(`${deployment}-rs-stale`, 'Stale reason', start - 1000),
+              event('other-devspace-rs-other', 'Unrelated reason', start + 9000),
+              event(`${deployment}-rs-image`, 'Image error', start + 8000, 'Failed'),
+              event(`${deployment}-rs-first`, 'Insufficient cpu', start + 1000),
+            ],
+          }),
+          stderr: '',
+        }
+      }
+      if (cmd === 'kubectl' && args[0] === 'get' && args[1] === 'pods' && podAppeared) {
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            items: [
+              { metadata: { name: `${deployment}-rs-pending` }, status: { phase: 'Pending' } },
+            ],
+          }),
+          stderr: '',
+        }
+      }
+      return base(cmd, args)
+    })
+    const svc = new Service({ roots: [root], stateFile }, { runner })
+    const line = '! svc-a-devspace has no pods. FailedScheduling: Insufficient memory'
+    try {
+      svc.rescan()
+      const state = await svc.reconcileOne('svc-a')
+      expect(state.workloads[0]).toMatchObject({
+        status: 'BUILDING',
+        schedulingFailure: 'Insufficient memory',
+      })
+      expect(svc.logs('svc-a')).toContain(line)
+
+      now.mockReturnValue(start + 10_000 + 5 * 60_000)
+      await svc.reconcileOne('svc-a')
+      expect(runner).toHaveBeenCalledWith(
+        'kubectl',
+        ['rollout', 'restart', 'deployment/svc-a-devspace', '-n', 'ns'],
+        { timeoutMs: 15_000 },
+      )
+      expect(svc.logs('svc-a').filter((log) => log === line)).toHaveLength(1)
+      podAppeared = true
+      expect((await svc.reconcileOne('svc-a')).workloads[0]?.schedulingFailure).toBeUndefined()
+    } finally {
+      now.mockRestore()
+      svc.stopLoop()
+    }
+  })
+
+  it.each([
+    { situation: 'empty rollout', readyToPatch: true },
+    { situation: 'terminated session', readyToPatch: true, dead: true },
+    { situation: 'unschedulable pod', pod: true },
+    { situation: 'scaled down intentionally', desired: 0 },
+    { situation: 'paused deployment', paused: true },
+    { situation: 'no session', hasSession: false },
+    { situation: 'failed pod query', podQuery: 'failed' },
+    { situation: 'unreadable pod list', podQuery: 'malformed' },
+    { situation: 'controller reports existing replicas', actual: 1 },
+  ])('reconciles a stalled rollout with $situation', async (scenario) => {
+    const time = Date.now()
+    const now = vi.spyOn(Date, 'now').mockReturnValue(time)
+    const deployments = JSON.stringify({
+      items: [
+        {
+          metadata: { name: 'svc-a-devspace' },
+          spec: { replicas: scenario.desired ?? 1, paused: scenario.paused },
+          status: { replicas: scenario.actual ?? 0 },
+        },
+      ],
+    })
+    const pending = JSON.stringify({
+      items: [{ metadata: { name: 'svc-a-devspace-1' }, status: { phase: 'Pending' } }],
+    })
+    const original = cannedRunner(
+      scenario.pod ? pending : '{"items":[]}',
+      scenario.hasSession ?? true,
+      deployments,
+    )
+    let pendingPod = false
+    const runner = vi.fn(async (cmd: string, args: string[]) => {
+      if (cmd === 'tmux' && args[0] === 'list-panes' && scenario.dead)
+        return { code: 0, stdout: 'devdock-svc-a 1', stderr: '' }
+      if (cmd === 'kubectl' && args[0] === 'get' && args[1] === 'pods') {
+        if (pendingPod) return { code: 0, stdout: pending, stderr: '' }
+        if (scenario.podQuery === 'failed') return { code: 1, stdout: '', stderr: '' }
+        if (scenario.podQuery === 'malformed') return { code: 0, stdout: 'invalid', stderr: '' }
+      }
+      return original(cmd, args)
+    })
+    const svc = new Service({ roots: [root], stateFile }, { runner })
+    const attempts = () =>
+      runner.mock.calls.filter(([cmd, args]) => cmd === 'kubectl' && args[0] === 'rollout')
+    try {
+      svc.rescan()
+      await svc.reconcileAll()
+      now.mockReturnValue(time + 4 * 60_000)
+      await svc.reconcileAll()
+      expect(attempts()).toHaveLength(0)
+      if (scenario.readyToPatch && !scenario.dead) {
+        // The Pending pod interrupts the empty-rollout timer.
+        pendingPod = true
+        await svc.reconcileAll()
+        pendingPod = false
+        now.mockReturnValue(time + 5 * 60_000)
+        await svc.reconcileAll()
+        expect(attempts()).toHaveLength(0)
+      }
+      now.mockReturnValue(time + 10 * 60_000)
+      await svc.reconcileAll()
+      now.mockReturnValue(time + 20 * 60_000)
+      await svc.reconcileAll()
+      expect(attempts()).toHaveLength(scenario.readyToPatch ? 1 : 0)
+      if (scenario.readyToPatch) {
+        expect(attempts()[0].slice(0, 2)).toEqual([
+          'kubectl',
+          ['rollout', 'restart', 'deployment/svc-a-devspace', '-n', 'ns'],
+        ])
+        expect(svc.logs('svc-a')).toContain(
+          '! restarting rollout for svc-a-devspace: desired replicas but no pods for five minutes',
+        )
+      }
+    } finally {
+      now.mockRestore()
+      svc.stopLoop()
+    }
   })
 
   it('a transient kubectl failure never retires the session or drops the status', async () => {
@@ -1004,7 +1346,10 @@ describe('Service', () => {
     before.rescan()
     before.setStartupCommand('svc-a', 'pnpm run dev')
     await before.start('svc-a')
-    writeFileSync(join(root, 'logs', 'svc-a.dev.log'), 'term  Opening shell to svc-a\n') // shell is open
+    writeFileSync(
+      join(root, 'logs', 'svc-a.dev.log'),
+      'term  Opening shell to svc-a\ndevspace ./app # \n',
+    ) // shell is open
 
     // …the daemon restarts inside the deploy window (fresh Service, same store),
     // and the pod only becomes ready on the new process's watch.
@@ -1031,7 +1376,7 @@ describe('Service', () => {
         'send-keys',
         '-t',
         '=devdock-svc-a:',
-        'pnpm run dev',
+        expect.stringContaining('then pnpm run dev; fi'),
         'Enter',
       ])
 
@@ -1072,17 +1417,23 @@ describe('Service', () => {
         }
         return base(cmd, args)
       })
-      const svc = new Service(
-        { roots: [root], stateFile },
-        {
-          runner,
-          streamSpawner: fakeStreamSpawner().spawner,
-        },
-      )
+      const createService = () =>
+        new Service(
+          { roots: [root], stateFile },
+          {
+            runner,
+            streamSpawner: fakeStreamSpawner().spawner,
+          },
+        )
+      const svc = createService()
       svc.rescan()
       svc.setStartupCommand('svc-a', 'python main.py')
       mkdirSync(join(root, 'logs'), { recursive: true })
-      writeFileSync(join(root, 'logs', 'svc-a.dev.log'), 'term  Opening shell to svc-a\n') // shell is open
+      const devLog = join(root, 'logs', 'svc-a.dev.log')
+      const banner = (pod: string) =>
+        `term  Opening shell to app:${pod} (pod:container)\ndevspace ./app # \n`
+      const original = banner(name)
+      writeFileSync(devLog, original)
       vi.useFakeTimers()
       try {
         await svc.reconcileAll()
@@ -1095,10 +1446,24 @@ describe('Service', () => {
         await vi.advanceTimersByTimeAsync(3000)
         expect(runner).not.toHaveBeenCalledWith('tmux', expect.arrayContaining(['send-keys']))
         ready = true
-        await svc.reconcileAll()
+        // Reconciliation after a daemon restart must still remember the previous pod.
+        svc.stopLoop()
+        const resumed = createService()
+        resumed.rescan()
+        await resumed.reconcileAll()
+        await vi.advanceTimersByTimeAsync(31_000)
+        expect(runner).not.toHaveBeenCalledWith('tmux', expect.arrayContaining(['send-keys']))
+        writeFileSync(devLog, original + banner('another-workload'))
+        await resumed.reconcileAll()
         await vi.advanceTimersByTimeAsync(3000)
-        await svc.reconcileAll()
+        expect(runner).not.toHaveBeenCalledWith('tmux', expect.arrayContaining(['send-keys']))
+        writeFileSync(devLog, original + banner('another-workload') + banner(name))
+        await resumed.reconcileAll()
+        await resumed.reconcileAll()
         await vi.advanceTimersByTimeAsync(3000)
+        await resumed.reconcileAll()
+        await vi.advanceTimersByTimeAsync(3000)
+        resumed.stopLoop()
         expect(
           runner.mock.calls.filter(([cmd, args]) => cmd === 'tmux' && args[0] === 'send-keys'),
         ).toHaveLength(1)
@@ -1138,7 +1503,7 @@ describe('Service', () => {
       expect(runner).not.toHaveBeenCalledWith('tmux', expect.arrayContaining(['send-keys']))
       writeFileSync(
         join(root, 'logs', 'svc-a.dev.log'),
-        'term  Opening shell to svc-a:app (pod:container)\n',
+        'term  Opening shell to svc-a:app (pod:container)\ndevspace ./app # \n',
       )
       await after.reconcileAll()
       await vi.advanceTimersByTimeAsync(3000)
@@ -1146,7 +1511,7 @@ describe('Service', () => {
         'send-keys',
         '-t',
         '=devdock-svc-a:',
-        'pnpm run dev',
+        expect.stringContaining('then pnpm run dev; fi'),
         'Enter',
       ])
     } finally {
@@ -1162,7 +1527,10 @@ describe('Service', () => {
     before.rescan()
     before.setStartupCommand('svc-a', 'pnpm run dev')
     await before.start('svc-a')
-    writeFileSync(join(root, 'logs', 'svc-a.dev.log'), 'term  Opening shell to svc-a\n') // shell is open
+    writeFileSync(
+      join(root, 'logs', 'svc-a.dev.log'),
+      'term  Opening shell to svc-a\ndevspace ./app # \n',
+    ) // shell is open
 
     let ready = false
     const runner = vi.fn(async (cmd: string, args: string[]): Promise<RunResult> => {
@@ -1217,7 +1585,7 @@ describe('Service', () => {
         'send-keys',
         '-t',
         '=devdock-svc-a:',
-        'pnpm run dev',
+        expect.stringContaining('then pnpm run dev; fi'),
         'Enter',
       ])
     } finally {
@@ -2099,6 +2467,27 @@ describe('Service replicas', () => {
     ])
     expect(svc.listReplicas()).toEqual([])
     expect(svc.listRepos().some((r) => r.id === 'parent-r1')).toBe(false)
+  })
+
+  it('keeps a live shared release when deleting a replica with a missing checkout', async () => {
+    const id = 'missing-replica'
+    const path = join(root, '.devdock-missing-replica')
+    new StateStore(stateFile).addReplica({
+      id,
+      parentId: 'svc-a',
+      path,
+      branch: 'feature',
+      configPaths: [join(path, 'devspace.yaml')],
+      releases: ['svc-a', 'unused-release'],
+      namespace: 'ns',
+      createdAt: Date.now(),
+    })
+    const { svc, runner } = newService(cannedRunner('{"items":[]}', true))
+    await svc.deleteReplica(id)
+
+    expect(runner).not.toHaveBeenCalledWith('helm', ['uninstall', 'svc-a', '-n', 'ns'])
+    expect(runner).toHaveBeenCalledWith('helm', ['uninstall', 'unused-release', '-n', 'ns'])
+    expect(svc.listReplicas()).toEqual([])
   })
 
   it('stop uninstalls a non-api release the purge pipeline left behind, never the api one', async () => {

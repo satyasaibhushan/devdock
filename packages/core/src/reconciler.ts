@@ -1,7 +1,7 @@
 // reconciler — state comes from the cluster, never from memory (spec §6).
 // Queries kubectl for pod + deployment reality, checks the tmux session,
 // derives status.
-import { type RunResult, run } from './exec.js'
+import { type RunOptions, type RunResult, run } from './exec.js'
 import { parseIngressUrls } from './ingressUrl.js'
 import { lifecycleActions } from './lifecycle.js'
 import type {
@@ -14,7 +14,7 @@ import type {
 } from './types.js'
 import { assembleState } from './workloads.js'
 
-type Runner = (cmd: string, args: string[], opts?: { cwd?: string }) => Promise<RunResult>
+type Runner = (cmd: string, args: string[], opts?: RunOptions) => Promise<RunResult>
 
 /** Derive a repo's lifecycle status from observed pods + session (spec §6 table). */
 export function deriveStatus(
@@ -87,21 +87,26 @@ export function matchDeployments(
   return matchByName(deployments, name, knownNames)
 }
 
-/** Parse `kubectl get pods -o json` into PodInfo[]. Defensive against junk. */
-export function parsePods(json: string): PodInfo[] {
-  let doc: unknown
+function listItems(json: string): unknown[] | null {
   try {
-    doc = JSON.parse(json)
+    const doc = JSON.parse(json) as { items?: unknown } | null
+    return Array.isArray(doc?.items) ? doc.items : null
   } catch {
-    return []
+    return null
   }
-  const items = (doc as { items?: unknown })?.items
-  if (!Array.isArray(items)) return []
+}
 
+/** Parse `kubectl get pods -o json` into PodInfo[]. */
+export function parsePods(json: string): PodInfo[] {
+  return podInfos(listItems(json) ?? [])
+}
+
+function podInfos(items: unknown[]): PodInfo[] {
   const pods: PodInfo[] = []
   for (const item of items) {
-    const meta = (item as { metadata?: { name?: string; deletionTimestamp?: string | null } })
-      .metadata
+    const meta = (
+      item as { metadata?: { name?: string; uid?: string; deletionTimestamp?: string | null } }
+    ).metadata
     // Lost nodes can retain ready container statuses after eviction begins.
     if (meta?.deletionTimestamp != null) continue
     const status = (item as { status?: Record<string, unknown> }).status ?? {}
@@ -151,6 +156,7 @@ export function parsePods(json: string): PodInfo[] {
       ...(spec?.nodeName ? { node: spec.nodeName } : {}),
       ...(imagePulled ? { imagePulled: true } : {}),
       name: meta?.name ?? '<unknown>',
+      ...(meta?.uid ? { uid: meta.uid } : {}),
       phase: typeof status.phase === 'string' ? status.phase : 'Unknown',
       ready,
       restartCount,
@@ -176,27 +182,34 @@ export function parsePods(json: string): PodInfo[] {
 
 /** Parse `kubectl get deployments -o json` into DeploymentInfo[]. Defensive against junk. */
 export function parseDeployments(json: string): DeploymentInfo[] {
-  let doc: unknown
-  try {
-    doc = JSON.parse(json)
-  } catch {
-    return []
-  }
-  const items = (doc as { items?: unknown })?.items
-  if (!Array.isArray(items)) return []
+  return deploymentInfos(listItems(json) ?? [])
+}
 
+function deploymentInfos(items: unknown[]): DeploymentInfo[] {
   const out: DeploymentInfo[] = []
   for (const item of items) {
     const meta = (item as { metadata?: { name?: string } }).metadata
-    const spec = (item as { spec?: { replicas?: unknown } }).spec
-    const status = (item as { status?: { readyReplicas?: unknown } }).status
+    const spec = (item as { spec?: { replicas?: unknown; paused?: boolean } }).spec
+    const status = (item as { status?: { readyReplicas?: number; replicas?: number } }).status
     out.push({
       name: meta?.name ?? '<unknown>',
       replicas: typeof spec?.replicas === 'number' ? spec.replicas : 0,
       readyReplicas: typeof status?.readyReplicas === 'number' ? status.readyReplicas : 0,
+      ...(status ? { actualReplicas: status.replicas ?? 0 } : {}),
+      ...(spec?.paused === true ? { paused: true } : {}),
     })
   }
   return out
+}
+
+interface SchedulingEvent {
+  reason?: string
+  message?: string
+  involvedObject?: { kind?: string; name?: string }
+  series?: { lastObservedTime?: string }
+  lastTimestamp?: string
+  eventTime?: string
+  metadata?: { creationTimestamp?: string }
 }
 
 /** One reconcile pass's worth of kubectl list results, keyed by query shape.
@@ -210,6 +223,7 @@ export interface ClusterCache {
   pods: Map<string, PodInfo[] | null>
   deployments: Map<string, DeploymentInfo[] | null>
   ingresses: Map<string, Map<string, string>>
+  schedulingEvents?: Map<string, SchedulingEvent[]>
   /** Every name that can claim pods/deployments this pass (repo, member, and
    *  workload-scoped names) — lets attribution give the longest name priority. */
   knownNames?: string[]
@@ -243,6 +257,7 @@ export class Reconciler {
     cache: ClusterCache,
     type: string,
     sessionDead = false,
+    sessionStartedAt?: number,
   ): Promise<WorkloadState> {
     const rawPods = await this.fetchPods(repo, cache)
     const rawDeployments = await this.fetchDeployments(repo, cache)
@@ -278,7 +293,60 @@ export class Reconciler {
     // A failed query means the cluster view is unknown, not empty — flag it so
     // the service can hold the last known status and skip retire decisions.
     if (rawPods === null || rawDeployments === null) ws.unreachable = true
+    if (hasSession && !ws.unreachable && pods.length === 0) {
+      const dev = deployments.find(
+        (d) => d.name === `${repo.name}-devspace` && d.replicas > 0 && !d.paused,
+      )
+      if (dev) {
+        const failure = await this.fetchSchedulingFailure(repo, cache, dev.name, sessionStartedAt)
+        if (failure) ws.schedulingFailure = failure
+      }
+    }
     return ws
+  }
+
+  private async fetchSchedulingFailure(
+    repo: Repo,
+    cache: ClusterCache,
+    deployment: string,
+    sessionStartedAt?: number,
+  ): Promise<string | undefined> {
+    const key = repo.namespace ?? ''
+    cache.schedulingEvents ??= new Map()
+    const eventsByNamespace = cache.schedulingEvents
+    let events = eventsByNamespace.get(key)
+    if (!events) {
+      const args = ['get', 'events', '--field-selector', 'reason=FailedScheduling', '-o', 'json']
+      if (repo.namespace) args.push('-n', repo.namespace)
+      const r = await this.runner('kubectl', args, { timeoutMs: 10_000 }).catch(() => undefined)
+      events = (r?.code === 0 ? (listItems(r.stdout) ?? []) : []) as SchedulingEvent[]
+      eventsByNamespace.set(key, events)
+    }
+    let latest: { time: number; message: string } | undefined
+    for (const event of events) {
+      const pod = event?.involvedObject?.name
+      if (
+        event?.reason !== 'FailedScheduling' ||
+        event.involvedObject?.kind !== 'Pod' ||
+        typeof pod !== 'string' ||
+        !pod.startsWith(`${deployment}-`) ||
+        !matchByName([{ name: pod }], repo.name, cache.knownNames).length ||
+        typeof event.message !== 'string' ||
+        !event.message.trim()
+      )
+        continue
+      const timestamp =
+        event.series?.lastObservedTime ??
+        event.lastTimestamp ??
+        event.eventTime ??
+        event.metadata?.creationTimestamp
+      const time = timestamp ? Date.parse(timestamp) : 0
+      if (!Number.isFinite(time) || time < (sessionStartedAt ?? 0)) continue
+      if (!latest || time >= latest.time) {
+        latest = { time, message: event.message.trim().replace(/\s+/g, ' ') }
+      }
+    }
+    return latest?.message
   }
 
   private async fetchIngresses(repo: Repo, cache: ClusterCache): Promise<Map<string, string>> {
@@ -305,7 +373,8 @@ export class Reconciler {
       if (repo.namespace) args.push('-n', repo.namespace)
       if (repo.selector) args.push('-l', repo.selector)
       const r = await this.runner('kubectl', args).catch(() => undefined)
-      pods = !r || r.code !== 0 ? null : parsePods(r.stdout)
+      const items = r?.code === 0 ? listItems(r.stdout) : null
+      pods = items && podInfos(items)
       cache.pods.set(key, pods)
     }
     if (pods === null) return null
@@ -327,7 +396,8 @@ export class Reconciler {
       const args = ['get', 'deployments', '-o', 'json']
       if (repo.namespace) args.push('-n', repo.namespace)
       const r = await this.runner('kubectl', args).catch(() => undefined)
-      deployments = !r || r.code !== 0 ? null : parseDeployments(r.stdout)
+      const items = r?.code === 0 ? listItems(r.stdout) : null
+      deployments = items && deploymentInfos(items)
       cache.deployments.set(key, deployments)
     }
     return deployments

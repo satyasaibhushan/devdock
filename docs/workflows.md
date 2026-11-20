@@ -97,3 +97,40 @@ Stopping a dev session interrupts its waiting operation and preserves deployment
 It does not cancel an in-progress deploy or purge.
 
 Live UAT deployment and verification are a separate final acceptance test.
+
+## Dev pod settings
+
+DevDock marks the pod templates DevSpace creates for development with
+`cluster-autoscaler.kubernetes.io/safe-to-evict: "false"`. The autoscaler keeps
+those pods out of voluntary node scale-down. Node failures can still evict them.
+
+Set `safeToEvict` to `true` in the machine's `~/.devdock/dev-pods.json` to skip
+the annotation for a workload. Use the scoped workload name as the key, such as
+`career-service-agents-api` for the API workload in a multi-workload repository.
+An annotation supplied by the workload itself takes precedence.
+
+```json
+{
+  "example-api": { "safeToEvict": true }
+}
+```
+
+Use `resources.requests` and `resources.limits` to override individual CPU and
+memory quantities for a workload. Use Kubernetes quantity strings. Any
+omitted field keeps the value from the repo or its DevSpace import.
+
+```json
+{
+  "career-service-agents-api": {
+    "resources": {
+      "limits": { "memory": "4Gi" }
+    }
+  }
+}
+```
+
+DevDock reads the file on each launch. Start a new dev session to apply edits.
+
+If a managed session's DevSpace deployment wants replicas and stays empty for
+five minutes, DevDock asks Kubernetes for one new rollout and logs the reason.
+A Pending pod counts as a scheduling attempt and resets the five-minute timer.
