@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { AwsCreds, type RunResult, Service } from '@devdock/core'
+import { AwsCreds, RouteConflict, type RunResult, Service, TestRunInputError } from '@devdock/core'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { AccessGate } from './accessGate.js'
 import { buildAgentApp } from './agentAccess.js'
@@ -733,6 +733,30 @@ describe('daemon routes', () => {
     expect(gc.json()).toEqual({ deleted: [] })
   })
 
+  it('forwards an explicit route claim, maps conflicts, and releases by replica id', async () => {
+    const service = makeReplicaService()
+    const app = buildApp(service)
+    const create = vi
+      .spyOn(service, 'createReplica')
+      .mockRejectedValue(new RouteConflict('Route is owned by replica parent-r1'))
+    const release = vi.spyOn(service, 'releaseReplicaRoute').mockResolvedValue()
+    const response = await app.inject({
+      method: 'POST',
+      url: '/repos/parent/replicas',
+      payload: { branch: 'feature', route: true },
+    })
+    expect(create).toHaveBeenCalledWith('parent', 'feature', {
+      ownImage: false,
+      route: true,
+      requestId: undefined,
+    })
+    expect(response.statusCode).toBe(409)
+    expect(response.json().error).toContain('parent-r1')
+    const released = await app.inject({ method: 'POST', url: '/replicas/parent-r1/release-route' })
+    expect(released.statusCode).toBe(200)
+    expect(release).toHaveBeenCalledWith('parent-r1')
+  })
+
   it('POST /repos/:id/replicas validates branch and repo, accepts single-config repos', async () => {
     const app = buildApp(makeReplicaService())
     const noBranch = await app.inject({
@@ -753,6 +777,70 @@ describe('daemon routes', () => {
       url: '/repos/nope/replicas',
       payload: { branch: 'main' },
     })
+    expect(unknown.statusCode).toBe(404)
+  })
+
+  it('starts a background test run and serves its status and paged output', async () => {
+    const service = makeReplicaService()
+    const app = buildApp(service)
+    const id = '0f9f2b5f-1f61-417a-a790-66231e7e5bd5'
+    const record = { id, repo: 'parent', state: 'running' as const, startedAt: 0 }
+    const startTest = vi.spyOn(service, 'startTest').mockReturnValue(record)
+    vi.spyOn(service.testRuns, 'status').mockReturnValue({
+      ...record,
+      state: 'finished',
+      exitCode: 7,
+    })
+    const output = vi
+      .spyOn(service.testRuns, 'output')
+      .mockReturnValue({ data: 'dGVzdA==', nextOffset: 8, eof: true })
+    const started = await app.inject({
+      method: 'POST',
+      url: '/repos/parent/test',
+      payload: { ref: 'feature', profile: 'php-8.1' },
+    })
+    expect(started.statusCode).toBe(202)
+    expect(started.json()).toEqual(record)
+    expect(startTest).toHaveBeenCalledWith('parent', { ref: 'feature', profile: 'php-8.1' })
+    expect((await app.inject({ method: 'GET', url: `/tests/${id}` })).json()).toMatchObject({
+      exitCode: 7,
+    })
+    expect(
+      (
+        await app.inject({ method: 'GET', url: `/tests/${id}/output?stream=stderr&offset=4` })
+      ).json(),
+    ).toMatchObject({ data: 'dGVzdA==', nextOffset: 8, eof: true })
+    expect(output).toHaveBeenCalledWith(id, 'stderr', 4)
+    expect(
+      (await app.inject({ method: 'GET', url: `/tests/${id}/output?offset=-1` })).statusCode,
+    ).toBe(400)
+    startTest.mockImplementation(() => {
+      throw new TestRunInputError('invalid profile')
+    })
+    expect((await app.inject({ method: 'POST', url: '/repos/parent/test' })).statusCode).toBe(400)
+  })
+
+  it('returns the final cancellation status and rejects unknown test run ids', async () => {
+    const service = makeReplicaService()
+    const app = buildApp(service)
+    const record = {
+      id: '0f9f2b5f-1f61-417a-a790-66231e7e5bd5',
+      repo: 'parent',
+      state: 'interrupted' as const,
+      startedAt: 1,
+      finishedAt: 2,
+      exitCode: 130,
+    }
+    const cancel = vi
+      .spyOn(service.testRuns, 'cancel')
+      .mockImplementation(async (id) => (id === record.id ? record : undefined))
+    const url = `/tests/${record.id}/cancel`
+    const response = await app.inject({ method: 'POST', url })
+    expect(response.statusCode).toBe(200)
+    expect(response.json()).toEqual(record)
+    expect((await app.inject({ method: 'POST', url })).json()).toEqual(record)
+    expect(cancel).toHaveBeenCalledWith(record.id)
+    const unknown = await app.inject({ method: 'POST', url: '/tests/unknown/cancel' })
     expect(unknown.statusCode).toBe(404)
   })
 

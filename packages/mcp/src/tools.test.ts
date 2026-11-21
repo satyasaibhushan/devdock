@@ -122,6 +122,11 @@ function fakeClient(over: Partial<DaemonClient> = {}): DaemonClient {
       },
     ],
     replicaDelete: async () => {},
+    replicaReleaseRoute: async () => {},
+    startTest: async (repo) => ({ id: 'test-run', repo, state: 'running', startedAt: 0 }),
+    testStatus: async (id) => ({ id, repo: 'svc-a', state: 'finished', startedAt: 0, exitCode: 7 }),
+    cancelTest: async (id) => ({ id, repo: 'svc-a', state: 'interrupted', startedAt: 0 }),
+    testOutput: async () => ({ data: '', nextOffset: 0, eof: true }),
     namespace: async () => ({ current: 'uat', known: ['uat', 'prod'] }),
     setNamespace: async (ns) => ({ current: ns, known: ['uat', ns] }),
     auth: async () => ({ oidc: true, phase: 'ok', checkedAt: 1 }),
@@ -186,6 +191,7 @@ describe('toolsForScope', () => {
       'devdock_checkout',
       'devdock_list',
       'devdock_status',
+      'devdock_test_result',
       'devdock_logs',
       'devdock_wait',
       'devdock_branch_list',
@@ -218,6 +224,7 @@ describe('toolsForScope', () => {
       'devdock_checkout',
       'devdock_list',
       'devdock_status',
+      'devdock_test_result',
       'devdock_logs',
       'devdock_wait',
       'devdock_branch_list',
@@ -234,7 +241,9 @@ describe('toolsForScope', () => {
       'devdock_adopt',
       'devdock_clear',
       'devdock_replica_create',
+      'devdock_replica_release_route',
       'devdock_replica_delete',
+      'devdock_test',
       'devdock_run',
       'devdock_exec',
       'devdock_set_startup',
@@ -491,8 +500,13 @@ describe('tool handlers', () => {
     const t = allTools(fakeClient({ replicaCreate })).find(
       (x) => x.name === 'devdock_replica_create',
     )
-    const out = await t?.handler({ repo: 'svc-a', branch: 'feature-x', requestId: 'retry-1' })
-    expect(replicaCreate).toHaveBeenCalledWith('svc-a', 'feature-x', undefined, 'retry-1')
+    const out = await t?.handler({
+      repo: 'svc-a',
+      branch: 'feature-x',
+      requestId: 'retry-1',
+      route: true,
+    })
+    expect(replicaCreate).toHaveBeenCalledWith('svc-a', 'feature-x', undefined, 'retry-1', true)
     expect(out).toContain('created svc-a-r1 from feature-x')
     expect(out).toContain('devdock_wait')
   })
@@ -526,7 +540,7 @@ describe('tool handlers', () => {
       (x) => x.name === 'devdock_replica_create',
     )
     const out = await t?.handler({ repo: 'svc-a', branch: 'feature-x', ownImage: true })
-    expect(replicaCreate).toHaveBeenCalledWith('svc-a', 'feature-x', true, undefined)
+    expect(replicaCreate).toHaveBeenCalledWith('svc-a', 'feature-x', true, undefined, undefined)
     expect(out).toContain('building its own image')
   })
 
@@ -538,6 +552,32 @@ describe('tool handlers', () => {
     expect(out).toContain('age=1d2h')
     expect(out).toContain('url=/svc-a-r1/')
     expect(out).not.toContain('pending')
+  })
+
+  it('starts isolated tests and pages their output without advancing past a split Unicode character', async () => {
+    const startTest = vi.fn(fakeClient().startTest)
+    const unfinished = Buffer.from('begin 😀').subarray(0, 8)
+    const testOutput = vi.fn(async () => ({
+      data: unfinished.toString('base64'),
+      nextOffset: unfinished.length,
+      eof: false,
+    }))
+    const tools = allTools(fakeClient({ startTest, testOutput }))
+    const start = tools.find(({ name }) => name === 'devdock_test')
+    const result = tools.find(({ name }) => name === 'devdock_test_result')
+    await start?.handler({ repo: 'svc-a', ref: 'feature', profile: 'php-8.5' })
+    expect(startTest).toHaveBeenCalledWith(
+      'svc-a',
+      expect.objectContaining({ ref: 'feature', profile: 'php-8.5' }),
+    )
+    const output = await result?.handler({ run: 'test-run', stream: 'stderr', offset: 0 })
+    expect(testOutput).toHaveBeenCalledWith('test-run', 'stderr', 0)
+    expect(JSON.parse(output ?? '')).toMatchObject({
+      exitCode: 7,
+      output: 'begin ',
+      nextOffset: 6,
+      eof: false,
+    })
   })
 
   it('replica_delete passes the id through', async () => {

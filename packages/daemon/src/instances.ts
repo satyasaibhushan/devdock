@@ -88,12 +88,13 @@ export function peerPathAllowed(path: string, terminals: boolean): boolean {
     return true
   if (/^\/sandboxes\/[^/]+(?:\/(?:build|snapshot|wake|sleep|expire))?$/.test(pathname)) return true
   if (
-    /^\/repos\/[a-zA-Z0-9_.-]+(?:\/(?:checkout|prerequisites|operations|pods|logs(?:\/query)?|branches|replicas|run|wait|exec|startup|start|build|build-start|restart|destroy|adopt|clear|stop-session|release|take-over))?$/.test(
+    /^\/repos\/[a-zA-Z0-9_.-]+(?:\/(?:checkout|prerequisites|operations|pods|logs(?:\/query)?|branches|replicas|run|test|wait|exec|startup|start|build|build-start|restart|destroy|adopt|clear|stop-session|release|take-over))?$/.test(
       pathname,
     )
   )
     return true
-  if (/^\/replicas\/[a-zA-Z0-9_.-]+$/.test(pathname)) return true
+  if (/^\/replicas\/[a-zA-Z0-9_.-]+(?:\/release-route)?$/.test(pathname)) return true
+  if (/^\/tests\/[a-f0-9-]{36}(?:\/(?:output|cancel))?$/.test(pathname)) return true
   if (/^\/operations(?:\/[a-zA-Z0-9-]+)?$/.test(pathname)) return true
   return (
     terminals && /^\/terminals(?:\/[a-zA-Z0-9_.:-]+(?:\/(?:attach|run|output))?)?$/.test(pathname)

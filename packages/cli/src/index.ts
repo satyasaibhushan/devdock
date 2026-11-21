@@ -2,6 +2,7 @@
 // Entry point: parse → one HTTP call → print → exit. All logic that can be
 // unit-tested lives in cli.ts; this file is the thin I/O shell around it.
 import {
+  type CliRequest,
   DEFAULT_URL,
   type LogsResponse,
   type RunResponse,
@@ -12,6 +13,7 @@ import {
   renderRun,
   renderWait,
 } from './cli.js'
+import { runTest } from './testRun.js'
 
 function emit(r: { out: string; err: string; code: number }): never {
   if (r.out) process.stdout.write(`${r.out}\n`)
@@ -19,7 +21,7 @@ function emit(r: { out: string; err: string; code: number }): never {
   process.exit(r.code)
 }
 
-async function main(): Promise<never> {
+async function main(): Promise<void> {
   const argv = process.argv.slice(2)
   if (argv.length === 0 || argv[0] === '--help' || argv[0] === '-h' || argv[0] === 'help') {
     process.stdout.write(`${USAGE}\n`)
@@ -36,24 +38,36 @@ async function main(): Promise<never> {
   }
 
   const base = (process.env.DEVDOCK_URL ?? DEFAULT_URL).replace(/\/$/, '')
-  let res: Response
-  try {
-    res = await fetch(`${base}${parsed.request.path}`, {
-      method: parsed.request.method,
-      headers: parsed.request.body ? { 'content-type': 'application/json' } : undefined,
-      body: parsed.request.body ? JSON.stringify(parsed.request.body) : undefined,
-    })
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err)
-    process.stderr.write(`devdock: cannot reach the daemon at ${base} — ${message}\n`)
-    process.exit(1)
+  const request = async <T>(req: CliRequest, signal?: AbortSignal): Promise<T> => {
+    let res: Response
+    try {
+      res = await fetch(`${base}${req.path}`, {
+        method: req.method,
+        headers: req.body ? { 'content-type': 'application/json' } : undefined,
+        body: req.body ? JSON.stringify(req.body) : undefined,
+        signal,
+      })
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      throw new Error(`cannot reach the daemon at ${base} — ${message}`)
+    }
+    const data = (await res.json().catch(() => ({}))) as T & { error?: string }
+    if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`)
+    return data
   }
-  const data = (await res.json().catch(() => ({}))) as Record<string, unknown>
-  if (!res.ok) {
-    process.stderr.write(`devdock: ${(data.error as string) ?? `HTTP ${res.status}`}\n`)
-    process.exit(1)
+  if (parsed.command === 'test') {
+    process.exitCode = await runTest(request, parsed.request, parsed.json)
+    return
   }
-
+  const data = await request<Record<string, unknown>>(parsed.request)
+  if (parsed.command === 'replica') {
+    const out = parsed.json
+      ? JSON.stringify(data)
+      : typeof data.id === 'string'
+        ? data.id
+        : 'Route released'
+    emit({ out, err: '', code: 0 })
+  }
   if (parsed.command === 'run') emit(renderRun(data as unknown as RunResponse, parsed.json))
   if (parsed.command === 'wait') emit(renderWait(data as unknown as WaitResponse, parsed.json))
   emit(renderLogs(data as unknown as LogsResponse, parsed.json))

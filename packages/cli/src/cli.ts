@@ -12,6 +12,13 @@ export const DEFAULT_URL = 'http://127.0.0.1:7717'
 export const USAGE = `devdock — command-line client for the devdock daemon (DEVDOCK_URL, default ${DEFAULT_URL})
 
 Usage:
+  devdock replica create <repo> <branch> [--route] [--own-image] [--request-id <id>] [--json]
+  devdock replica release-route <replica>
+
+  devdock test <repo> [--ref <ref> | --worktree <path>]
+      --profile <php-7.1|php-8.1|php-8.5>  --command <command>  --timeout-ms <n>  --json
+      Run in a disposable Docker container and exit with the suite's exit code.
+
   devdock run  <repo> <command>   run a command in the workload's pod; exits with
                                   the command's REAL exit code (124 = timed out,
                                   125 = infra error: no pod / auth / connectivity)
@@ -38,7 +45,7 @@ export interface CliRequest {
 }
 
 export interface ParsedCli {
-  command: 'run' | 'wait' | 'logs'
+  command: 'run' | 'wait' | 'logs' | 'replica' | 'test'
   request: CliRequest
   json: boolean
 }
@@ -103,6 +110,78 @@ function compact(obj: Record<string, unknown>): Record<string, unknown> {
 
 export function parseCli(argv: string[]): ParsedCli {
   const [command, ...rest] = argv
+  if (command === 'replica') {
+    const [action, ...args] = rest
+    if (action === 'release-route' && args.length === 1 && args[0]) {
+      return {
+        command,
+        json: false,
+        request: { method: 'POST', path: `/replicas/${encodeURIComponent(args[0])}/release-route` },
+      }
+    }
+    if (action !== 'create') throw new UsageError('replica needs create or release-route <replica>')
+    const { values, positionals } = parseArgs({
+      args,
+      allowPositionals: true,
+      options: {
+        route: { type: 'boolean' },
+        'own-image': { type: 'boolean' },
+        'request-id': { type: 'string' },
+        json: { type: 'boolean' },
+      },
+    })
+    const [repo, branch] = positionals
+    if (!repo || !branch || positionals.length !== 2)
+      throw new UsageError('replica create needs a repo and a branch')
+    return {
+      command,
+      json: values.json === true,
+      request: {
+        method: 'POST',
+        path: `/repos/${encodeURIComponent(repo)}/replicas`,
+        body: compact({
+          branch,
+          route: values.route,
+          ownImage: values['own-image'],
+          requestId: values['request-id'],
+        }),
+      },
+    }
+  }
+  if (command === 'test') {
+    const { values, positionals } = parseArgs({
+      args: rest,
+      allowPositionals: true,
+      options: {
+        ref: { type: 'string' },
+        worktree: { type: 'string' },
+        profile: { type: 'string' },
+        command: { type: 'string' },
+        'timeout-ms': { type: 'string' },
+        json: { type: 'boolean' },
+      },
+    })
+    const [repo] = positionals
+    if (!repo || positionals.length !== 1) throw new UsageError('test needs exactly one repo')
+    if (values.ref !== undefined && values.worktree !== undefined)
+      throw new UsageError('Choose --ref or --worktree')
+    return {
+      command,
+      json: values.json === true,
+      request: {
+        method: 'POST',
+        path: `/repos/${encodeURIComponent(repo)}/test`,
+        body: compact({
+          ref: values.ref,
+          worktree: values.worktree,
+          profile: values.profile,
+          command: values.command,
+          timeoutMs: positiveInt('timeout-ms', values['timeout-ms']),
+        }),
+      },
+    }
+  }
+
   if (command === 'run') {
     const { values, positionals } = parseArgs({
       args: rest,

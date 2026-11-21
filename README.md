@@ -101,3 +101,44 @@ gate as the rest of the API. The agent socket does not serve MCP.
 
 `devdock-mcp` still speaks stdio for clients that cannot use HTTP; it proxies
 to the daemon API and reads `DEVDOCK_MCP_SCOPE=rw` for write verbs.
+
+## Routed replicas
+
+Pass `route: true` to `devdock_replica_create`, or run
+`devdock replica create <repo> <branch> --route`. The parent's default workload
+needs an existing Kubernetes Service with a pod selector. DevDock reserves that
+Service for one replica and switches the selector after the replica's initial
+file sync completes and its Service selects ready pods. `devdock_status` and
+`devdock_replica_list` show the owner and route state.
+
+Use `devdock_replica_release_route` or `devdock replica release-route <replica>`
+to restore the selector and keep the replica running. Deletion, expiry, or
+daemon recovery also restores the selector.
+
+## Isolated PHP tests
+
+Use `devdock test <repo> --ref <ref> --profile php-8.1`, or call
+`devdock_test` and read its status and output with `devdock_test_result`.
+The CLI streams stdout and stderr and exits with the suite's exit code.
+Ctrl-C or SIGTERM cancels the run on the daemon and waits for cleanup. The
+daemon retries failed cleanup in the background. HTTP clients can also cancel
+an active run with `POST /tests/:id/cancel`.
+`--worktree <absolute-path>` snapshots tracked and unignored files in a worktree
+of the same repo. Omit both source options to test the committed `HEAD`.
+
+The runner uses Docker with BuildKit on the daemon host. It installs dependencies
+from `composer.lock` and runs PHPUnit in a disposable container without network
+access. The supported profiles are PHP 7.1, 8.1, and 8.5. The legacy profile
+installs PHP 7.1-compatible PHPUnit and Mockery in `/opt/devtools`. You can
+override the suite with `--command` and set a total deadline with `--timeout-ms`.
+
+Image build steps use `docker build --resource=memory=2g --resource=memory-swap=2g`.
+Use Docker Buildx with a Linux BuildKit worker that enforces per-step memory
+limits. DevDock stops the build if the Docker CLI lacks the flag or the
+dependency and compilation steps cannot verify their cgroup memory limit.
+
+For private SSH dependencies, configure both `DEVDOCK_TEST_SSH_AUTH_SOCK` and
+`DEVDOCK_TEST_SSH_KNOWN_HOSTS` on the daemon host. BuildKit mounts the agent and
+known hosts only while downloading dependencies. Install callbacks and the test
+command run offline. DevDock deletes the container and its tagged image and
+keeps the output in the daemon's state directory.

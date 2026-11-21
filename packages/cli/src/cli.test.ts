@@ -2,6 +2,49 @@ import { describe, expect, it } from 'vitest'
 import { UsageError, parseCli, renderLogs, renderRun, renderWait } from './cli.js'
 
 describe('parseCli', () => {
+  it('replica create opts in to routing and release targets the replica id', () => {
+    expect(
+      parseCli(['replica', 'create', 'svc-a', 'feature-a', '--route', '--own-image']).request,
+    ).toEqual({
+      method: 'POST',
+      path: '/repos/svc-a/replicas',
+      body: { branch: 'feature-a', route: true, ownImage: true },
+    })
+    expect(parseCli(['replica', 'release-route', 'svc-a-r1']).request).toEqual({
+      method: 'POST',
+      path: '/replicas/svc-a-r1/release-route',
+    })
+  })
+
+  it('test selects a ref or worktree and passes the runtime profile and command', () => {
+    expect(
+      parseCli([
+        'test',
+        'svc-a',
+        '--worktree',
+        '/worktrees/feature',
+        '--profile',
+        'php-8.1',
+        '--command',
+        'php vendor/bin/phpunit --filter Example',
+        '--timeout-ms',
+        '60000',
+      ]).request,
+    ).toEqual({
+      method: 'POST',
+      path: '/repos/svc-a/test',
+      body: {
+        worktree: '/worktrees/feature',
+        profile: 'php-8.1',
+        command: 'php vendor/bin/phpunit --filter Example',
+        timeoutMs: 60_000,
+      },
+    })
+    expect(() => parseCli(['test', 'svc-a', '--ref', 'HEAD', '--worktree', '/tmp/tree'])).toThrow(
+      UsageError,
+    )
+  })
+
   it('run: repo + quoted command → POST /run with the body', () => {
     const p = parseCli(['run', 'svc-a', 'pytest -q', '--workload', 'api', '--timeout-ms', '60000'])
     expect(p.command).toBe('run')

@@ -1,6 +1,7 @@
 // Thin promise wrapper around child_process — devdock shells out to
 // trusted CLIs (devspace, kubectl, tmux) rather than reimplementing them.
 import { type ChildProcess, spawn } from 'node:child_process'
+import { closeSync, openSync } from 'node:fs'
 import { env } from 'node:process'
 
 /** The user's login shell. devdock shells out to `devspace`, which in turn
@@ -31,10 +32,13 @@ export interface RunOptions {
   /** Kill the process after this many ms. */
   timeoutMs?: number
   killProcessGroup?: boolean
+  signal?: AbortSignal
   env?: NodeJS.ProcessEnv
   /** Cap each captured stream to this many bytes, keeping the TAIL — the end
    *  of a test run or stack trace is the informative part. */
   maxOutputBytes?: number
+  /** Send both streams directly to private log files instead of buffering. */
+  outputFiles?: { stdout: string; stderr: string }
 }
 
 /** Run a command to completion and capture its output. Never rejects — a
@@ -42,25 +46,57 @@ export interface RunOptions {
  *  are both reported in the result so one absent CLI can't crash the daemon. */
 export function run(cmd: string, args: string[], opts: RunOptions = {}): Promise<RunResult> {
   return new Promise((resolve) => {
+    if (opts.signal?.aborted) {
+      resolve({ code: -1, stdout: '', stderr: '' })
+      return
+    }
     const processGroup = opts.killProcessGroup && process.platform !== 'win32'
-    const child = spawn(cmd, args, { cwd: opts.cwd, env: opts.env, detached: processGroup })
+    let out: number | undefined
+    let err: number | undefined
+    let child: ChildProcess
+    try {
+      if (opts.outputFiles) {
+        out = openSync(opts.outputFiles.stdout, 'a', 0o600)
+        err = openSync(opts.outputFiles.stderr, 'a', 0o600)
+      }
+      child = spawn(cmd, args, {
+        cwd: opts.cwd,
+        env: opts.env,
+        detached: processGroup,
+        stdio: opts.outputFiles ? ['ignore', out, err] : 'pipe',
+      })
+    } catch (error) {
+      resolve({ code: 125, stdout: '', stderr: String(error) })
+      return
+    } finally {
+      if (out !== undefined) closeSync(out)
+      if (err !== undefined) closeSync(err)
+    }
     let stdout = ''
     let stderr = ''
     let timedOut = false
     let truncated = false
     let timer: NodeJS.Timeout | undefined
 
+    const kill = () => {
+      if (processGroup && child.pid) {
+        try {
+          process.kill(-child.pid, 'SIGKILL')
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ESRCH') child.kill('SIGKILL')
+        }
+      } else child.kill('SIGKILL')
+    }
     if (opts.timeoutMs) {
       timer = setTimeout(() => {
         timedOut = true
-        if (processGroup && child.pid) {
-          try {
-            process.kill(-child.pid, 'SIGKILL')
-          } catch (error) {
-            if ((error as NodeJS.ErrnoException).code !== 'ESRCH') child.kill('SIGKILL')
-          }
-        } else child.kill('SIGKILL')
+        kill()
       }, opts.timeoutMs)
+    }
+    opts.signal?.addEventListener('abort', kill, { once: true })
+    const dispose = () => {
+      clearTimeout(timer)
+      opts.signal?.removeEventListener('abort', kill)
     }
 
     const cap = (s: string): string => {
@@ -77,13 +113,13 @@ export function run(cmd: string, args: string[], opts: RunOptions = {}): Promise
       stderr = cap(stderr + d)
     })
     child.on('error', (err) => {
-      if (timer) clearTimeout(timer)
+      dispose()
       const code = (err as NodeJS.ErrnoException).code === 'ENOENT' ? 127 : -1
       const hint = code === 127 ? `${cmd}: command not found` : err.message
       resolve({ code, stdout, stderr: stderr || hint, timedOut, truncated })
     })
     child.on('close', (code) => {
-      if (timer) clearTimeout(timer)
+      dispose()
       resolve({ code: code ?? -1, stdout, stderr, timedOut, truncated })
     })
   })

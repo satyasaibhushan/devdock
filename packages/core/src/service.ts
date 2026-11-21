@@ -13,7 +13,7 @@ import { environmentWarning } from './environmentWarning.js'
 import { type RunOptions, type RunResult, run, runStream, spawnStream } from './exec.js'
 import { clusterIPService, helmReleaseNames } from './helmRelease.js'
 import { type LifecycleAction, lifecyclePlan } from './lifecycle.js'
-import { decodeCursor, encodeCursor, readFileSlice } from './logQuery.js'
+import { decodeCursor, encodeCursor, readFileSlice, scanFileLines } from './logQuery.js'
 import { LogHub, LogTailer, type SpawnFn, cleanLine } from './logTailer.js'
 import { type Operation, type OperationStage, Operations } from './operations.js'
 import { DeploymentOwnership } from './ownership.js'
@@ -32,6 +32,7 @@ import {
 } from './reconciler.js'
 import { duplicateRepoWarning, parseDevspaceConfig, scanRepos, sessionName } from './registry.js'
 import { replicaImageWarnings } from './replicaImage.js'
+import { ReplicaRoutes, publicRoute } from './replicaRoutes.js'
 import {
   aliasIngressManifest,
   generateReplicaConfig,
@@ -57,9 +58,10 @@ import {
   shellPromptReady,
   startProgress,
 } from './startProgress.js'
-import { type ReplicaRecord, StateStore } from './stateStore.js'
+import { type ReplicaInfo, type ReplicaRecord, StateStore } from './stateStore.js'
 import { type SessionState, type StreamRunner, Supervisor, verbLabel } from './supervisor.js'
 import { type RunOutcome, type TermInfo, type TermKind, TermRegistry } from './termRegistry.js'
+import { type TestRunOptions, TestRuns } from './testRuns.js'
 import type {
   DeploymentInfo,
   PodInfo,
@@ -302,6 +304,10 @@ export class Service {
   private readonly reconnects = new Map<string, { attempts: number; lastAt: number }>()
   private readonly pausedSessions = new Set<string>()
   private readonly sessionGenerations = new Map<string, number>()
+  private readonly initialSyncState = new Map<
+    string,
+    { generation: number; offset: number; synced: boolean }
+  >()
   private readonly readyPodGenerations = new Map<string, string>()
   /** Effective release names are stable for a running DevSpace session. */
   private readonly sessionHelmReleases = new Map<string, { target: string; names: string[] }>()
@@ -313,6 +319,10 @@ export class Service {
   private readonly startupReadySince = new Map<string, number>()
   /** Fast re-checks for a pending startup between the 5s reconcile ticks. */
   private readonly shellWatches = new Map<string, NodeJS.Timeout>()
+  private readonly creatingReplicas = new Set<string>()
+  private readonly deletingReplicas = new Map<string, Promise<void>>()
+  private readonly replicaRoutes: ReplicaRoutes
+  readonly testRuns: TestRuns
   private readonly replicaRequests = new Map<string, Promise<ReplicaRecord>>()
   private timer?: NodeJS.Timeout
   private authTimer?: NodeJS.Timeout
@@ -393,6 +403,8 @@ export class Service {
     this.runner = baseRunner
     this.streamSpawner = deps.streamSpawner ?? spawnStream
     this.store = new StateStore(this.opts.stateFile)
+    this.replicaRoutes = new ReplicaRoutes(this.store, this.kubectl)
+    this.testRuns = new TestRuns(`${this.opts.stateFile}.tests`, this.runner)
     this.operations = new Operations(`${this.opts.stateFile}.operations`)
     this.sandboxes = new Sandboxes({
       store: this.store,
@@ -817,7 +829,7 @@ export class Service {
   }
 
   async status(id: string): Promise<RepoState | undefined> {
-    const state = await this.lookup(id)
+    const state = await this.lookupWithRoutes(id)
     if (!state) return
     const [daemon, workloads] = await Promise.all([
       this.versionInfo(),
@@ -914,7 +926,7 @@ export class Service {
   }
 
   list(): RepoState[] {
-    return [...this.states.values()]
+    return [...this.states.values()].map((state) => this.withReplicaRoutes(state))
   }
 
   async listWithOwnership() {
@@ -953,7 +965,20 @@ export class Service {
   }
 
   get(id: string): RepoState | undefined {
-    return this.states.get(id)
+    const state = this.states.get(id)
+    return state && this.withReplicaRoutes(state)
+  }
+
+  private withReplicaRoutes(state: RepoState): RepoState {
+    const routes = this.store
+      .listReplicas()
+      .flatMap(({ id, parentId, route }) =>
+        route &&
+        (state.repo.id === id || (state.repo.id === parentId && route.state !== 'released'))
+          ? [publicRoute(id, route)]
+          : [],
+      )
+    return routes.length ? { ...state, replicaRoutes: routes } : state
   }
 
   health(): { ok: boolean; state: { ok: boolean; error?: string }; warnings: string[] } {
@@ -1223,7 +1248,7 @@ export class Service {
 
   /** Stop synchronization and forwarding only. Keep Kubernetes workloads and ownership. */
   async stopSession(id: string, workload?: string): Promise<RunResult> {
-    const { repo, key } = this.scoped(id, workload)
+    const { repo, key, type } = this.scoped(id, workload)
     const activeOperation = this.operations.active(id, this.scoped(id, workload).type ?? '')
     if (activeOperation && ['deploying', 'stopping'].includes(activeOperation.stage))
       return {
@@ -1231,6 +1256,7 @@ export class Service {
         stdout: '',
         stderr: 'Wait for deployment changes to finish before stopping the session',
       }
+    await this.releaseRouteForWorkload(id, type)
     this.recordLifecycle(id, workload)
     await this.claimOwnership(repo)
     if (activeOperation)
@@ -1257,10 +1283,11 @@ export class Service {
   }
 
   async stop(id: string, workload?: string): Promise<RunResult> {
-    const { repo: scoped, key } = this.scoped(id, workload)
+    const { repo: scoped, key, type: scopedType } = this.scoped(id, workload)
     this.operationStage(id, workload, 'stopping')
     const denied = await this.ensureAuth(key)
     if (denied) return denied
+    await this.releaseRouteForWorkload(id, scopedType)
     const namespace = scoped.namespace || (await this.contextNamespace()) || 'default'
     const repo = { ...scoped, namespace }
     const sessions = await this.supervisor.sessionStates()
@@ -1409,9 +1436,10 @@ export class Service {
   /** Drop the dev session and its replaced pod, restoring the deployment as
    *  deployed (`devspace reset pods`). No purge: the Ingress is not rewritten. */
   private async resetSession(id: string, workload?: string): Promise<RunResult> {
-    const { repo, key } = this.scoped(id, workload)
+    const { repo, key, type } = this.scoped(id, workload)
     const denied = await this.ensureAuth(key)
     if (denied) return denied
+    await this.releaseRouteForWorkload(id, type)
     await this.claimOwnership(repo)
     this.noPodsSince.delete(key)
     this.emptyDevRollouts.delete(key)
@@ -1622,10 +1650,36 @@ export class Service {
     )
   }
 
+  startTest(id: string, options: TestRunOptions) {
+    return this.testRuns.start(this.repoOrThrow(id), options)
+  }
+
   // ---- replicas: ephemeral branch-pinned parallel deployments (spec: replicas) ----
 
-  listReplicas(): ReplicaRecord[] {
-    return this.store.listReplicas()
+  listReplicas(): ReplicaInfo[] {
+    return this.store.listReplicas().map(publicReplica)
+  }
+
+  async lookupWithRoutes(id: string): Promise<RepoState | undefined> {
+    const state = await this.lookup(id)
+    if (!state || state.repo.parentId) return state
+    try {
+      const { repo, type } = this.scoped(id)
+      const route = await this.replicaRoutes.status(
+        {
+          context: await this.currentContext(),
+          namespace: repo.namespace || (await this.contextNamespace()) || 'default',
+          service: repo.name,
+        },
+        type ?? '',
+      )
+      if (route && !state.replicaRoutes?.some(({ owner }) => owner === route.owner)) {
+        return { ...state, replicaRoutes: [route] }
+      }
+    } catch {
+      // Preserve locally known route state when the cluster is unavailable.
+    }
+    return state
   }
 
   /** Local branches of a repo's checkout, most recently committed first — the
@@ -1663,25 +1717,33 @@ export class Service {
   async createReplica(
     parentId: string,
     branch: string,
-    opts: { ownImage?: boolean; requestId?: string } = {},
+    opts: { ownImage?: boolean; requestId?: string; route?: boolean } = {},
+  ): Promise<ReplicaInfo> {
+    return publicReplica(await this.requestReplica(parentId, branch, opts))
+  }
+
+  private async requestReplica(
+    parentId: string,
+    branch: string,
+    opts: { ownImage?: boolean; requestId?: string; route?: boolean } = {},
   ): Promise<ReplicaRecord> {
     const requestId = opts.requestId
     if (requestId === undefined) return this.createReplicaOnce(parentId, branch, opts)
     if (typeof requestId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(requestId))
       throw new Error('invalid replica request id')
     const key = `${parentId}:${requestId}`
-    const existing = this.store
-      .listReplicas()
-      .find((record) => record.parentId === parentId && record.requestId === requestId)
-    if (existing) {
-      if (existing.branch !== branch.trim() || !!existing.ownImage !== !!opts.ownImage)
-        throw new Error('replica request id already belongs to different options')
-      return existing
-    }
-    const active = this.replicaRequests.get(key)
-    if (active) {
-      const record = await active
-      if (record.branch !== branch.trim() || !!record.ownImage !== !!opts.ownImage)
+    const prior =
+      this.replicaRequests.get(key) ??
+      this.store
+        .listReplicas()
+        .find((record) => record.parentId === parentId && record.requestId === requestId)
+    if (prior) {
+      const record = await prior
+      if (
+        record.branch !== branch.trim() ||
+        !!record.ownImage !== !!opts.ownImage ||
+        !!record.route !== !!opts.route
+      )
         throw new Error('replica request id already belongs to different options')
       return record
     }
@@ -1697,7 +1759,7 @@ export class Service {
   private async createReplicaOnce(
     parentId: string,
     branch: string,
-    opts: { ownImage?: boolean; requestId?: string },
+    opts: { ownImage?: boolean; requestId?: string; route?: boolean },
   ): Promise<ReplicaRecord> {
     const parent = this.repoOrThrow(parentId)
     if (parent.parentId) throw new Error('cannot create a replica of a replica')
@@ -1733,6 +1795,8 @@ export class Service {
       `${parentId}${this.replicaInstanceSuffix}`,
       (cand) =>
         this.repos.has(cand) ||
+        this.creatingReplicas.has(cand) ||
+        this.deletingReplicas.has(cand) ||
         !!this.store.getReplica(cand) ||
         existsSync(replicaCheckoutPath(parent.path, cand)) ||
         existsSync(join(legacyReplicasDir, cand)),
@@ -1741,19 +1805,22 @@ export class Service {
     // --detach: no branch is checked out twice (git forbids that) and the
     // worktree can't accumulate commits — replicas are strictly read-only
     // snapshots of the branch's tip at creation time.
-    const added = await this.runner('git', [
-      '-C',
-      parent.path,
-      'worktree',
-      'add',
-      '--detach',
-      wt,
-      trimmedBranch,
-    ])
-    if (added.code !== 0) {
-      throw new Error(added.stderr.trim() || `git worktree add exited ${added.code}`)
-    }
+    this.creatingReplicas.add(id)
+    let worktreeAdded = false
     try {
+      const added = await this.runner('git', [
+        '-C',
+        parent.path,
+        'worktree',
+        'add',
+        '--detach',
+        wt,
+        trimmedBranch,
+      ])
+      if (added.code !== 0) {
+        throw new Error(added.stderr.trim() || `git worktree add exited ${added.code}`)
+      }
+      worktreeAdded = true
       assertParentConfigsUnchanged()
       let namespace = parent.namespace
       if (!namespace) namespace = (await this.contextNamespace()) || undefined
@@ -1847,28 +1914,70 @@ export class Service {
         ]),
       ]
       this.store.addReplica(record) // persisted before start — restart-safe
-      this.repos.set(id, repo)
-      for (const warning of record.warnings ?? []) this.hubFor(id).push(`! ${warning}`)
-      if (opts.ownImage) {
-        this.hubFor(id).push(
-          `✓ replica ${id} created from ${trimmedBranch} — building image, then deploying`,
-        )
-        void this.build(id)
-          .then((r) => (r.code === 0 ? this.start(id) : undefined))
-          .catch(() => undefined)
-      } else {
-        this.hubFor(id).push(`✓ replica ${id} created from ${trimmedBranch} — deploying`)
-        void this.start(id).catch(() => undefined)
+      if (opts.route) {
+        const type = resolveWorkload(parent)
+        const parentWorkload = this.pinned(scopeRepo(parent, type), workloadKey(parentId, type))
+        const replicaWorkload = scopeRepo(repo, type)
+        const parentNamespace = parentWorkload.namespace || namespace || 'default'
+        if (parentNamespace !== (replicaWorkload.namespace || namespace || 'default'))
+          throw new Error('Replica and parent Services must be in the same namespace')
+        await this.replicaRoutes.reserve(id, {
+          context: await this.currentContext(),
+          namespace: parentNamespace,
+          service: parentWorkload.name,
+          replicaService: replicaWorkload.name,
+          workload: type ?? '',
+        })
       }
-      return record
+      this.repos.set(id, repo)
+      const created = this.store.getReplica(id) ?? record
+      for (const warning of created.warnings ?? []) this.hubFor(id).push(`! ${warning}`)
+      const action = created.ownImage ? 'building image, then deploying' : 'deploying'
+      this.hubFor(id).push(`✓ replica ${id} created from ${trimmedBranch} — ${action}`)
+      void this.launchReplica(created)
+      return created
     } catch (err) {
-      await this.runner('git', ['-C', parent.path, 'worktree', 'remove', '--force', wt]).catch(
-        () => undefined,
-      )
-      this.store.removeReplica(id)
+      await this.releaseReplicaRoute(id).catch(() => undefined)
+      if (worktreeAdded) {
+        await this.runner('git', ['-C', parent.path, 'worktree', 'remove', '--force', wt]).catch(
+          () => undefined,
+        )
+      }
+      const route = this.store.getReplica(id)?.route
+      if (!route || route.state === 'released') this.store.removeReplica(id)
       this.store.clearStartup(id)
       this.repos.delete(id)
       throw err
+    } finally {
+      this.creatingReplicas.delete(id)
+    }
+  }
+
+  private async launchReplica(record: ReplicaRecord): Promise<void> {
+    const { id, route } = record
+    try {
+      const build = record.ownImage ? await this.build(id) : undefined
+      const current = this.store.getReplica(id)
+      if ((!build || build.code === 0) && current?.createdAt === record.createdAt) {
+        if ((await this.start(id)).code === 0) return
+      }
+    } catch {
+      // The build and start verbs already report to the replica log.
+    }
+    if (route) await this.replicaRoutes.release(id, route).catch(() => undefined)
+  }
+
+  private async releaseRouteForWorkload(id: string, workload: string | undefined): Promise<void> {
+    if (this.store.getReplica(id)?.route?.workload === (workload ?? '')) {
+      await this.releaseReplicaRoute(id)
+    }
+  }
+
+  async releaseReplicaRoute(id: string): Promise<void> {
+    const record = this.store.getReplica(id)
+    if (!record) throw new Error(`unknown replica: ${id}`)
+    if (record.route && record.route.state !== 'released') {
+      await this.replicaRoutes.release(id, record.route)
     }
   }
 
@@ -1901,8 +2010,18 @@ export class Service {
    *  worktree, and purge every trace from the store. Works from stored paths
    *  even when the worktree or parent checkout has already gone. */
   async deleteReplica(id: string): Promise<void> {
+    const pending = this.deletingReplicas.get(id)
+    if (pending) return pending
     const rec = this.store.getReplica(id)
-    if (!rec) throw new Error(`unknown replica: ${id}`)
+    if (!rec || this.creatingReplicas.has(id)) throw new Error(`unknown replica: ${id}`)
+    const deletion = this.deleteReplicaOnce(rec).finally(() => this.deletingReplicas.delete(id))
+    this.deletingReplicas.set(id, deletion)
+    return deletion
+  }
+
+  private async deleteReplicaOnce(rec: ReplicaRecord): Promise<void> {
+    const { id } = rec
+    await this.releaseReplicaRoute(id)
     const repo = this.repos.get(id)
     if (repo) {
       for (const type of workloadTypes(repo)) await this.claimOwnership(scopeRepo(repo, type))
@@ -1979,8 +2098,15 @@ export class Service {
     const deleted: string[] = []
     for (const rec of this.store.listReplicas()) {
       if (now - rec.createdAt < REPLICA_TTL_MS) continue
-      await this.deleteReplica(rec.id).catch(() => undefined)
-      deleted.push(rec.id)
+      const current = this.store.getReplica(rec.id)
+      if (current?.createdAt !== rec.createdAt || current.route?.token !== rec.route?.token)
+        continue
+      try {
+        await this.deleteReplica(rec.id)
+        deleted.push(rec.id)
+      } catch {
+        // Keep the record so an unavailable cluster can be retried.
+      }
     }
     for (const repo of this.repos.values()) {
       if (repo.parentId) continue
@@ -2197,6 +2323,17 @@ export class Service {
   }
 
   // ---- namespace (the UI face of the user's `kn` alias) ----
+  private async currentContext(): Promise<string> {
+    const result = await this.runner('kubectl', ['config', 'current-context'], {
+      timeoutMs: 10_000,
+    })
+    if (result.code !== 0 || !result.stdout.trim())
+      throw new Error(
+        result.stderr.trim() || 'Cannot determine Kubernetes context for replica route',
+      )
+    return result.stdout.trim()
+  }
+
   /** The kube context's current namespace ('' when unset or unreadable). */
   private async contextNamespace(): Promise<string> {
     const r = await this.runner('kubectl', [
@@ -2480,7 +2617,10 @@ export class Service {
         // in CRASHED — devspace reattaches to the existing dev pod.
         if (this.scheduleReconnect(id, type, key)) ws.status = 'RESTARTING'
       }
-      if (!hasSession) this.sessionHelmReleases.delete(key)
+      if (!hasSession) {
+        this.sessionHelmReleases.delete(key)
+        this.initialSyncState.delete(key)
+      }
       if (session && ws.status === 'RUNNING_MANAGED' && !ws.unreachable) {
         await this.repairApiService(scoped, key, session).catch(() => undefined)
       }
@@ -2538,15 +2678,64 @@ export class Service {
     const state = assembleState(repo, workloads, Date.now())
     // A pass that outlived its repo (replica deleted mid-pass) must not
     // re-list it.
-    if (!this.repos.has(id)) return state
+    if (this.repos.get(id) !== repo) return state
     this.applyStartupCommands(state)
     this.applyState(state)
-    if (repo.parentId && state.pods.length > 0) {
+    if (repo.parentId) {
       const rec = this.store.getReplica(id)
-      if (rec && !rec.ingressApplied)
+      const route = rec?.route
+      if (route && (route.state === 'pending' || route.state === 'active')) {
+        const target = workloads.find((w) => w.type === route.workload)
+        const key = workloadKey(id, route.workload || undefined)
+        if (target && !target.unreachable && !this.pausedSessions.has(key)) {
+          if (route.state === 'pending' && target.hasSession) {
+            // A ready replacement can still be serving the reused parent image's code.
+            const synced = this.hasInitialSync(key)
+            if (synced && devSessionReady(target.pods, synced)) {
+              await this.replicaRoutes
+                .activate(id, route, devSessionPods(target.pods))
+                .catch((error: unknown) =>
+                  this.replicaRoutes.reportActivationError(id, route.token, error),
+                )
+            }
+          } else if (route.state === 'active') {
+            const reconcile = target.hasSession
+              ? this.replicaRoutes.releaseIfChanged(id, route)
+              : this.replicaRoutes.release(id, route)
+            await reconcile.catch(() => undefined)
+          }
+        }
+      }
+      if (rec && !rec.ingressApplied && state.pods.length > 0)
         await this.applyReplicaIngress(repo, rec).catch(() => undefined)
     }
-    return state
+    return this.withReplicaRoutes(state)
+  }
+
+  private hasInitialSync(key: string): boolean {
+    const generation = this.sessionGenerations.get(key) ?? 0
+    const file = this.devLogPath(key)
+    let size: number
+    try {
+      size = statSync(file).size
+    } catch {
+      this.initialSyncState.delete(key)
+      return false
+    }
+    const prev = this.initialSyncState.get(key)
+    if (prev && prev.generation === generation && prev.offset <= size && prev.synced) {
+      return true
+    }
+    const startOffset =
+      prev && prev.generation === generation && prev.offset <= size ? prev.offset : 0
+    const scanned = scanFileLines(file, startOffset, initialSyncDone)
+    if (!scanned) return false
+    this.initialSyncState.set(key, {
+      generation,
+      offset: scanned.nextOffset,
+      synced: scanned.matched,
+    })
+    return scanned.matched
   }
 
   private async repairApiService(repo: Repo, key: string, session: SessionState): Promise<void> {
@@ -2638,6 +2827,7 @@ export class Service {
   async reconcileAll(): Promise<RepoState[]> {
     const authSync = this.auth.syncContext?.()
     if (authSync) await authSync.catch(() => undefined)
+    await this.replicaRoutes.recover()
     this.pruneMissingCheckouts()
     // Share one cluster snapshot + one session map across the pass — repos in
     // the same namespace reuse a single kubectl query instead of one each.
@@ -3364,6 +3554,7 @@ export class Service {
     // from tick one instead of racing kubelogins at boot.
     await this.auth.init().catch(() => undefined)
     this.rescan()
+    void this.testRuns.recover().catch((error: unknown) => console.error(error))
     await this.reconcileAll()
     this.stopped = false
     await this.sandboxes.recover()
@@ -3409,6 +3600,10 @@ export class Service {
     for (const t of this.tailers.values()) t.stop()
     this.terms.closeAll()
   }
+}
+
+function publicReplica({ route, ...record }: ReplicaRecord): ReplicaInfo {
+  return route ? { ...record, route: publicRoute(record.id, route) } : record
 }
 
 function nonEmptyLines(text: string): string[] {

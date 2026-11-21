@@ -2,7 +2,15 @@
 import { existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import type { LifecycleAction, Service, WorkflowAction } from '@devdock/core'
+import {
+  type LifecycleAction,
+  RouteConflict,
+  type Service,
+  TestRunBusyError,
+  TestRunInputError,
+  type TestRunOptions,
+  type WorkflowAction,
+} from '@devdock/core'
 import fastifyStatic from '@fastify/static'
 import Fastify, { type FastifyInstance, type FastifyReply } from 'fastify'
 import type { AccessGate } from './accessGate.js'
@@ -378,24 +386,28 @@ export function buildApp(
 
   app.post<{
     Params: { id: string }
-    Body: { branch?: string; ownImage?: boolean; requestId?: string }
+    Body: { branch?: string; ownImage?: boolean; requestId?: string; route?: boolean }
   }>('/repos/:id/replicas', async (req, reply) => {
     const branch = req.body?.branch
     if (typeof branch !== 'string' || !branch.trim()) {
       return reply.code(400).send({ error: 'branch required' })
+    }
+    if (req.body.route !== undefined && typeof req.body.route !== 'boolean') {
+      return reply.code(400).send({ error: 'route must be a boolean' })
     }
     try {
       return reply.code(201).send(
         await service.createReplica(req.params.id, branch, {
           ownImage: req.body?.ownImage === true,
           requestId: req.body?.requestId,
+          route: req.body?.route,
         }),
       )
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       const code = message.includes('unknown repo')
         ? 404
-        : message.includes('replica request id already belongs')
+        : err instanceof RouteConflict || message.includes('replica request id already belongs')
           ? 409
           : message.includes('replica of a replica') ||
               message.includes('invalid replica request id')
@@ -410,6 +422,16 @@ export function buildApp(
   app.delete<{ Params: { id: string } }>('/replicas/:id', async (req, reply) => {
     try {
       await service.deleteReplica(req.params.id)
+      return { ok: true }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      return reply.code(message.includes('unknown replica') ? 404 : 500).send({ error: message })
+    }
+  })
+
+  app.post<{ Params: { id: string } }>('/replicas/:id/release-route', async (req, reply) => {
+    try {
+      await service.releaseReplicaRoute(req.params.id)
       return { ok: true }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
@@ -438,6 +460,55 @@ export function buildApp(
     sandboxRoutes(sandboxApp, service)
   })
   sandboxLinkRoute(app, service)
+
+  app.post<{ Params: { id: string }; Body: TestRunOptions }>(
+    '/repos/:id/test',
+    async (req, reply) => {
+      try {
+        return reply.code(202).send(service.startTest(req.params.id, req.body ?? {}))
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        const code =
+          err instanceof TestRunInputError
+            ? 400
+            : err instanceof TestRunBusyError
+              ? 409
+              : message.includes('unknown repo')
+                ? 404
+                : 500
+        return reply.code(code).send({ error: message })
+      }
+    },
+  )
+
+  app.get<{ Params: { id: string } }>('/tests/:id', async (req, reply) => {
+    const status = service.testRuns.status(req.params.id)
+    return status ?? reply.code(404).send({ error: 'unknown test run' })
+  })
+
+  app.post<{ Params: { id: string } }>('/tests/:id/cancel', async (req, reply) => {
+    const status = await service.testRuns.cancel(req.params.id)
+    return status ?? reply.code(404).send({ error: 'unknown test run' })
+  })
+
+  app.get<{
+    Params: { id: string }
+    Querystring: { stream?: string; offset?: string }
+  }>('/tests/:id/output', async (req, reply) => {
+    const stream = req.query.stream ?? 'stdout'
+    const offset = Number(req.query.offset ?? 0)
+    if (
+      (stream !== 'stdout' && stream !== 'stderr') ||
+      !Number.isSafeInteger(offset) ||
+      offset < 0
+    ) {
+      return reply
+        .code(400)
+        .send({ error: 'Expected stdout or stderr and a non-negative byte offset' })
+    }
+    const output = service.testRuns.output(req.params.id, stream, offset)
+    return output ?? reply.code(404).send({ error: 'unknown test run' })
+  })
 
   // One-shot command in the workload's pod with a REAL exit code (kubectl
   // exec) — the agent-loop counterpart to /exec's fire-and-forget send-keys.
