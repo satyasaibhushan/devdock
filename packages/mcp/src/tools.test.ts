@@ -1,7 +1,9 @@
-import type { RepoState } from '@devdock/core'
+import { readFileSync, readdirSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { PHP_TEST_PROFILES, type RepoState } from '@devdock/core'
 import { describe, expect, it, vi } from 'vitest'
 import type { DaemonClient, VerbResult } from './client.js'
-import { allTools, renderList, toolsForScope } from './tools.js'
+import { MCP_PHP_TEST_PROFILES, allTools, renderList, toolsForScope } from './tools.js'
 
 const ok: VerbResult = { ok: true, code: 0, stderr: '' }
 
@@ -599,5 +601,17 @@ describe('tool handlers', () => {
     expect(await tool('devdock_set_startup').handler({ repo: 'svc-a', command: '' })).toBe(
       'startup command cleared for svc-a',
     )
+  })
+
+  it('keeps runtime MCP sources free of @devdock/core imports and in sync with PHP test profiles', () => {
+    expect(MCP_PHP_TEST_PROFILES).toEqual(PHP_TEST_PROFILES)
+    const srcDir = fileURLToPath(new URL('.', import.meta.url))
+    for (const file of readdirSync(srcDir)) {
+      if (!file.endsWith('.ts') || file.endsWith('.test.ts')) continue
+      const text = readFileSync(new URL(file, import.meta.url), 'utf8')
+      expect(text, `${file} must use import type for @devdock/core`).not.toMatch(
+        /^import\s+(?!type\b)(?:(?!\bfrom\b)[\s\S])*?\bfrom\s+['"]@devdock\/core['"]/m,
+      )
+    }
   })
 })

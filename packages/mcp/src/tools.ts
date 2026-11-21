@@ -3,16 +3,24 @@
 // with rw scope — this is the "ro/rw via token scope" gate. Each tool is a
 // thin call into the daemon client.
 import { StringDecoder } from 'node:string_decoder'
-import {
-  type LogSource,
+import type {
+  LogSource,
   PHP_TEST_PROFILES,
-  type RepoState,
-  type TestOutputStream,
-  type WorkflowAction,
+  RepoState,
+  TestOutputStream,
+  WorkflowAction,
 } from '@devdock/core'
 import { z } from 'zod'
 import type { DaemonClient, MoveFollowUp, RepoVerb, VerbResult } from './client.js'
 import { sandboxTools } from './sandboxTools.js'
+
+// Keep @devdock/mcp runtime-free of @devdock/core so standalone pnpm deploy
+// bundles do not need the core package at runtime.
+export const MCP_PHP_TEST_PROFILES = [
+  'php-7.1',
+  'php-8.1',
+  'php-8.5',
+] as const satisfies typeof PHP_TEST_PROFILES
 
 export type Scope = 'ro' | 'rw'
 
@@ -496,7 +504,7 @@ export function allTools(client: DaemonClient): ToolDef[] {
           .min(1)
           .optional()
           .describe('Absolute path to a worktree of this repo on the daemon host'),
-        profile: z.enum(PHP_TEST_PROFILES).optional(),
+        profile: z.enum(MCP_PHP_TEST_PROFILES).optional(),
         command: z
           .string()
           .min(1)
