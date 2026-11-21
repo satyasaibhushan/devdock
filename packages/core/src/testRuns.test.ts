@@ -70,7 +70,7 @@ describe('PHP test profiles', () => {
       expect(manifest).toContain('RUN --mount=type=ssh')
       expect(manifest).toContain('--no-plugins --no-scripts')
       expect(manifest).toContain('USER www-data')
-      expect(manifest).toContain('RUN --network=none composer install')
+      expect(manifest).toMatch(/^RUN --network=none .*memory\.max.*composer install/m)
       expect(manifest).not.toContain('--no-dev')
       expect(testCommand(profile)).toBe('php vendor/bin/phpunit')
     },
@@ -130,10 +130,12 @@ describe('isolated test runs', () => {
       args: string[],
       opts?: RunOptions,
     ) => RunResult | undefined | Promise<RunResult | undefined> = () => undefined,
+    buildHelp = '      --resource stringArray     Resource limits for build containers',
   ) {
     return vi.fn(async (cmd: string, args: string[], opts?: RunOptions) => {
       if (cmd !== 'docker') return run(cmd, args, opts)
       if (args[0] === 'context') return success('fixture-engine\n')
+      if (args[2] === 'build' && args[3] === '--help') return success(buildHelp)
       return (await override(args, opts)) ?? success()
     })
   }
@@ -164,6 +166,9 @@ describe('isolated test runs', () => {
     const stdout = '👋'.repeat(19_000)
     const runner = dockerRunner((args, opts) => {
       if (args[2] === 'build') {
+        expect(args).toEqual(
+          expect.arrayContaining(['--resource=memory=2g', '--resource=memory-swap=2g']),
+        )
         const context = args.at(-1) ?? ''
         expect(readFileSync(join(context, 'source/source.php'), 'utf8')).toBe('committed')
         expect(existsSync(join(context, 'source/.git'))).toBe(false)
@@ -178,6 +183,7 @@ describe('isolated test runs', () => {
             '--network=none',
             '--cap-drop=ALL',
             '--cpus=2',
+            '--memory=2g',
             '--pids-limit=256',
             'sh',
             '-c',
@@ -273,7 +279,9 @@ describe('isolated test runs', () => {
           : expect.stringContaining('Test image build'),
       })
       const actions = runner.mock.calls
-        .filter(([cmd, args]) => cmd === 'docker' && args[0] === '--context')
+        .filter(
+          ([cmd, args]) => cmd === 'docker' && args[0] === '--context' && args[3] !== '--help',
+        )
         .map(([, args]) => args[2])
       expect(actions).toEqual(
         didTimeout ? ['build', 'run', 'container', 'image'] : ['build', 'container', 'image'],
@@ -284,6 +292,23 @@ describe('isolated test runs', () => {
       expect(existsSync(join(receipts, id, 'build'))).toBe(false)
     },
   )
+
+  it('reports an unsupported Docker builder without starting an uncapped build', async () => {
+    const runner = dockerRunner(undefined, '      --memory bytes    Memory limit')
+    const runs = new TestRuns(receipts, runner)
+    const { id } = runs.start(repo, {})
+    expect(await finished(runs, id)).toMatchObject({
+      exitCode: 125,
+      error: 'Test images require Docker Buildx with --resource memory limit support',
+    })
+    const calls = runner.mock.calls.filter(
+      ([cmd, args]) => cmd === 'docker' && ['build', 'run'].includes(args[2] ?? ''),
+    )
+    expect(calls.map(([, args]) => args)).toEqual([
+      ['--context', 'fixture-engine', 'build', '--help'],
+    ])
+    expect(existsSync(join(receipts, id, 'build'))).toBe(false)
+  })
 
   it('rejects invalid inputs and worktrees from other repositories without using Docker', async () => {
     const other = join(tmp, 'other')

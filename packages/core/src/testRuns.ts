@@ -23,6 +23,7 @@ import { shellQuote } from './supervisor.js'
 import {
   LEGACY_TEST_BOOTSTRAP,
   type PhpTestProfile,
+  TEST_MEMORY_LIMIT,
   resolveTestProfile,
   testCommand,
   testDockerfile,
@@ -243,9 +244,27 @@ export class TestRuns {
       if (!record.context) throw new Error('Cannot determine Docker context')
       this.save(record)
 
+      const help = await this.runDocker(
+        record,
+        ['--context', record.context, 'build', '--help'],
+        runOptions(),
+      )
+      if (help.timedOut) throw new TestTimeout()
+      if (help.code !== 0 || !/\s--resource(?:\s|=)/.test(help.stdout))
+        throw new Error('Test images require Docker Buildx with --resource memory limit support')
+
       const build = await this.docker(
         record,
-        ['build', '--progress=plain', '--tag', imageName(record.id), ...sshArgs(), contextDir],
+        [
+          'build',
+          '--progress=plain',
+          `--resource=memory=${TEST_MEMORY_LIMIT}`,
+          `--resource=memory-swap=${TEST_MEMORY_LIMIT}`,
+          '--tag',
+          imageName(record.id),
+          ...sshArgs(),
+          contextDir,
+        ],
         runOptions(),
       )
       if (build.timedOut || Date.now() >= deadline) throw new TestTimeout()
@@ -267,7 +286,7 @@ export class TestRuns {
           '--security-opt=no-new-privileges',
           '--init',
           '--cpus=2',
-          '--memory=2g',
+          `--memory=${TEST_MEMORY_LIMIT}`,
           '--pids-limit=256',
           imageName(record.id),
           'timeout',

@@ -1,6 +1,16 @@
 export const PHP_TEST_PROFILES = ['php-7.1', 'php-8.1', 'php-8.5'] as const
 export type PhpTestProfile = (typeof PHP_TEST_PROFILES)[number]
 
+const TEST_MEMORY_GIB = 2
+export const TEST_MEMORY_LIMIT = `${TEST_MEMORY_GIB}g`
+// Some BuildKit workers accept resource options without applying them. Check
+// the effective cgroup in each expensive RUN, including after a cache hit.
+const BUILD_MEMORY_CHECK = [
+  'limit=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null);',
+  `test "$limit" -gt 0 2>/dev/null && test "$limit" -le ${TEST_MEMORY_GIB * 1024 ** 3} ||`,
+  `{ echo 'BuildKit must enforce a ${TEST_MEMORY_GIB} GiB build memory limit' >&2; exit 1; };`,
+].join(' ')
+
 const INSTALL = 'composer install --no-interaction --no-progress --prefer-dist'
 const DOWNLOAD = '--no-plugins --no-scripts'
 const PREPARE_TOOLS =
@@ -46,30 +56,31 @@ export function testDockerfile(profile: PhpTestProfile): string {
     `FROM composer:${legacy ? '2.2' : '2'} AS composer`,
     `FROM ${image}`,
     'COPY --from=composer /usr/bin/composer /usr/local/bin/composer',
-    `RUN ${apt}apt-get -o Acquire::Check-Valid-Until=false update \\`,
+    `RUN ${BUILD_MEMORY_CHECK} \\`,
+    `    ${apt}apt-get -o Acquire::Check-Valid-Until=false update \\`,
     '    && apt-get install -y --no-install-recommends git openssh-client unzip libicu-dev libzip-dev \\',
     '    && docker-php-ext-install -j2 bcmath intl pdo_mysql zip \\',
     '    && rm -rf /var/lib/apt/lists/*',
-    'RUN curl -fsSL --retry 3 https://pecl.php.net/get/apcu-5.1.28.tgz -o /tmp/apcu.tgz && pecl install /tmp/apcu.tgz && docker-php-ext-enable apcu && rm /tmp/apcu.tgz',
+    `RUN ${BUILD_MEMORY_CHECK} curl -fsSL --retry 3 https://pecl.php.net/get/apcu-5.1.28.tgz -o /tmp/apcu.tgz && pecl install /tmp/apcu.tgz && docker-php-ext-enable apcu && rm /tmp/apcu.tgz`,
     'RUN printf "%s\\n" "memory_limit=512M" "apc.enable_cli=1" > "$PHP_INI_DIR/conf.d/99-devdock-test.ini"',
     'ENV COMPOSER_MEMORY_LIMIT=1G COMPOSER_MAX_PARALLEL_HTTP=4 COMPOSER_MAX_PARALLEL_PROCESSES=4',
     'ENV COMPOSER_ALLOW_SUPERUSER=1 COMPOSER_HOME=/tmp/devdock-composer',
     'ENV GIT_SSH_COMMAND="ssh -o BatchMode=yes -o StrictHostKeyChecking=yes"',
     ...(legacy
       ? [
-          `RUN mkdir -p /opt/devtools && ${PREPARE_TOOLS}`,
+          `RUN ${BUILD_MEMORY_CHECK} mkdir -p /opt/devtools && ${PREPARE_TOOLS}`,
           'COPY bootstrap.php /opt/devtools/bootstrap.php',
         ]
       : []),
     'WORKDIR /workspace',
     'COPY source/ /workspace/',
     'RUN --mount=type=ssh --mount=type=secret,id=known_hosts,target=/etc/ssh/ssh_known_hosts \\',
-    `    test -f composer.lock && ${install} ${DOWNLOAD} && rm -rf "$COMPOSER_HOME"`,
+    `    ${BUILD_MEMORY_CHECK} test -f composer.lock && ${install} ${DOWNLOAD} && rm -rf "$COMPOSER_HOME"`,
     'RUN chown -R www-data:www-data /workspace',
     'USER www-data',
     'ENV APP_ENV=testing COMPOSER_DISABLE_NETWORK=1',
     // Run the repository's install callbacks offline, with no credential mount.
-    `RUN --network=none ${install}${legacy ? ' && composer dump-autoload --dev --no-plugins --no-scripts' : ''}`,
+    `RUN --network=none ${BUILD_MEMORY_CHECK} ${install}${legacy ? ' && composer dump-autoload --dev --no-plugins --no-scripts' : ''}`,
     'ENTRYPOINT []',
     '',
   ].join('\n')
