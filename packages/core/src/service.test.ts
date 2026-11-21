@@ -2281,12 +2281,17 @@ describe('Service replicas', () => {
     let extraPod = false
     let patchUnavailable = false
     let beforePatch: (() => Promise<void>) | undefined
+    let beforeRemoval: (() => Promise<void>) | undefined
     const success = (data?: unknown) => ({
       code: 0,
       stdout: data === undefined ? '' : JSON.stringify(data),
       stderr: '',
     })
     const runner = vi.fn(async (cmd: string, args: string[]) => {
+      if (cmd === 'git' && args[2] === 'worktree' && args[3] === 'remove') {
+        await beforeRemoval?.()
+        rmSync(args[5] ?? '', { recursive: true, force: true })
+      }
       if (cmd === 'tmux' && args[0] === 'list-panes')
         return { code: 0, stdout: ready ? 'devdock-parent-r1-api 0\n' : '', stderr: '' }
       if (cmd === 'kubectl') {
@@ -2347,6 +2352,10 @@ describe('Service replicas', () => {
       vi.spyOn(svc, 'start').mockResolvedValue(success())
       return svc
     }
+    const synced = () => {
+      mkdirSync(join(root, 'logs'), { recursive: true })
+      writeFileSync(join(root, 'logs', 'parent-r1.api.dev.log'), 'Initial sync completed\n')
+    }
     return {
       daemon,
       parent,
@@ -2355,8 +2364,17 @@ describe('Service replicas', () => {
       beforePatch: (hook: () => Promise<void>) => {
         beforePatch = hook
       },
-      ready: () => {
+      beforeRemoval: (hook: () => Promise<void>) => {
+        beforeRemoval = hook
+      },
+      synced,
+      ready: (initialSync = true) => {
         ready = true
+        if (initialSync) synced()
+      },
+      stripClaim: () => {
+        delete parent.metadata.annotations[annotation]
+        parent.metadata.resourceVersion = String(Number(parent.metadata.resourceVersion) + 1)
       },
       includeParentPod: (include: boolean) => {
         extraPod = include
@@ -2396,6 +2414,78 @@ describe('Service replicas', () => {
     expect(cluster.parent.spec.selector).toEqual({ svc: 'parent-api', app: 'parent' })
     expect(cluster.claim()).toBeUndefined()
     expect(svc.listReplicas()).toEqual([])
+  })
+
+  it('waits for initial file sync even when the replacement pod is already ready', async () => {
+    makeParent()
+    const cluster = routedCluster()
+    const svc = cluster.daemon()
+    const created = await svc.createReplica('parent', 'feature', { route: true })
+    cluster.ready(false)
+    await svc.reconcileOne(created.id)
+    expect(svc.listReplicas()[0]?.route?.state).toBe('pending')
+    expect(cluster.parent.spec.selector).toEqual({ svc: 'parent-api', app: 'parent' })
+
+    cluster.synced()
+    await svc.reconcileOne(created.id)
+    expect(svc.listReplicas()[0]?.route?.state).toBe('active')
+    expect(cluster.parent.spec.selector).toEqual({ svc: 'parent-r1-api' })
+  })
+
+  it('restores the original selector before deleting a replica whose route annotation was stripped', async () => {
+    makeParent()
+    const cluster = routedCluster()
+    const svc = cluster.daemon()
+    const created = await svc.createReplica('parent', 'feature', { route: true })
+    cluster.ready()
+    await svc.reconcileOne(created.id)
+    cluster.stripClaim()
+    expect(cluster.parent.spec.selector).toEqual({ svc: 'parent-r1-api' })
+
+    cluster.patchUnavailable(true)
+    await expect(svc.deleteReplica(created.id)).rejects.toThrow('patch rejected')
+    expect(svc.listReplicas()[0]?.route?.state).toBe('restoring')
+    expect(cluster.parent.spec.selector).toEqual({ svc: 'parent-r1-api' })
+    expect(cluster.runner).not.toHaveBeenCalledWith('helm', expect.arrayContaining(['uninstall']))
+
+    cluster.patchUnavailable(false)
+    await svc.deleteReplica(created.id)
+    expect(cluster.parent.spec.selector).toEqual({ svc: 'parent-api', app: 'parent' })
+    expect(cluster.claim()).toBeUndefined()
+    expect(svc.listReplicas()).toEqual([])
+  })
+
+  it('joins a simultaneous expiry to the manual delete and preserves the reused route', async () => {
+    makeParent()
+    const cluster = routedCluster()
+    const svc = cluster.daemon()
+    const created = await svc.createReplica('parent', 'old', { route: true })
+    let finishFirst = () => {}
+    let finishSecond = () => {}
+    const first = new Promise<void>((resolve) => {
+      finishFirst = resolve
+    })
+    const second = new Promise<void>((resolve) => {
+      finishSecond = resolve
+    })
+    let attempts = 0
+    cluster.beforeRemoval(() => (++attempts === 1 ? first : second))
+
+    const manual = svc.deleteReplica(created.id)
+    await vi.waitFor(() => expect(attempts).toBe(1))
+    const expiry = svc.gcReplicas(created.createdAt + 3 * 24 * 60 * 60 * 1000)
+    finishFirst()
+    await manual
+    const replacement = await svc.createReplica('parent', 'new', { route: true })
+    finishSecond()
+
+    expect(await expiry).toEqual([created.id])
+    expect(attempts).toBe(1)
+    expect(replacement.id).toBe(created.id)
+    expect(svc.listReplicas()).toMatchObject([{ id: created.id, branch: 'new' }])
+    const token = new StateStore(stateFile).getReplica(created.id)?.route?.token
+    expect(token).toBeDefined()
+    expect(JSON.parse(cluster.claim() ?? '{}')).toMatchObject({ token })
   })
 
   it('rejects concurrent claims across daemons until the owner explicitly releases the route', async () => {

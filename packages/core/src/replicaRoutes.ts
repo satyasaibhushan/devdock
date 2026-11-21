@@ -33,10 +33,15 @@ export interface ReplicaRoute extends Omit<ReplicaRouteStatus, 'owner'> {
   context: string
   replicaService: string
   token: string
+  originalSelector?: Selector
+  replicaSelector?: Selector
 }
 
 type Target = Pick<ReplicaRoute, 'context' | 'namespace' | 'service'>
-type Reservation = Omit<ReplicaRoute, 'token' | 'state'>
+type Reservation = Pick<
+  ReplicaRoute,
+  'context' | 'namespace' | 'service' | 'replicaService' | 'workload'
+>
 
 export class RouteConflict extends Error {}
 
@@ -56,6 +61,10 @@ function sameSelector(a: Selector | undefined, b: Selector): boolean {
     Object.keys(a).length === Object.keys(b).length &&
     Object.entries(b).every(([key, value]) => a[key] === value)
   )
+}
+
+function includesSelector(a: Selector, b: Selector): boolean {
+  return Object.entries(b).every(([key, value]) => a[key] === value)
 }
 
 function claimOf(service: ServiceResource): Claim | undefined {
@@ -108,9 +117,7 @@ export class ReplicaRoutes {
             `Route requires a Service with a pod selector: ${target.namespace}/${target.service}`,
           )
         }
-        this.store.updateReplica(id, { route })
-        const health = this.store.health()
-        if (!health.ok) throw new Error(`Cannot persist replica route: ${health.error}`)
+        this.persistRecovery(id, { ...route, originalSelector: service.spec.selector })
         try {
           await this.patch(
             target,
@@ -155,7 +162,13 @@ export class ReplicaRoutes {
       if (!parent || claim?.token !== route.token)
         throw new Error('Replica route claim was removed')
       if (claim.selected && sameSelector(parent.spec.selector, claim.selected)) {
-        this.store.updateReplica(id, { route: { ...route, state: 'active', error: undefined } })
+        this.persistRecovery(id, {
+          ...current,
+          originalSelector: claim.original,
+          replicaSelector: claim.selected,
+          state: 'active',
+          error: undefined,
+        })
         return
       }
       if (!sameSelector(parent.spec.selector, claim.original)) {
@@ -212,11 +225,15 @@ export class ReplicaRoutes {
       )
         return
 
+      // Keep both selectors on disk before the switch, even if kubectl's
+      // response or the Service annotation is lost after the patch succeeds.
+      const recovery = { ...current, originalSelector: claim.original, replicaSelector: selected }
+      this.persistRecovery(id, recovery)
       await this.patch(route, parent, [
         ...this.setClaim(parent, { ...claim, selected }),
         { op: 'replace', path: '/spec/selector', value: selected },
       ])
-      this.store.updateReplica(id, { route: { ...route, state: 'active', error: undefined } })
+      this.store.updateReplica(id, { route: { ...recovery, state: 'active', error: undefined } })
     })
   }
 
@@ -256,13 +273,27 @@ export class ReplicaRoutes {
       try {
         const parent = await this.read(current)
         const claim = parent && claimOf(parent)
-        if (parent && claim?.token === current.token) {
-          const patches: Patch[] = [{ op: 'remove', path: annotationPath }]
-          // A Helm update or operator may already have taken over the selector.
-          if (claim.selected && sameSelector(parent.spec.selector, claim.selected)) {
-            patches.push({ op: 'replace', path: '/spec/selector', value: claim.original })
+        if (parent) {
+          const owned = claim?.token === current.token ? claim : undefined
+          const patches: Patch[] = owned ? [{ op: 'remove', path: annotationPath }] : []
+          const actual = parent.spec.selector
+          const original = owned?.original ?? current.originalSelector
+          let selected = owned?.selected ?? current.replicaSelector
+          if (selector(actual) && !owned && !original && !selected) {
+            // Older receipts relied on the annotation for the original selector.
+            const replica = await this.read({ ...current, service: current.replicaService })
+            selected = replica?.spec.selector
+            if (!selector(selected))
+              throw new Error('Cannot verify the Service selector after losing its route claim')
           }
-          await this.patch(current, parent, patches)
+          if (selector(actual) && selected && (!original || !sameSelector(actual, original))) {
+            if (sameSelector(actual, selected) && original && (!claim || owned)) {
+              patches.push({ op: 'replace', path: '/spec/selector', value: original })
+            } else if (includesSelector(actual, selected) || includesSelector(selected, actual)) {
+              throw new Error('Service selector still points at the replica')
+            }
+          }
+          if (patches.length) await this.patch(current, parent, patches)
         }
         this.store.updateReplica(id, { route: { ...current, state: 'released', error: undefined } })
       } catch (error) {
@@ -280,6 +311,12 @@ export class ReplicaRoutes {
     const message = String(error)
     if (route.error !== message)
       this.store.updateReplica(id, { route: { ...route, error: message } })
+  }
+
+  private persistRecovery(id: string, route: ReplicaRoute): void {
+    this.store.updateReplica(id, { route })
+    const health = this.store.health()
+    if (!health.ok) throw new Error(`Cannot persist replica route: ${health.error}`)
   }
 
   private async serial(id: string, action: () => Promise<void>): Promise<void> {

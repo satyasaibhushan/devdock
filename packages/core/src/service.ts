@@ -316,6 +316,7 @@ export class Service {
   /** Fast re-checks for a pending startup between the 5s reconcile ticks. */
   private readonly shellWatches = new Map<string, NodeJS.Timeout>()
   private readonly creatingReplicas = new Set<string>()
+  private readonly deletingReplicas = new Map<string, Promise<void>>()
   private readonly replicaRoutes: ReplicaRoutes
   readonly testRuns: TestRuns
   private readonly replicaRequests = new Map<string, Promise<ReplicaRecord>>()
@@ -1791,6 +1792,7 @@ export class Service {
       (cand) =>
         this.repos.has(cand) ||
         this.creatingReplicas.has(cand) ||
+        this.deletingReplicas.has(cand) ||
         !!this.store.getReplica(cand) ||
         existsSync(replicaCheckoutPath(parent.path, cand)) ||
         existsSync(join(legacyReplicasDir, cand)),
@@ -2004,8 +2006,17 @@ export class Service {
    *  worktree, and purge every trace from the store. Works from stored paths
    *  even when the worktree or parent checkout has already gone. */
   async deleteReplica(id: string): Promise<void> {
+    const pending = this.deletingReplicas.get(id)
+    if (pending) return pending
     const rec = this.store.getReplica(id)
     if (!rec || this.creatingReplicas.has(id)) throw new Error(`unknown replica: ${id}`)
+    const deletion = this.deleteReplicaOnce(rec).finally(() => this.deletingReplicas.delete(id))
+    this.deletingReplicas.set(id, deletion)
+    return deletion
+  }
+
+  private async deleteReplicaOnce(rec: ReplicaRecord): Promise<void> {
+    const { id } = rec
     await this.releaseReplicaRoute(id)
     const repo = this.repos.get(id)
     if (repo) {
@@ -2083,6 +2094,9 @@ export class Service {
     const deleted: string[] = []
     for (const rec of this.store.listReplicas()) {
       if (now - rec.createdAt < REPLICA_TTL_MS) continue
+      const current = this.store.getReplica(rec.id)
+      if (current?.createdAt !== rec.createdAt || current.route?.token !== rec.route?.token)
+        continue
       try {
         await this.deleteReplica(rec.id)
         deleted.push(rec.id)
@@ -2657,7 +2671,7 @@ export class Service {
     const state = assembleState(repo, workloads, Date.now())
     // A pass that outlived its repo (replica deleted mid-pass) must not
     // re-list it.
-    if (!this.repos.has(id)) return state
+    if (this.repos.get(id) !== repo) return state
     this.applyStartupCommands(state)
     this.applyState(state)
     if (repo.parentId) {
@@ -2668,10 +2682,9 @@ export class Service {
         const key = workloadKey(id, route.workload || undefined)
         if (target && !target.unreachable && !this.pausedSessions.has(key)) {
           if (route.state === 'pending' && target.hasSession) {
-            const synced = target.pods.some((pod) => pod.name.includes('-devspace'))
-              ? false
-              : initialSyncDone(readFileSlice(this.devLogPath(key), 0)?.lines ?? [])
-            if (devSessionReady(target.pods, synced)) {
+            // A ready replacement can still be serving the reused parent image's code.
+            const synced = initialSyncDone(readFileSlice(this.devLogPath(key), 0)?.lines ?? [])
+            if (synced && devSessionReady(target.pods, synced)) {
               await this.replicaRoutes
                 .activate(id, route, devSessionPods(target.pods))
                 .catch((error: unknown) =>
