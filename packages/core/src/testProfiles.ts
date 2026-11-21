@@ -2,14 +2,38 @@ export const PHP_TEST_PROFILES = ['php-7.1', 'php-8.1', 'php-8.5'] as const
 export type PhpTestProfile = (typeof PHP_TEST_PROFILES)[number]
 
 const TEST_MEMORY_GIB = 2
+const TEST_MEMORY_BYTES = TEST_MEMORY_GIB * 1024 ** 3
 export const TEST_MEMORY_LIMIT = `${TEST_MEMORY_GIB}g`
 // Some BuildKit workers accept resource options without applying them. Check
-// the effective cgroup in each expensive RUN, including after a cache hit.
-const BUILD_MEMORY_CHECK = [
-  'limit=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null);',
-  `test "$limit" -gt 0 2>/dev/null && test "$limit" -le ${TEST_MEMORY_GIB * 1024 ** 3} ||`,
-  `{ echo 'BuildKit must enforce a ${TEST_MEMORY_GIB} GiB build memory limit' >&2; exit 1; };`,
-].join(' ')
+// the effective cgroup memory and swap caps in each expensive RUN, including
+// after a cache hit.
+export function buildMemoryCheckScript(cgroupRoot = '/sys/fs/cgroup'): string {
+  return [
+    `cg="${cgroupRoot}";`,
+    'if [ -r "$cg/memory.max" ]; then',
+    '  limit=$(cat "$cg/memory.max" 2>/dev/null);',
+    `  test "$limit" -gt 0 2>/dev/null && test "$limit" -le ${TEST_MEMORY_BYTES} ||`,
+    `    { echo 'BuildKit must enforce a ${TEST_MEMORY_GIB} GiB build memory limit' >&2; exit 1; };`,
+    '  if [ -r "$cg/memory.swap.max" ]; then',
+    '    swap=$(cat "$cg/memory.swap.max" 2>/dev/null);',
+    '    test "$swap" -eq 0 2>/dev/null ||',
+    "      { echo 'BuildKit must enforce zero build swap' >&2; exit 1; };",
+    '  fi;',
+    'elif [ -r "$cg/memory/memory.limit_in_bytes" ]; then',
+    '  limit=$(cat "$cg/memory/memory.limit_in_bytes" 2>/dev/null);',
+    `  test "$limit" -gt 0 2>/dev/null && test "$limit" -le ${TEST_MEMORY_BYTES} ||`,
+    `    { echo 'BuildKit must enforce a ${TEST_MEMORY_GIB} GiB build memory limit' >&2; exit 1; };`,
+    '  if [ -r "$cg/memory/memory.memsw.limit_in_bytes" ]; then',
+    '    memsw=$(cat "$cg/memory/memory.memsw.limit_in_bytes" 2>/dev/null);',
+    `    test "$memsw" -gt 0 2>/dev/null && test "$memsw" -le ${TEST_MEMORY_BYTES} ||`,
+    "      { echo 'BuildKit must enforce zero build swap' >&2; exit 1; };",
+    '  fi;',
+    'else',
+    `  echo 'BuildKit must enforce a ${TEST_MEMORY_GIB} GiB build memory limit' >&2; exit 1;`,
+    'fi;',
+  ].join(' ')
+}
+const BUILD_MEMORY_CHECK = buildMemoryCheckScript()
 
 const INSTALL = 'composer install --no-interaction --no-progress --prefer-dist'
 const DOWNLOAD = '--no-plugins --no-scripts'

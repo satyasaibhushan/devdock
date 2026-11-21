@@ -2432,6 +2432,44 @@ describe('Service replicas', () => {
     expect(cluster.parent.spec.selector).toEqual({ svc: 'parent-r1-api' })
   })
 
+  it('activates a ready replacement even after >512 KiB of dev logs scroll past the sync marker', async () => {
+    makeParent()
+    const cluster = routedCluster()
+    const svc = cluster.daemon()
+    const created = await svc.createReplica('parent', 'feature', { route: true })
+    cluster.ready(false)
+    mkdirSync(join(root, 'logs'), { recursive: true })
+    const noise = `${'x'.repeat(1023)}\n`.repeat(600)
+    writeFileSync(join(root, 'logs', 'parent-r1.api.dev.log'), `Initial sync completed\n${noise}`)
+    await svc.reconcileOne(created.id)
+    expect(svc.listReplicas()[0]?.route?.state).toBe('active')
+    expect(cluster.parent.spec.selector).toEqual({ svc: 'parent-r1-api' })
+  })
+
+  it('refuses a second daemon claim when annotation loss leaves the Service pointing at a replica', async () => {
+    makeParent()
+    const cluster = routedCluster()
+    const svc = cluster.daemon()
+    const other = cluster.daemon(join(root, 'peer.json'))
+    const created = await svc.createReplica('parent', 'feature', { route: true })
+    cluster.ready()
+    await svc.reconcileOne(created.id)
+    cluster.stripClaim()
+    expect(cluster.parent.spec.selector).toEqual({ svc: 'parent-r1-api' })
+
+    await expect(other.createReplica('parent', 'another', { route: true })).rejects.toThrow(
+      'still selects replica parent-r1',
+    )
+    expect(cluster.claim()).toBeUndefined()
+    expect(cluster.parent.spec.selector).toEqual({ svc: 'parent-r1-api' })
+
+    await svc.deleteReplica(created.id)
+    expect(cluster.parent.spec.selector).toEqual({ svc: 'parent-api', app: 'parent' })
+    expect((await other.createReplica('parent', 'another', { route: true })).route?.state).toBe(
+      'pending',
+    )
+  })
+
   it('restores the original selector before deleting a replica whose route annotation was stripped', async () => {
     makeParent()
     const cluster = routedCluster()

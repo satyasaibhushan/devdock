@@ -67,6 +67,33 @@ function includesSelector(a: Selector, b: Selector): boolean {
   return Object.entries(b).every(([key, value]) => a[key] === value)
 }
 
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function replicaSelectorOwner(
+  selected: Selector,
+  id: string,
+  target: Reservation,
+): string | undefined {
+  const stems = new Set<string>()
+  const fromId = /^(.*)-r\d+$/.exec(id)?.[1]
+  if (fromId) stems.add(fromId)
+  if (target.workload && target.service.endsWith(`-${target.workload}`)) {
+    const fromService = target.service.slice(0, -(target.workload.length + 1))
+    if (fromService) stems.add(fromService)
+  }
+  if (target.service) stems.add(target.service)
+  for (const stem of stems) {
+    const pattern = new RegExp(`^(${escapeRegExp(stem)}-r\\d+)(?:-|$)`)
+    for (const value of Object.values(selected)) {
+      const match = pattern.exec(value)
+      if (match?.[1]) return match[1]
+    }
+  }
+  return undefined
+}
+
 function claimOf(service: ServiceResource): Claim | undefined {
   const raw = service.metadata.annotations?.[annotation]
   if (raw === undefined) return undefined
@@ -115,6 +142,12 @@ export class ReplicaRoutes {
         if (!service || service.spec.type === 'ExternalName' || !selector(service.spec.selector)) {
           throw new Error(
             `Route requires a Service with a pod selector: ${target.namespace}/${target.service}`,
+          )
+        }
+        const routedTo = replicaSelectorOwner(service.spec.selector, id, target)
+        if (routedTo) {
+          throw new RouteConflict(
+            `Route for ${target.namespace}/${target.service} still selects replica ${routedTo}; restore the parent Service selector first`,
           )
         }
         this.persistRecovery(id, { ...route, originalSelector: service.spec.selector })

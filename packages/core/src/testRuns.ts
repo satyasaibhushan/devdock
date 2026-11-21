@@ -36,6 +36,13 @@ const MAX_CONCURRENT_RUNS = 2
 const OUTPUT_BYTES = 32 * 1024
 const CLEANUP_RETRY_MS = 1_000
 const MAX_CLEANUP_RETRY_MS = 30_000
+const INTERRUPTED_RECHECK_WINDOW_MS = 30_000
+
+export interface TestRunsOptions {
+  cleanupRetryMs?: number
+  maxCleanupRetryMs?: number
+  interruptedRecheckWindowMs?: number
+}
 
 export interface TestRunOptions {
   ref?: string
@@ -62,6 +69,7 @@ export interface TestRun {
 interface Receipt extends TestRun {
   context?: string
   dockerLoginShell?: boolean
+  cleanupPendingUntil?: number
 }
 
 interface ActiveRun {
@@ -88,10 +96,20 @@ export class TestRuns {
   private readonly cleaning = new Map<string, Promise<void>>()
   private readonly retrying = new Set<string>()
 
+  private readonly cleanupRetryMs: number
+  private readonly maxCleanupRetryMs: number
+  private readonly interruptedRecheckWindowMs: number
+
   constructor(
     private readonly directory: string,
     private readonly runner: typeof run = run,
-  ) {}
+    options: TestRunsOptions = {},
+  ) {
+    this.cleanupRetryMs = options.cleanupRetryMs ?? CLEANUP_RETRY_MS
+    this.maxCleanupRetryMs = options.maxCleanupRetryMs ?? MAX_CLEANUP_RETRY_MS
+    this.interruptedRecheckWindowMs =
+      options.interruptedRecheckWindowMs ?? INTERRUPTED_RECHECK_WINDOW_MS
+  }
 
   start(repo: Repo, options: TestRunOptions): TestRun {
     if (repo.parentId) throw new TestRunInputError('Choose the source repo and a ref or worktree')
@@ -152,7 +170,12 @@ export class TestRuns {
   status(id: string): TestRun | undefined {
     const receipt = this.read(id)
     if (!receipt) return undefined
-    const { context: _context, dockerLoginShell: _shell, ...status } = receipt
+    const {
+      context: _context,
+      dockerLoginShell: _shell,
+      cleanupPendingUntil: _pending,
+      ...status
+    } = receipt
     return status
   }
 
@@ -183,7 +206,11 @@ export class TestRuns {
     for (const id of readdirSync(this.directory)) {
       if (this.active.has(id) || this.retrying.has(id)) continue
       const record = this.read(id)
-      if (!record || (record.state !== 'running' && !record.cleanupError)) continue
+      if (
+        !record ||
+        (record.state !== 'running' && !record.cleanupError && !record.cleanupPendingUntil)
+      )
+        continue
       await this.recoverRun(record)
     }
   }
@@ -193,6 +220,9 @@ export class TestRuns {
       record.state = 'interrupted'
       record.exitCode = 125
       record.error = 'Daemon restarted during the test run'
+      if (record.context) {
+        record.cleanupPendingUntil = Date.now() + this.interruptedRecheckWindowMs
+      }
     }
     return this.cleanUp(record)
   }
@@ -314,7 +344,10 @@ export class TestRuns {
       }
     } finally {
       // Docker may finish an already accepted create or export after the client exits.
-      await this.cleanUp(record, record.state === 'interrupted' && !!record.context)
+      if (record.state === 'interrupted' && record.context) {
+        record.cleanupPendingUntil = Date.now() + this.interruptedRecheckWindowMs
+      }
+      await this.cleanUp(record)
     }
   }
 
@@ -428,22 +461,29 @@ export class TestRuns {
       : this.runner('docker', args, options)
   }
 
-  private cleanUp(record: Receipt, recheck = false, retryMs = CLEANUP_RETRY_MS): Promise<void> {
+  private cleanUp(record: Receipt, retryMs = this.cleanupRetryMs): Promise<void> {
     const pending = this.cleaning.get(record.id)
     if (pending) return pending
     const task = this.cleanup(record)
       .then((error) => {
         record.cleanupError = error
         record.finishedAt ??= Date.now()
+        const now = Date.now()
+        const keepRechecking =
+          !!error || (record.cleanupPendingUntil !== undefined && now < record.cleanupPendingUntil)
+        if (!keepRechecking) record.cleanupPendingUntil = undefined
         this.save(record)
-        if (!error && !recheck) return
+        if (!keepRechecking) return
+        const delay = error
+          ? retryMs
+          : Math.min(retryMs, Math.max(1, (record.cleanupPendingUntil ?? now) - now))
         this.retrying.add(record.id)
         setTimeout(() => {
           this.retrying.delete(record.id)
-          void this.cleanUp(record, false, Math.min(retryMs * 2, MAX_CLEANUP_RETRY_MS)).catch(
+          void this.cleanUp(record, Math.min(retryMs * 2, this.maxCleanupRetryMs)).catch(
             (err: unknown) => this.reportError(record.id, err),
           )
-        }, retryMs).unref()
+        }, delay).unref()
       })
       .finally(() => this.cleaning.delete(record.id))
     this.cleaning.set(record.id, task)

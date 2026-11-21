@@ -94,7 +94,7 @@ export function peerPathAllowed(path: string, terminals: boolean): boolean {
   )
     return true
   if (/^\/replicas\/[a-zA-Z0-9_.-]+(?:\/release-route)?$/.test(pathname)) return true
-  if (/^\/tests\/[a-f0-9-]{36}(?:\/output)?$/.test(pathname)) return true
+  if (/^\/tests\/[a-f0-9-]{36}(?:\/(?:output|cancel))?$/.test(pathname)) return true
   if (/^\/operations(?:\/[a-zA-Z0-9-]+)?$/.test(pathname)) return true
   return (
     terminals && /^\/terminals(?:\/[a-zA-Z0-9_.:-]+(?:\/(?:attach|run|output))?)?$/.test(pathname)

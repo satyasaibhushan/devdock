@@ -52,6 +52,12 @@ describe('instance directory', () => {
     expect(peerPathAllowed('/auth/aws/login', false)).toBe(true)
     expect(peerPathAllowed('/repos/accounts/stop-session?workload=api', false)).toBe(true)
     expect(peerPathAllowed('/repos/accounts/logs?workload=api', false)).toBe(true)
+    const runId = '12345678-1234-1234-1234-123456789012'
+    expect(peerPathAllowed(`/tests/${runId}`, false)).toBe(true)
+    expect(peerPathAllowed(`/tests/${runId}/output?stream=stdout&offset=0`, false)).toBe(true)
+    expect(peerPathAllowed(`/tests/${runId}/cancel`, false)).toBe(true)
+    expect(peerPathAllowed(`/tests/${runId}/other`, true)).toBe(false)
+    expect(peerPathAllowed('/tests/not-a-uuid/cancel', true)).toBe(false)
     expect(peerPathAllowed('/terminals/id/attach', false)).toBe(false)
     expect(peerPathAllowed('/terminals/id/attach', true)).toBe(true)
   })

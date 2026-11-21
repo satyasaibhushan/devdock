@@ -13,7 +13,7 @@ import { environmentWarning } from './environmentWarning.js'
 import { type RunOptions, type RunResult, run, runStream, spawnStream } from './exec.js'
 import { clusterIPService, helmReleaseNames } from './helmRelease.js'
 import { type LifecycleAction, lifecyclePlan } from './lifecycle.js'
-import { decodeCursor, encodeCursor, readFileSlice } from './logQuery.js'
+import { decodeCursor, encodeCursor, readFileSlice, scanFileLines } from './logQuery.js'
 import { LogHub, LogTailer, type SpawnFn, cleanLine } from './logTailer.js'
 import { type Operation, type OperationStage, Operations } from './operations.js'
 import { DeploymentOwnership } from './ownership.js'
@@ -304,6 +304,10 @@ export class Service {
   private readonly reconnects = new Map<string, { attempts: number; lastAt: number }>()
   private readonly pausedSessions = new Set<string>()
   private readonly sessionGenerations = new Map<string, number>()
+  private readonly initialSyncState = new Map<
+    string,
+    { generation: number; offset: number; synced: boolean }
+  >()
   private readonly readyPodGenerations = new Map<string, string>()
   /** Effective release names are stable for a running DevSpace session. */
   private readonly sessionHelmReleases = new Map<string, { target: string; names: string[] }>()
@@ -2613,7 +2617,10 @@ export class Service {
         // in CRASHED — devspace reattaches to the existing dev pod.
         if (this.scheduleReconnect(id, type, key)) ws.status = 'RESTARTING'
       }
-      if (!hasSession) this.sessionHelmReleases.delete(key)
+      if (!hasSession) {
+        this.sessionHelmReleases.delete(key)
+        this.initialSyncState.delete(key)
+      }
       if (session && ws.status === 'RUNNING_MANAGED' && !ws.unreachable) {
         await this.repairApiService(scoped, key, session).catch(() => undefined)
       }
@@ -2683,7 +2690,7 @@ export class Service {
         if (target && !target.unreachable && !this.pausedSessions.has(key)) {
           if (route.state === 'pending' && target.hasSession) {
             // A ready replacement can still be serving the reused parent image's code.
-            const synced = initialSyncDone(readFileSlice(this.devLogPath(key), 0)?.lines ?? [])
+            const synced = this.hasInitialSync(key)
             if (synced && devSessionReady(target.pods, synced)) {
               await this.replicaRoutes
                 .activate(id, route, devSessionPods(target.pods))
@@ -2703,6 +2710,32 @@ export class Service {
         await this.applyReplicaIngress(repo, rec).catch(() => undefined)
     }
     return this.withReplicaRoutes(state)
+  }
+
+  private hasInitialSync(key: string): boolean {
+    const generation = this.sessionGenerations.get(key) ?? 0
+    const file = this.devLogPath(key)
+    let size: number
+    try {
+      size = statSync(file).size
+    } catch {
+      this.initialSyncState.delete(key)
+      return false
+    }
+    const prev = this.initialSyncState.get(key)
+    if (prev && prev.generation === generation && prev.offset <= size && prev.synced) {
+      return true
+    }
+    const startOffset =
+      prev && prev.generation === generation && prev.offset <= size ? prev.offset : 0
+    const scanned = scanFileLines(file, startOffset, initialSyncDone)
+    if (!scanned) return false
+    this.initialSyncState.set(key, {
+      generation,
+      offset: scanned.nextOffset,
+      synced: scanned.matched,
+    })
+    return scanned.matched
   }
 
   private async repairApiService(repo: Repo, key: string, session: SessionState): Promise<void> {

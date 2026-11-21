@@ -91,3 +91,49 @@ export function readFileSlice(
     truncated,
   }
 }
+
+/** Scan complete lines forward from `offset` without skipping earlier bytes.
+ *  Stops as soon as `match` returns true so markers cannot scroll out of a
+ *  fixed tail window. Returns undefined when the file is missing. */
+export function scanFileLines(
+  path: string,
+  offset: number,
+  match: (lines: string[]) => boolean,
+  chunkBytes = 64 * 1024,
+): { matched: boolean; nextOffset: number } | undefined {
+  let size: number
+  try {
+    size = statSync(path).size
+  } catch {
+    return undefined
+  }
+  let pos = offset > size ? 0 : offset
+  if (pos >= size) return { matched: false, nextOffset: size }
+
+  const fd = openSync(path, 'r')
+  let carry = Buffer.alloc(0)
+  let consumed = pos
+  try {
+    const buf = Buffer.alloc(Math.min(chunkBytes, size - pos))
+    while (pos < size) {
+      const n = readSync(fd, buf, 0, Math.min(buf.length, size - pos), pos)
+      if (n <= 0) break
+      pos += n
+      const data = carry.length ? Buffer.concat([carry, buf.subarray(0, n)]) : buf.subarray(0, n)
+      const lastNl = data.lastIndexOf(0x0a)
+      if (lastNl === -1) {
+        carry = Buffer.from(data)
+        continue
+      }
+      const complete = data.subarray(0, lastNl)
+      carry = Buffer.from(data.subarray(lastNl + 1))
+      consumed += lastNl + 1
+      if (match(complete.toString('utf8').split('\n'))) {
+        return { matched: true, nextOffset: consumed }
+      }
+    }
+  } finally {
+    closeSync(fd)
+  }
+  return { matched: false, nextOffset: consumed }
+}

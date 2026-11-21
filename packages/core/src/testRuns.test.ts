@@ -14,6 +14,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { type RunOptions, type RunResult, run } from './exec.js'
 import {
   LEGACY_TEST_BOOTSTRAP,
+  buildMemoryCheckScript,
   resolveTestProfile,
   testCommand,
   testDockerfile,
@@ -71,10 +72,58 @@ describe('PHP test profiles', () => {
       expect(manifest).toContain('--no-plugins --no-scripts')
       expect(manifest).toContain('USER www-data')
       expect(manifest).toMatch(/^RUN --network=none .*memory\.max.*composer install/m)
+      expect(manifest).toContain('memory.swap.max')
       expect(manifest).not.toContain('--no-dev')
       expect(testCommand(profile)).toBe('php vendor/bin/phpunit')
     },
   )
+
+  it('verifies both RAM and zero-swap cgroup caps in build memory checks', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'devdock-cg-'))
+    try {
+      const check = async (files: Record<string, string>) => {
+        const cg = mkdtempSync(join(dir, 'case-'))
+        for (const [rel, value] of Object.entries(files)) {
+          const target = join(cg, rel)
+          mkdirSync(join(target, '..'), { recursive: true })
+          writeFileSync(target, value)
+        }
+        return run('sh', ['-c', buildMemoryCheckScript(cg)])
+      }
+      const twoGiB = String(2 * 1024 ** 3)
+      expect((await check({ 'memory.max': `${twoGiB}\n`, 'memory.swap.max': '0\n' })).code).toBe(0)
+      expect((await check({ 'memory.max': `${twoGiB}\n` })).code).toBe(0)
+      const v2SwapMax = await check({ 'memory.max': `${twoGiB}\n`, 'memory.swap.max': 'max\n' })
+      expect(v2SwapMax.code).not.toBe(0)
+      expect(v2SwapMax.stderr).toContain('zero build swap')
+      const v2SwapNonZero = await check({
+        'memory.max': `${twoGiB}\n`,
+        'memory.swap.max': '4096\n',
+      })
+      expect(v2SwapNonZero.code).not.toBe(0)
+      expect(v2SwapNonZero.stderr).toContain('zero build swap')
+      const v2Unbounded = await check({ 'memory.max': 'max\n', 'memory.swap.max': '0\n' })
+      expect(v2Unbounded.code).not.toBe(0)
+      expect(v2Unbounded.stderr).toContain('2 GiB build memory limit')
+      expect(
+        (
+          await check({
+            'memory/memory.limit_in_bytes': `${twoGiB}\n`,
+            'memory/memory.memsw.limit_in_bytes': `${twoGiB}\n`,
+          })
+        ).code,
+      ).toBe(0)
+      const v1SwapAllowed = await check({
+        'memory/memory.limit_in_bytes': `${twoGiB}\n`,
+        'memory/memory.memsw.limit_in_bytes': `${String(4 * 1024 ** 3)}\n`,
+      })
+      expect(v1SwapAllowed.code).not.toBe(0)
+      expect(v1SwapAllowed.stderr).toContain('zero build swap')
+      expect((await check({})).code).not.toBe(0)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
 })
 
 describe('isolated test runs', () => {
@@ -437,5 +486,71 @@ describe('isolated test runs', () => {
     ])
     expect(output(runs, id, 'stdout')).toBe('before crash')
     expect(existsSync(join(receipts, id, 'build'))).toBe(false)
+  })
+
+  it('keeps rechecking interrupted runs to catch late containers and resumes across restart', async () => {
+    let started = false
+    let containerRmCalls = 0
+    let lateContainerRemoved = false
+    const runner = dockerRunner((args, opts) => {
+      if (args[2] === 'run') {
+        started = true
+        return run('sh', ['-c', 'sleep 60 & wait'], opts)
+      }
+      if (args[2] === 'container') {
+        containerRmCalls += 1
+        if (containerRmCalls <= 2) {
+          return {
+            code: 1,
+            stdout: '',
+            stderr: 'Error response from daemon: No such container: late',
+          }
+        }
+        lateContainerRemoved = true
+        return success()
+      }
+    })
+    const runs = new TestRuns(receipts, runner, {
+      cleanupRetryMs: 10,
+      maxCleanupRetryMs: 25,
+      interruptedRecheckWindowMs: 120,
+    })
+    const { id } = runs.start(repo, {})
+    await vi.waitFor(() => expect(started).toBe(true))
+    await runs.cancel(id)
+    expect(containerRmCalls).toBe(1)
+    expect(lateContainerRemoved).toBe(false)
+    await vi.waitFor(() => expect(lateContainerRemoved).toBe(true), { timeout: 2_000 })
+    expect(containerRmCalls).toBeGreaterThanOrEqual(3)
+
+    // A daemon restart during the recheck window still cleans up a late container.
+    const restartId = '11111111-2222-3333-4444-555555555555'
+    mkdirSync(join(receipts, restartId), { recursive: true })
+    writeFileSync(
+      join(receipts, restartId, 'run.json'),
+      JSON.stringify({
+        id: restartId,
+        repo: 'app',
+        state: 'interrupted',
+        startedAt: 1,
+        finishedAt: 2,
+        exitCode: 130,
+        context: 'old-context',
+        cleanupPendingUntil: Date.now() + 50,
+      }),
+    )
+    const restartRunner = dockerRunner()
+    const restarted = new TestRuns(receipts, restartRunner, {
+      cleanupRetryMs: 10,
+      maxCleanupRetryMs: 20,
+      interruptedRecheckWindowMs: 50,
+    })
+    await restarted.recover()
+    expect(
+      restartRunner.mock.calls.some(
+        ([cmd, args]) =>
+          cmd === 'docker' && args[2] === 'container' && args.includes(`devdock-test-${restartId}`),
+      ),
+    ).toBe(true)
   })
 })
