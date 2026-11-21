@@ -486,6 +486,11 @@ export function buildApp(
     return status ?? reply.code(404).send({ error: 'unknown test run' })
   })
 
+  app.post<{ Params: { id: string } }>('/tests/:id/cancel', async (req, reply) => {
+    const status = await service.testRuns.cancel(req.params.id)
+    return status ?? reply.code(404).send({ error: 'unknown test run' })
+  })
+
   app.get<{
     Params: { id: string }
     Querystring: { stream?: string; offset?: string }

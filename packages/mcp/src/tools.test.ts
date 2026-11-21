@@ -125,6 +125,7 @@ function fakeClient(over: Partial<DaemonClient> = {}): DaemonClient {
     replicaReleaseRoute: async () => {},
     startTest: async (repo) => ({ id: 'test-run', repo, state: 'running', startedAt: 0 }),
     testStatus: async (id) => ({ id, repo: 'svc-a', state: 'finished', startedAt: 0, exitCode: 7 }),
+    cancelTest: async (id) => ({ id, repo: 'svc-a', state: 'interrupted', startedAt: 0 }),
     testOutput: async () => ({ data: '', nextOffset: 0, eof: true }),
     namespace: async () => ({ current: 'uat', known: ['uat', 'prod'] }),
     setNamespace: async (ns) => ({ current: ns, known: ['uat', ns] }),

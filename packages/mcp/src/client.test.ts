@@ -1,5 +1,16 @@
-import { expect, it } from 'vitest'
-import { daemonRequestTimeoutMs } from './client.js'
+import { expect, it, vi } from 'vitest'
+import { daemonClient, daemonRequestTimeoutMs } from './client.js'
+
+it('cancels a test run on the addressed daemon instance', async () => {
+  const status = { id: 'test/run', state: 'interrupted', exitCode: 130 }
+  const send = vi.fn(async () => Response.json(status))
+  const client = daemonClient(send, '/instances/box/api')
+  await expect(client.cancelTest('test/run')).resolves.toEqual(status)
+  expect(send).toHaveBeenCalledWith(
+    '/instances/box/api/tests/test%2Frun/cancel',
+    expect.objectContaining({ method: 'POST' }),
+  )
+})
 
 it.each([
   ['/repos/svc/run', { timeoutMs: 600_000 }, 610_000],

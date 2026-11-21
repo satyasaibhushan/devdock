@@ -144,6 +144,7 @@ export interface DaemonClient {
   replicaReleaseRoute(id: string): Promise<void>
   startTest(id: string, options: TestRunOptions): Promise<TestRun>
   testStatus(id: string): Promise<TestRun>
+  cancelTest(id: string): Promise<TestRun>
   testOutput(id: string, stream: TestOutputStream, offset?: number): Promise<TestOutput>
   termList(): Promise<TermInfo[]>
   termOpen(opts: TermOpenOpts): Promise<TermInfo>
@@ -358,6 +359,7 @@ export function daemonClient(send: DaemonTransport, prefix = ''): DaemonClient {
     replicaList: () => request<ReplicaInfo[]>('/replicas'),
     startTest: (i, options) => post(`/repos/${id(i)}/test`, options),
     testStatus: (i) => request(`/tests/${id(i)}`),
+    cancelTest: (i) => post(`/tests/${id(i)}/cancel`),
     testOutput: (i, stream, offset = 0) =>
       request(`/tests/${id(i)}/output?stream=${stream}&offset=${offset}`),
     replicaReleaseRoute: async (i) => {

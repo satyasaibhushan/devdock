@@ -319,6 +319,59 @@ describe('isolated test runs', () => {
     expect(await finished(runs, runs.start(repo, {}).id)).toMatchObject({ exitCode: 0 })
   })
 
+  it.each(['build', 'run'] as const)(
+    'cancels an active Docker %s, removes its resources, and retries failed cleanup',
+    async (phase) => {
+      let started = false
+      let removals = 0
+      const runner = dockerRunner((args, opts) => {
+        if (args[2] === phase) {
+          started = true
+          return run('sh', ['-c', 'sleep 60 & wait'], opts)
+        }
+        if (args[2] === 'container' && ++removals === 1)
+          return { code: 1, stdout: '', stderr: 'Docker temporarily unavailable' }
+      })
+      const runs = new TestRuns(receipts, runner)
+      const { id } = runs.start(repo, {})
+      await vi.waitFor(() => expect(started).toBe(true))
+
+      const [cancelled, duplicate] = await Promise.all([runs.cancel(id), runs.cancel(id)])
+      expect(cancelled).toMatchObject({
+        state: 'interrupted',
+        exitCode: 130,
+        cleanupError: 'Docker temporarily unavailable',
+      })
+      expect(duplicate).toEqual(cancelled)
+      expect(removals).toBe(1)
+      expect(existsSync(join(receipts, id, 'build'))).toBe(false)
+      const commands = () => runner.mock.calls.filter(([cmd]) => cmd === 'docker').map(([, a]) => a)
+      expect(commands()).toContainEqual([
+        '--context',
+        'fixture-engine',
+        'container',
+        'rm',
+        '--force',
+        '--volumes',
+        `devdock-test-${id}`,
+      ])
+      expect(commands()).toContainEqual([
+        '--context',
+        'fixture-engine',
+        'image',
+        'rm',
+        `devdock-test:${id}`,
+      ])
+      if (phase === 'build') expect(commands().some((args) => args[2] === 'run')).toBe(false)
+      await vi.waitFor(() => expect(runs.status(id)?.cleanupError).toBeUndefined(), {
+        timeout: 3_000,
+      })
+      expect(removals).toBe(2)
+      expect(await runs.cancel(id)).toMatchObject({ state: 'interrupted', exitCode: 130 })
+      expect(await runs.cancel('unknown')).toBeUndefined()
+    },
+  )
+
   it('marks a crashed run interrupted and cleans up its recorded Docker context', async () => {
     const id = '9bd4c6d7-95c1-45c2-8c63-08a698317641'
     mkdirSync(join(receipts, id, 'build'), { recursive: true })
@@ -349,12 +402,12 @@ describe('isolated test runs', () => {
           '--volumes',
           `devdock-test-${id}`,
         ],
-        { timeoutMs: 15_000 },
+        { timeoutMs: 15_000, killProcessGroup: true },
       ],
       [
         'docker',
         ['--context', 'old-context', 'image', 'rm', `devdock-test:${id}`],
-        { timeoutMs: 15_000 },
+        { timeoutMs: 15_000, killProcessGroup: true },
       ],
     ])
     expect(output(runs, id, 'stdout')).toBe('before crash')

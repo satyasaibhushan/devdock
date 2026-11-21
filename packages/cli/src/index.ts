@@ -13,7 +13,7 @@ import {
   renderRun,
   renderWait,
 } from './cli.js'
-import { followTest } from './testRun.js'
+import { runTest } from './testRun.js'
 
 function emit(r: { out: string; err: string; code: number }): never {
   if (r.out) process.stdout.write(`${r.out}\n`)
@@ -38,13 +38,14 @@ async function main(): Promise<void> {
   }
 
   const base = (process.env.DEVDOCK_URL ?? DEFAULT_URL).replace(/\/$/, '')
-  const request = async <T>(req: CliRequest): Promise<T> => {
+  const request = async <T>(req: CliRequest, signal?: AbortSignal): Promise<T> => {
     let res: Response
     try {
       res = await fetch(`${base}${req.path}`, {
         method: req.method,
         headers: req.body ? { 'content-type': 'application/json' } : undefined,
         body: req.body ? JSON.stringify(req.body) : undefined,
+        signal,
       })
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
@@ -54,12 +55,11 @@ async function main(): Promise<void> {
     if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`)
     return data
   }
-  const data = await request<Record<string, unknown>>(parsed.request)
   if (parsed.command === 'test') {
-    if (typeof data.id !== 'string') throw new Error('Daemon did not return a test run id')
-    process.exitCode = await followTest(request, data.id, parsed.json)
+    process.exitCode = await runTest(request, parsed.request, parsed.json)
     return
   }
+  const data = await request<Record<string, unknown>>(parsed.request)
   if (parsed.command === 'replica') {
     const out = parsed.json
       ? JSON.stringify(data)

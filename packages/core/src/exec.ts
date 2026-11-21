@@ -32,6 +32,7 @@ export interface RunOptions {
   /** Kill the process after this many ms. */
   timeoutMs?: number
   killProcessGroup?: boolean
+  signal?: AbortSignal
   env?: NodeJS.ProcessEnv
   /** Cap each captured stream to this many bytes, keeping the TAIL — the end
    *  of a test run or stack trace is the informative part. */
@@ -45,6 +46,10 @@ export interface RunOptions {
  *  are both reported in the result so one absent CLI can't crash the daemon. */
 export function run(cmd: string, args: string[], opts: RunOptions = {}): Promise<RunResult> {
   return new Promise((resolve) => {
+    if (opts.signal?.aborted) {
+      resolve({ code: -1, stdout: '', stderr: '' })
+      return
+    }
     const processGroup = opts.killProcessGroup && process.platform !== 'win32'
     let out: number | undefined
     let err: number | undefined
@@ -73,17 +78,25 @@ export function run(cmd: string, args: string[], opts: RunOptions = {}): Promise
     let truncated = false
     let timer: NodeJS.Timeout | undefined
 
+    const kill = () => {
+      if (processGroup && child.pid) {
+        try {
+          process.kill(-child.pid, 'SIGKILL')
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ESRCH') child.kill('SIGKILL')
+        }
+      } else child.kill('SIGKILL')
+    }
     if (opts.timeoutMs) {
       timer = setTimeout(() => {
         timedOut = true
-        if (processGroup && child.pid) {
-          try {
-            process.kill(-child.pid, 'SIGKILL')
-          } catch (error) {
-            if ((error as NodeJS.ErrnoException).code !== 'ESRCH') child.kill('SIGKILL')
-          }
-        } else child.kill('SIGKILL')
+        kill()
       }, opts.timeoutMs)
+    }
+    opts.signal?.addEventListener('abort', kill, { once: true })
+    const dispose = () => {
+      clearTimeout(timer)
+      opts.signal?.removeEventListener('abort', kill)
     }
 
     const cap = (s: string): string => {
@@ -100,13 +113,13 @@ export function run(cmd: string, args: string[], opts: RunOptions = {}): Promise
       stderr = cap(stderr + d)
     })
     child.on('error', (err) => {
-      if (timer) clearTimeout(timer)
+      dispose()
       const code = (err as NodeJS.ErrnoException).code === 'ENOENT' ? 127 : -1
       const hint = code === 127 ? `${cmd}: command not found` : err.message
       resolve({ code, stdout, stderr: stderr || hint, timedOut, truncated })
     })
     child.on('close', (code) => {
-      if (timer) clearTimeout(timer)
+      dispose()
       resolve({ code: code ?? -1, stdout, stderr, timedOut, truncated })
     })
   })

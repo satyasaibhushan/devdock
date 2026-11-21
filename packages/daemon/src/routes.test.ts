@@ -820,6 +820,30 @@ describe('daemon routes', () => {
     expect((await app.inject({ method: 'POST', url: '/repos/parent/test' })).statusCode).toBe(400)
   })
 
+  it('returns the final cancellation status and rejects unknown test run ids', async () => {
+    const service = makeReplicaService()
+    const app = buildApp(service)
+    const record = {
+      id: '0f9f2b5f-1f61-417a-a790-66231e7e5bd5',
+      repo: 'parent',
+      state: 'interrupted' as const,
+      startedAt: 1,
+      finishedAt: 2,
+      exitCode: 130,
+    }
+    const cancel = vi
+      .spyOn(service.testRuns, 'cancel')
+      .mockImplementation(async (id) => (id === record.id ? record : undefined))
+    const url = `/tests/${record.id}/cancel`
+    const response = await app.inject({ method: 'POST', url })
+    expect(response.statusCode).toBe(200)
+    expect(response.json()).toEqual(record)
+    expect((await app.inject({ method: 'POST', url })).json()).toEqual(record)
+    expect(cancel).toHaveBeenCalledWith(record.id)
+    const unknown = await app.inject({ method: 'POST', url: '/tests/unknown/cancel' })
+    expect(unknown.statusCode).toBe(404)
+  })
+
   it('POST /repos/:id/wait resolves on status and 400s with no condition', async () => {
     const svc = makeRunService()
     await svc.reconcileAll()
